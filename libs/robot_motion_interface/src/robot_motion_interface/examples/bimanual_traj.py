@@ -40,6 +40,10 @@ def generate_sine_trajectory(home_pos, duration=5.0, dt=1/30.0, freq=0.5, amp=0.
     
     # Broadcast home_position to [steps, dim] and add offsets
     trajectory = home_pos + offsets
+
+    trajectory[:,:2] = home_pos[:,:2]  # Fix first two joints (base joints)
+    trajectory[:,4:21] = home_pos[:,4:21]  # Fix joints from index 4 to 20
+    trajectory[:,23:] = home_pos[:,23:]  # Fix joints from index 23 onwards
     
     return trajectory
 
@@ -94,6 +98,7 @@ def main():
                 
                 # --- Send Command ---
                 # Assume q's dimensions match the number of joints defined in the config
+                print(f"q: {q}")
                 interface.set_joint_positions(q)
                 
                 # --- Frequency Control ---
