@@ -15,7 +15,7 @@ from pathlib import Path
 from robot_motion_interface.bimanual_interface import BimanualInterface
 
 # ----------------- Configuration ----------------- #
-CONFIG_FILENAME = "bimanual_config.yaml"
+CONFIG_FILENAME = "bimanual_arm_config.yaml"
 # ------------------------------------------------- #
 
 def get_args():
