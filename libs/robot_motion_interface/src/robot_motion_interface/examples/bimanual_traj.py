@@ -66,8 +66,8 @@ def main():
     time.sleep(2.0)  # wait for the robot to stabilize
     
     # 3. Load Traj
-    home_position = interface.home_joint_positions
     try:
+        home_position = interface._home_joint_positions
         trajectory = generate_sine_trajectory(home_position, duration=5.0, dt=1/args.freq, freq=0.5, amp=0.1)
     except Exception as e:
         print(f"Error loading data: {e}")
