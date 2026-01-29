@@ -9,7 +9,6 @@ Usage:
 import time
 import argparse
 import numpy as np
-import torch
 from pathlib import Path
 
 # Import the Bimanual Interface
@@ -21,7 +20,6 @@ CONFIG_FILENAME = "bimanual_config.yaml"
 
 def get_args():
     parser = argparse.ArgumentParser(description="Local Trajectory Player")
-    parser.add_argument("--file", type=str, required=True, help="Path to .npy or .pt file")
     parser.add_argument("--freq", type=float, default=30.0, help="Control frequency in Hz (default: 30.0)")
     parser.add_argument("--loop", action="store_true", help="Loop the playback")
     return parser.parse_args()
