@@ -24,26 +24,45 @@ def get_args():
     parser.add_argument("--loop", action="store_true", help="Loop the playback")
     return parser.parse_args()
 
-def generate_sine_trajectory(home_pos, duration=5.0, dt=1/30.0, freq=0.5, amp=0.1):
+import numpy as np
+
+def generate_sine_trajectory(home_pos, duration=5.0, dt=1/30.0, freq=0.5, active_joints=None, amp=0.1):
     """
-    Generates a [steps, dim] trajectory oscillating around home_position.
+    Generates a [steps, dim] trajectory. Only specified joints will move.
+    
+    Args:
+        home_pos: [dim] array of home positions.
+        active_joints: List of indices that should move (e.g., [0, 2, 5]). 
+                       If None, all joints move.
+        amp: Scalar or [dim] array of amplitudes.
     """
     num_steps = int(duration / dt)
     num_joints = len(home_pos)
     
-    # Create time vector [steps, 1]
+    # 1. 构造振幅向量 [num_joints]
+    # 初始化为全 0
+    amp_vector = np.zeros(num_joints)
+    
+    if active_joints is None:
+        # 如果没指定，全部关节都用传入的 amp
+        amp_vector[:] = amp
+    else:
+        # 只给选中的关节赋值
+        for idx in active_joints:
+            amp_vector[idx] = amp
+
+    # 2. 生成时间向量 [num_steps, 1]
     t = np.linspace(0, duration, num_steps).reshape(-1, 1)
     
-    # Calculate offsets [steps, dim]
-    # We use sin(2 * pi * f * t) starting at 0 to ensure a smooth takeoff
-    offsets = amp * np.sin(2 * np.pi * freq * t)
+    # 3. 计算基础的正弦波形 [num_steps, 1]
+    base_wave = np.sin(2 * np.pi * freq * t)
     
-    # Broadcast home_position to [steps, dim] and add offsets
+    # 4. 利用广播机制计算偏移 [num_steps, num_joints]
+    # [num_steps, 1] * [num_joints] -> [num_steps, num_joints]
+    offsets = base_wave * amp_vector
+    
+    # 5. 叠加到起始位置
     trajectory = home_pos + offsets
-
-    trajectory[:,:2] = home_pos[:,:2]  # Fix first two joints (base joints)
-    trajectory[:,4:21] = home_pos[:,4:21]  # Fix joints from index 4 to 20
-    trajectory[:,23:] = home_pos[:,23:]  # Fix joints from index 23 onwards
     
     return trajectory
 
