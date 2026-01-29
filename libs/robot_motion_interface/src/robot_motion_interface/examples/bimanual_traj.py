@@ -26,7 +26,7 @@ def get_args():
 
 import numpy as np
 
-def generate_sine_trajectory(home_pos, duration=5.0, dt=1/30.0, freq=0.5, active_joints=None, amp=0.1):
+def generate_sine_trajectory(home_pos, duration=5.0, dt=1/30.0, freq=0.5, active_joints=None, amp=0.01):
     """
     Generates a [steps, dim] trajectory. Only specified joints will move.
     
@@ -91,7 +91,8 @@ def main():
     # 3. Load Traj
     try:
         home_position = interface._home_joint_positions
-        trajectory = generate_sine_trajectory(home_position, duration=5.0, dt=1/args.freq, freq=0.5, amp=0.1)
+        trajectory = generate_sine_trajectory(home_position, duration=5.0, dt=1/args.freq, freq=0.5, 
+                                              active_joints=[2, 3, 10, 14, 17, 18], amp=0.01)
     except Exception as e:
         print(f"Error loading data: {e}")
         interface.stop_loop()
