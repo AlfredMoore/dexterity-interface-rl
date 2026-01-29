@@ -26,28 +26,25 @@ def get_args():
     parser.add_argument("--loop", action="store_true", help="Loop the playback")
     return parser.parse_args()
 
-def load_data(file_path):
-    """Loads numpy or torch data and returns a numpy array."""
-    path = Path(file_path)
-    if not path.exists():
-        raise FileNotFoundError(f"File not found: {file_path}")
-
-    print(f"Loading data from {file_path}...")
-    if path.suffix == '.npy':
-        data = np.load(file_path)
-    elif path.suffix == '.pt':
-        data = torch.load(file_path)
-        if isinstance(data, torch.Tensor):
-            data = data.cpu().numpy()
-        else:
-            raise ValueError("The .pt file must contain a raw Tensor.")
-    else:
-        raise ValueError("Unsupported file format. Use .npy or .pt")
-
-    # data shouuld be (T, Dims)
+def generate_sine_trajectory(home_pos, duration=5.0, dt=1/30.0, freq=0.5, amp=0.1):
+    """
+    Generates a [steps, dim] trajectory oscillating around home_position.
+    """
+    num_steps = int(duration / dt)
+    num_joints = len(home_pos)
     
-    print(f"Data loaded. Shape: {data.shape}")
-    return data
+    # Create time vector [steps, 1]
+    t = np.linspace(0, duration, num_steps).reshape(-1, 1)
+    
+    # Calculate offsets [steps, dim]
+    # We use sin(2 * pi * f * t) starting at 0 to ensure a smooth takeoff
+    offsets = amp * np.sin(2 * np.pi * freq * t)
+    
+    # Broadcast home_position to [steps, dim] and add offsets
+    trajectory = home_pos + offsets
+    
+    return trajectory
+
 
 def main():
     args = get_args()
@@ -70,9 +67,10 @@ def main():
     interface.home()
     time.sleep(2.0)  # wait for the robot to stabilize
     
-    # 3. Load Data
+    # 3. Load Traj
+    home_position = interface.home_joint_positions
     try:
-        trajectory = load_data(args.file)
+        trajectory = generate_sine_trajectory(home_position, duration=5.0, dt=1/args.freq, freq=0.5, amp=0.1)
     except Exception as e:
         print(f"Error loading data: {e}")
         interface.stop_loop()
