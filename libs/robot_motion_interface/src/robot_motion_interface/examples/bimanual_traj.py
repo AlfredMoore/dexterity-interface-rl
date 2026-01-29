@@ -118,7 +118,7 @@ def main():
                 
                 # --- Send Command ---
                 # Assume q's dimensions match the number of joints defined in the config
-                print(f"q: {q}")
+                # print(f"q: {q}")
                 interface.set_joint_positions(q)
                 
                 # --- Frequency Control ---
