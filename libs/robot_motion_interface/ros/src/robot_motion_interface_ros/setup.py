@@ -22,6 +22,7 @@ setup(
     entry_points={
         'console_scripts': [
             'interface = robot_motion_interface_ros.interface_node:main',
+            'rl_driver = robot_motion_interface_ros.rl_driver_node:main',
         ],
     },
 )
