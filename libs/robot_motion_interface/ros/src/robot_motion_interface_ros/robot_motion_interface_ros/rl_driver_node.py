@@ -127,25 +127,22 @@ class RLDriverNode(Node):
         try:
             # joint_state() returns numpy array
             pos_state = []
+            vel_state = []
+
             panda_left_joint_state = self._panda_left.joint_state()
             tesollo_left_joint_state = self._tesollo_left.joint_state()
-            pos_state.extend([ 
-                panda_left_joint_state[:self._n_panda],
-                tesollo_left_joint_state[:self._n_tesollo]
-            ])
             panda_right_joint_state = self._panda_right.joint_state()
             tesollo_right_joint_state = self._tesollo_right.joint_state()
+            
             pos_state.extend([ 
+                panda_left_joint_state[:self._n_panda],
+                tesollo_left_joint_state[:self._n_tesollo],
                 panda_right_joint_state[:self._n_panda],
                 tesollo_right_joint_state[:self._n_tesollo]
             ])
-            # Concat velocity
-            vel_state = []
             vel_state.extend([ 
                 panda_left_joint_state[self._n_panda:],
-                tesollo_left_joint_state[self._n_tesollo:]
-            ])
-            vel_state.extend([
+                tesollo_left_joint_state[self._n_tesollo:],
                 panda_right_joint_state[self._n_panda:],
                 tesollo_right_joint_state[self._n_tesollo:]
             ])
@@ -193,7 +190,7 @@ class RLDriverNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = RLBimanualDriverNode()
+    node = RLDriverNode()
     
     try:
         rclpy.spin(node)

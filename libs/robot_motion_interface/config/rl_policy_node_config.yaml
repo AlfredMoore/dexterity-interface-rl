@@ -1,7 +1,15 @@
 # TODO: Align with RL HandEnv.yaml
-freq: 60
-ema: 0.75
 rs_fps: 120
+
+policy_run_dir: "<rsl-rl run folder path>"
+cv_run_dir: "<cv run folder path>"
+
+
+actionEMA: 0.75
+armDof: 7
+handDof: 12
+actionPerChain: 19
+actionSpace: 38
 
 init_joint_pose:
   left_joint_pose:
