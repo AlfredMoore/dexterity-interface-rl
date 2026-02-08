@@ -8,6 +8,7 @@ Before running this node, make sure to:
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from vision_msgs.msg import Detection3D
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rclpy.parameter import Parameter
 import torch
@@ -51,8 +52,6 @@ class RLPolicyNode(Node):
             config = yaml.safe_load(f)
         self.get_logger().info(f"Loaded config from: {config_path}")
 
-        self.rs_fps = config['rs_fps']
-
         # load runtime cfg, env cfg, agent cfg, policy model, cv model
         policy_run_dir: str = config['policy_run_dir']
         if not os.path.exists(policy_run_dir):
@@ -75,22 +74,9 @@ class RLPolicyNode(Node):
         self._action_per_chain = self.env_cfg['action_per_chain']
         self._action_num = self.env_cfg['action_num']
 
-        # 2. RealSense Initialization (Mirroring pipeline/rs_config style)
-        self.rs_pipeline = rs.pipeline()
-        self.rs_config = rs.config() # Changed from self.config
-        
-        self.rs_config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, self.rs_fps)
-        self.rs_config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, self.rs_fps)
-        
-        self.rs_profile = self.rs_pipeline.start(self.rs_config)
-        self.rs_align = rs.align(rs.stream.color) # Alignment: Depth -> Color
-        self.get_logger().info("RealSense Pipeline and rs_config initialized.")
-
         # 3. Model Loading (GPU)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.action_policy = torch.jit.load(os.path.join(policy_run_dir, 'exported','policy.pt'), map_location=self.device).eval()
-        cv_run_dir: str = config['cv_run_dir']
-        self.cv_model = torch.jit.load(..., map_location=self.device).eval()
 
         # 4. State Management for Actions and Targets
         self.proprioceptive_states: torch.Tensor = None
@@ -101,9 +87,8 @@ class RLPolicyNode(Node):
         # 5. Communication & Timers
         self.target_pub = self.create_publisher(JointState, '/target_joint_states', HIGH_PERF_QOS)
         self.create_subscription(JointState, '/joint_states', self.sub_joint_state_cb, HIGH_PERF_QOS)
+        self.create_subscription(Detection3D, '/object_detection', self.sub_object_detection_cb, HIGH_PERF_QOS)
         
-        # Dual timers to keep control frequency independent of vision latency
-        self.cv_timer = self.create_timer(1.0/self.rs_fps, self.cv_update_loop)
         self.policy_timer = self.create_timer(self.dt, self.policy_update_loop)
 
         self.get_logger().info("RLPolicyNode initialized.")
@@ -167,39 +152,18 @@ class RLPolicyNode(Node):
             # TODO: Assymmetric Actor obseervation space, align with the trained model
             self.proprioceptive_states = ...
 
-
-    def cv_update_loop(self):
-        """Fetch, align, and process vision data"""
-        try:
-            frames = self.rs_pipeline.wait_for_frames(timeout_ms=10)
-            aligned_frames = self.rs_align.process(frames)  # maybe depth is no need
-            
-            color_frame = aligned_frames.get_color_frame()
-            if not color_frame:
-                raise RuntimeError("Failed to get color frame from RealSense pipeline.")
-
-            # TODO: select and test cv model for object pose and size estimation
-            # Convert to GPU tensor for JIT CV model
-            img = np.asanyarray(color_frame.get_data())
-            img_tensor = torch.from_numpy(img).to(self.device).permute(2, 0, 1).float() / 255.0
-            
-            with torch.inference_mode():
-                # Inference using JIT-loaded SAM2, YOLO, or Pose model
-                pose = self.cv_model(img_tensor.unsqueeze(0))
-            
-            with self.lock:
-                self.object_pose = pose.squeeze().cpu().numpy()
-        except Exception as e:
-            self.get_logger().warn(f"Vision loop error: {e}")
-
+    def sub_object_detection_cb(self, msg: Detection3D):
+        with self.lock:
+            Detection3D
+            self.object_detection = torch.tensor(...)
 
     def policy_update_loop(self):
         """Control loop: Fuses states and integrates delta actions"""
-        if self.joint_states is None or self.object_pose is None or self.targets is None:
+        if self.proprioceptive_states is None or self.object_detection is None or self.targets is None:
             return
 
         with self.lock:
-            obs = np.concatenate([self.joint_states, self.object_pose])
+            obs = np.concatenate([self.proprioceptive_states, self.object_detection], axis=-1)   # num_envs, obs_dim
             current_targets = self.targets.clone()
 
         obs_tensor = torch.from_numpy(obs).to(self.device).unsqueeze(0)
