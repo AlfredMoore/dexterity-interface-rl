@@ -56,18 +56,17 @@ class RLDriverNode(Node):
         tesollo_kp = np.array(config["tesollo_kp"], dtype=float)
         tesollo_kd = np.array(config["tesollo_kd"], dtype=float)
 
-        # Optional
-        left_panda_hostname = config.get("left_panda_hostname")
-        left_panda_joint_names = config.get("left_panda_joint_names", [])
-        right_panda_hostname = config.get("right_panda_hostname")
-        right_panda_joint_names = config.get("right_panda_joint_names", [])
+        left_panda_hostname = config["left_panda_hostname"]
+        left_panda_joint_names = config["left_panda_joint_names"]
+        right_panda_hostname = config["right_panda_hostname"]
+        right_panda_joint_names = config["right_panda_joint_names"]
 
-        left_tesollo_ip = config.get("left_tesollo_ip")
-        left_tesollo_port = config.get("left_tesollo_port")
-        left_tesollo_joint_names = config.get("left_tesollo_joint_names", [])
-        right_tesollo_ip = config.get("right_tesollo_ip")
-        right_tesollo_port = config.get("right_tesollo_port")
-        right_tesollo_joint_names = config.get("right_tesollo_joint_names", [])
+        left_tesollo_ip = config["left_tesollo_ip"]
+        left_tesollo_port = config["left_tesollo_port"]
+        left_tesollo_joint_names = config["left_tesollo_joint_names"]
+        right_tesollo_ip = config["right_tesollo_ip"]
+        right_tesollo_port = config["right_tesollo_port"]
+        right_tesollo_joint_names = config["right_tesollo_joint_names"]
         
         # --- 2. Initialize Interface ---
         self.get_logger().info(f"Initializing RLDriverNode...")
@@ -111,8 +110,8 @@ class RLDriverNode(Node):
             HIGH_PERF_QOS
         )
 
-        # --- 5. timer: 1kHz (0.001s) read states ---
-        self._timer = self.create_timer(0.001, self.joint_state_loop)
+        # --- 5. timer: read and pub states ---
+        self._timer = self.create_timer(1.0 / config["joint_state_pub_timer_freq"], self.joint_state_loop)
 
         # --- etc ---
         l_joint_names = self._panda_left.joint_names() + self._tesollo_left.joint_names()
@@ -133,7 +132,7 @@ class RLDriverNode(Node):
             tesollo_left_joint_state = self._tesollo_left.joint_state()
             panda_right_joint_state = self._panda_right.joint_state()
             tesollo_right_joint_state = self._tesollo_right.joint_state()
-            
+
             pos_state.extend([ 
                 panda_left_joint_state[:self._n_panda],
                 tesollo_left_joint_state[:self._n_tesollo],

@@ -1,5 +1,6 @@
 # TODO: Align with RL HandEnv.yaml
 rs_fps: 120
+fk_rate: 60
 
 policy_run_dir: "<rsl-rl run folder path>"
 cv_run_dir: "<cv run folder path>"
