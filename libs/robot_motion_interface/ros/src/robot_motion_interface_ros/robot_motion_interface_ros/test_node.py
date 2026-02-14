@@ -26,10 +26,30 @@ RMI_ROOT = Path(spec.origin).parent.parent.parent
 FREQ = 60  # Hz
 DURATION = 10  # seconds
 T_STEPS = int(FREQ * DURATION) # total time steps
-TRAJ = np.zeros((T_STEPS, 38))
-# TODO: generate a more meaningful trajectory
-time_steps = np.linspace(0, 2 * np.pi, T_STEPS)
-TRAJ = ...
+
+HOME_Q = np.array([
+    0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+], dtype=np.float32)
+
+PRE_GRASP_Q = np.array([
+    # --- Left Joint Pose (19 dims) ---
+    -0.6981317007977318, 0.9075712110370514, 0.14835298641951802, -1.8657569703819383, 
+    1.3788101090755203, 1.6126842288427605, 2.0943951023931953,  # panda 1-7
+    0.0, 0.0, 0.7853981633974483, 0.5235987755982988,            # F1M1-M4
+    0.0, 0.0, 0.7853981633974483, 0.5235987755982988,            # F2M1-M4
+    0.0, 0.0, 0.7853981633974483, 0.5235987755982988,            # F3M1-M4
+    # --- Right Joint Pose (19 dims) ---
+    -0.19198621771937624, 0.32986722862692824, 0.07853981633974483, -1.8936822384138476, 
+    -0.059341194567807204, 2.1415189921970423, 0.8000065692366409, # panda 1-7
+    0.0, 0.0, 0.7853981633974483, 0.5235987755982988,            # F1M1-M4
+    0.0, 0.0, 0.7853981633974483, 0.5235987755982988,            # F2M1-M4
+    0.0, 0.0, 0.7853981633974483, 0.5235987755982988             # F3M1-M4
+], dtype=np.float32)
+
+TRAJ = np.linspace(HOME_Q, PRE_GRASP_Q, T_STEPS)
 
 class BimanualTrajTestNode(Node):
     def __init__(self):
@@ -45,38 +65,35 @@ class BimanualTrajTestNode(Node):
         with open(config_path, 'r') as f:
             cfg = yaml.safe_load(f)
         
-        # 获取关节名称列表 (确保与 driver_node 订阅的顺序完全一致)
-        # 这里的逻辑通过遍历配置字典提取名称
-        l_arm_names = cfg['robot_motion_interface']['panda_left']['joint_names']
-        l_hand_names = cfg['robot_motion_interface']['tesollo_left']['joint_names']
-        r_arm_names = cfg['robot_motion_interface']['panda_right']['joint_names']
-        r_hand_names = cfg['robot_motion_interface']['tesollo_right']['joint_names']
+        # joint names
+        l_joint_names = cfg['robot_motion_interface']['panda_left']['joint_names'] + cfg['robot_motion_interface']['tesollo_left']['joint_names']
+        l_joint_names = ['l_' + name for name in l_joint_names]
+        r_joint_names = cfg['robot_motion_interface']['panda_right']['joint_names'] + cfg['robot_motion_interface']['tesollo_right']['joint_names']
+        r_joint_names = ['r_' + name for name in r_joint_names]
+        self.joint_names = l_joint_names + r_joint_names
         
-        self.joint_names = l_arm_names + l_hand_names + r_arm_names + r_hand_names
-        
-        # 3. 发布者配置
+        # target joint state publisher
         self.target_pub = self.create_publisher(JointState, '/target_joint_states', HIGH_PERF_QOS)
         
-        # 4. 定时器 (60Hz)
+        # timer for publishing trajectory
         self.traj_index = 0
         self.timer = self.create_timer(1.0 / 60.0, self.timer_callback)
         
         self.get_logger().info(f"Test Node initialized with {len(self.joint_names)} joints. Ready to publish.")
 
     def timer_callback(self):
-        # 循环播放轨迹
         if self.traj_index >= len(TRAJ):
-            self.traj_index = 0
-            self.get_logger().info("Trajectory loop restarted.")
+            self.get_logger().info("Trajectory loop ended.")
+            self.timer.cancel()
+            self.destroy_node()
+            rclpy.shutdown()
+            return
 
-        # 获取当前时刻的轨迹行
         target_q = TRAJ[self.traj_index]
 
-        # 构建 JointState 消息
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name = self.joint_names
-        # 必须转换为 list 以兼容 ROS 2 Python API
         msg.position = target_q.tolist() 
         
         self.target_pub.publish(msg)
