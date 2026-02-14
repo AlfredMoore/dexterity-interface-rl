@@ -23,6 +23,9 @@ setup(
         'console_scripts': [
             'interface = robot_motion_interface_ros.interface_node:main',
             'rl_driver = robot_motion_interface_ros.rl_driver_node:main',
+            'rl_policy = robot_motion_interface_ros.rl_policy_node:main',
+            'cv_node = robot_motion_interface_ros.cv_node:main',
+            'test_node = robot_motion_interface_ros.test_node:main',
         ],
     },
 )

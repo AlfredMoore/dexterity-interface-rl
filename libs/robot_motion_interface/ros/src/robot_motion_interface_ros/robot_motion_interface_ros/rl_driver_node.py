@@ -37,7 +37,7 @@ class RLDriverNode(Node):
         super().__init__('rl_driver_node')
         
         # --- 1. config ---
-        self.declare_parameter('config_path', str(RMI_ROOT/'configs'/'rl_bimanual_driver_config.yaml'))
+        self.declare_parameter('config_path', str(RMI_ROOT/'config'/'rl_bimanual_driver_config.yaml'))
         config_path = self.get_parameter('config_path').value
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"Config file not found at: {config_path}")
@@ -109,9 +109,11 @@ class RLDriverNode(Node):
             self.target_callback, 
             HIGH_PERF_QOS
         )
+        self.get_logger().info(f"Subscribing to /target_joint_states for target joint poses.")
 
         # --- 5. timer: read and pub states ---
         self._timer = self.create_timer(1.0 / config["joint_state_pub_timer_freq"], self.joint_state_loop)
+        self.get_logger().info(f"Started joint state publisher timer at {config['joint_state_pub_timer_freq']} Hz.")
 
         # --- etc ---
         l_joint_names = self._panda_left.joint_names() + self._tesollo_left.joint_names()
