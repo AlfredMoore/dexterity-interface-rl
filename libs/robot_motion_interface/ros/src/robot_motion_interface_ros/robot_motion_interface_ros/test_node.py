@@ -66,9 +66,9 @@ class BimanualTrajTestNode(Node):
             cfg = yaml.safe_load(f)
         
         # joint names
-        l_joint_names = cfg['robot_motion_interface']['panda_left']['joint_names'] + cfg['robot_motion_interface']['tesollo_left']['joint_names']
+        l_joint_names = cfg['left_panda_joint_names'] + cfg['left_tesollo_joint_names']
         l_joint_names = ['l_' + name for name in l_joint_names]
-        r_joint_names = cfg['robot_motion_interface']['panda_right']['joint_names'] + cfg['robot_motion_interface']['tesollo_right']['joint_names']
+        r_joint_names = cfg['right_panda_joint_names'] + cfg['right_tesollo_joint_names']
         r_joint_names = ['r_' + name for name in r_joint_names]
         self.joint_names = l_joint_names + r_joint_names
         
