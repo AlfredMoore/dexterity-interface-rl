@@ -49,7 +49,11 @@ PRE_GRASP_Q = np.array([
     0.0, 0.0, 0.7853981633974483, 0.5235987755982988             # F3M1-M4
 ], dtype=np.float32)
 
-TRAJ = np.linspace(HOME_Q, PRE_GRASP_Q, T_STEPS)
+MID_Q = HOME_Q.copy()
+MID_Q[:19] = PRE_GRASP_Q[:19]
+TRAJ1 = np.linspace(HOME_Q, MID_Q, T_STEPS // 2)
+TRAJ2 = np.linspace(MID_Q, PRE_GRASP_Q, T_STEPS // 2)
+TRAJ = np.concatenate([TRAJ1, TRAJ2], axis=0)  # [T_STEPS, 38]
 
 class BimanualTrajTestNode(Node):
     def __init__(self):
