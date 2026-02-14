@@ -1,3 +1,46 @@
+# Dexterity Interface for RL
+
+## Quick Start
+Docker Image Build
+```bash
+docker build -t dex-interface .
+```
+
+Docker Run the Container
+```bash
+cd ~/simulation/dexterity-interface-rl
+docker run --name handrl --rm -it --privileged  -v $(pwd)/libs:/workspace/libs -v $(pwd)/app:/workspace/app --net=host dex-interface
+```
+
+Docker Enter the Running Container
+```bash
+docker exec -it handrl bash
+```
+
+ROS2 Build
+```bash
+cd /workspace/libs/robot_motion_interface/ros
+colcon build --symlink-install
+source install/setup.bash
+```
+
+ROS2 Run Driver Node
+```bash
+ros2 run robot_motion_interface_ros rl_driver
+```
+
+Open Another Bash, Enter the Running Container, and Source ROS2 Workspace
+```bash
+cd /workspace/libs/robot_motion_interface/ros
+source install/setup.bash
+```
+
+ROS2 Run Test Node
+```bash
+ros2 run robot_motion_interface_ros test_node
+```
+
+
 # Dexterity Interface
 
 ## Requirements
