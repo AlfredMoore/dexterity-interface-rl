@@ -12,11 +12,6 @@ cd ~/simulation/dexterity-interface-rl
 docker run --name handrl --rm -it --privileged  -v $(pwd)/libs:/workspace/libs -v $(pwd)/app:/workspace/app --net=host dex-interface
 ```
 
-Docker Enter the Running Container
-```bash
-docker exec -it handrl bash
-```
-
 ROS2 Build
 ```bash
 cd /workspace/libs/robot_motion_interface/ros
@@ -29,7 +24,14 @@ ROS2 Run Driver Node
 ros2 run robot_motion_interface_ros rl_driver
 ```
 
-Open Another Bash, Enter the Running Container, and Source ROS2 Workspace
+If it says `libfranka: Move command rejected: command not possible in the current mode ("User stopped")`, please check the Franka Control Panel for the robot status and check the `stop` button.
+
+Open Another Bash and Enter the Running Container
+```bash
+docker exec -it handrl bash
+```
+
+Enter and Source ROS2 Workspace
 ```bash
 cd /workspace/libs/robot_motion_interface/ros
 source install/setup.bash
