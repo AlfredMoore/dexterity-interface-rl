@@ -1,0 +1,13 @@
+##
+## World configuration for bimanual setup with table
+## Table dimensions match the bimanual_arms.urdf.xacro specification
+##
+
+cuboid:
+  # Work table - positioned to match the mounting positions in bimanual URDF
+  # In bimanual_arms.urdf.xacro, table_top is at z=0.9144 with height 0.045
+  # Center of table_top is at z=0.9144
+  # We need the cuboid center, so: z = 0.9144 - 0.045/2 = 0.89175
+  table:
+    dims: [1.8288, 0.62865, 0.045]  # x, y, z (from bimanual_arms.urdf.xacro)
+    pose: [0.0, 0.0, 0.89175, 1, 0, 0, 0]  # x, y, z, qw, qx, qy, qz

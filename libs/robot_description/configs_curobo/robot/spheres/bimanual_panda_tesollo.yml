@@ -1,0 +1,315 @@
+##
+## Collision spheres for bimanual Panda with Tesollo DG3F grippers
+## Based on franka_mesh.yml (Panda arm) and ur5e_robotiq_2f_140.yml (gripper)
+##
+
+collision_spheres:
+  # ===== LEFT ARM ===== (from franka_mesh.yml)
+  left_panda_link0:
+    - center: [0.0, 0.0, 0.085]
+      radius: 0.03
+    - center: [-0.1, 0.0, 0.085]
+      radius: 0.03
+
+  left_panda_link1:
+    - center: [0.0, -0.08, 0.0]
+      radius: 0.055
+    - center: [0.0, -0.03, 0.0]
+      radius: 0.06
+    - center: [0.0, 0.0, -0.12]
+      radius: 0.06
+    - center: [0.0, 0.0, -0.17]
+      radius: 0.06
+
+  left_panda_link2:
+    - center: [0.0, 0.0, 0.03]
+      radius: 0.055
+    - center: [0.0, 0.0, 0.08]
+      radius: 0.055
+    - center: [0.0, -0.12, 0.0]
+      radius: 0.055
+    - center: [0.0, -0.17, 0.0]
+      radius: 0.055
+
+  left_panda_link3:
+    - center: [0.0, 0.0, -0.06]
+      radius: 0.05
+    - center: [0.0, 0.0, -0.1]
+      radius: 0.06
+    - center: [0.08, 0.06, 0.0]
+      radius: 0.052
+    - center: [0.08, 0.02, 0.0]
+      radius: 0.052
+
+  left_panda_link4:
+    - center: [0.0, 0.0, 0.02]
+      radius: 0.052
+    - center: [0.0, 0.0, 0.06]
+      radius: 0.052
+    - center: [-0.08, 0.095, 0.0]
+      radius: 0.055
+    - center: [-0.08, 0.06, 0.0]
+      radius: 0.052
+
+  left_panda_link5:
+    - center: [0.0, 0.03, 0.0]
+      radius: 0.05
+    - center: [0.0, 0.082, 0.0]
+      radius: 0.05
+    - center: [0.0, 0.000, -0.22]
+      radius: 0.05
+    - center: [0.0, 0.052, -0.18]
+      radius: 0.04
+    - center: [0.01, 0.08, -0.14]
+      radius: 0.022
+    - center: [0.01, 0.085, -0.11]
+      radius: 0.022
+    - center: [0.01, 0.09, -0.08]
+      radius: 0.022
+    - center: [0.01, 0.095, -0.05]
+      radius: 0.022
+
+  left_panda_link6:
+    - center: [0.0, 0.0, 0.0]
+      radius: 0.05
+    - center: [0.08, 0.035, 0.0]
+      radius: 0.052
+    - center: [0.08, -0.01, 0.0]
+      radius: 0.05
+
+  left_panda_link7:
+    - center: [0.0, 0.0, 0.07]
+      radius: 0.05
+    - center: [0.02, 0.04, 0.08]
+      radius: 0.025
+    - center: [0.02, -0.04, 0.08]
+      radius: 0.025
+
+  # Left gripper base (from robotiq pattern)
+  left_delto_base_link:
+    - center: [0.0, 0.0, 0.0]
+      radius: 0.035
+    - center: [0.0, 0.0, -0.02]
+      radius: 0.035
+
+  # Left gripper fingers (simplified from ur5e_robotiq_2f_140.yml)
+  left_F1_01:
+    - center: [0.0, 0.0, 0.0]
+      radius: 0.015
+
+  left_F1_02:
+    - center: [0.01, 0.0, 0.015]
+      radius: 0.012
+
+  left_F1_03:
+    - center: [0.02, 0.0, 0.0]
+      radius: 0.012
+
+  left_F1_04:
+    - center: [0.01, 0.0, 0.0]
+      radius: 0.012
+
+  left_F1_TIP:
+    - center: [0.02, 0.0, 0.0]
+      radius: 0.012
+    - center: [0.04, 0.0, 0.0]
+      radius: 0.01
+
+  left_F2_01:
+    - center: [0.0, 0.0, 0.0]
+      radius: 0.015
+
+  left_F2_02:
+    - center: [0.01, 0.0, 0.015]
+      radius: 0.012
+
+  left_F2_03:
+    - center: [0.02, 0.0, 0.0]
+      radius: 0.012
+
+  left_F2_04:
+    - center: [0.01, 0.0, 0.0]
+      radius: 0.012
+
+  left_F2_TIP:
+    - center: [0.02, 0.0, 0.0]
+      radius: 0.012
+    - center: [0.04, 0.0, 0.0]
+      radius: 0.01
+
+  left_F3_01:
+    - center: [0.0, 0.0, 0.0]
+      radius: 0.015
+
+  left_F3_02:
+    - center: [0.01, 0.0, 0.015]
+      radius: 0.012
+
+  left_F3_03:
+    - center: [0.02, 0.0, 0.0]
+      radius: 0.012
+
+  left_F3_04:
+    - center: [0.01, 0.0, 0.0]
+      radius: 0.012
+
+  left_F3_TIP:
+    - center: [0.02, 0.0, 0.0]
+      radius: 0.012
+    - center: [0.04, 0.0, 0.0]
+      radius: 0.01
+
+  # ===== RIGHT ARM ===== (mirror of left)
+  right_panda_link0:
+    - center: [0.0, 0.0, 0.085]
+      radius: 0.03
+    - center: [-0.1, 0.0, 0.085]
+      radius: 0.03
+
+  right_panda_link1:
+    - center: [0.0, -0.08, 0.0]
+      radius: 0.055
+    - center: [0.0, -0.03, 0.0]
+      radius: 0.06
+    - center: [0.0, 0.0, -0.12]
+      radius: 0.06
+    - center: [0.0, 0.0, -0.17]
+      radius: 0.06
+
+  right_panda_link2:
+    - center: [0.0, 0.0, 0.03]
+      radius: 0.055
+    - center: [0.0, 0.0, 0.08]
+      radius: 0.055
+    - center: [0.0, -0.12, 0.0]
+      radius: 0.055
+    - center: [0.0, -0.17, 0.0]
+      radius: 0.055
+
+  right_panda_link3:
+    - center: [0.0, 0.0, -0.06]
+      radius: 0.05
+    - center: [0.0, 0.0, -0.1]
+      radius: 0.06
+    - center: [0.08, 0.06, 0.0]
+      radius: 0.052
+    - center: [0.08, 0.02, 0.0]
+      radius: 0.052
+
+  right_panda_link4:
+    - center: [0.0, 0.0, 0.02]
+      radius: 0.052
+    - center: [0.0, 0.0, 0.06]
+      radius: 0.052
+    - center: [-0.08, 0.095, 0.0]
+      radius: 0.055
+    - center: [-0.08, 0.06, 0.0]
+      radius: 0.052
+
+  right_panda_link5:
+    - center: [0.0, 0.03, 0.0]
+      radius: 0.05
+    - center: [0.0, 0.082, 0.0]
+      radius: 0.05
+    - center: [0.0, 0.000, -0.22]
+      radius: 0.05
+    - center: [0.0, 0.052, -0.18]
+      radius: 0.04
+    - center: [0.01, 0.08, -0.14]
+      radius: 0.022
+    - center: [0.01, 0.085, -0.11]
+      radius: 0.022
+    - center: [0.01, 0.09, -0.08]
+      radius: 0.022
+    - center: [0.01, 0.095, -0.05]
+      radius: 0.022
+
+  right_panda_link6:
+    - center: [0.0, 0.0, 0.0]
+      radius: 0.05
+    - center: [0.08, 0.035, 0.0]
+      radius: 0.052
+    - center: [0.08, -0.01, 0.0]
+      radius: 0.05
+
+  right_panda_link7:
+    - center: [0.0, 0.0, 0.07]
+      radius: 0.05
+    - center: [0.02, 0.04, 0.08]
+      radius: 0.025
+    - center: [0.02, -0.04, 0.08]
+      radius: 0.025
+
+  # Right gripper base
+  right_delto_base_link:
+    - center: [0.0, 0.0, 0.0]
+      radius: 0.035
+    - center: [0.0, 0.0, -0.02]
+      radius: 0.035
+
+  # Right gripper fingers
+  right_F1_01:
+    - center: [0.0, 0.0, 0.0]
+      radius: 0.015
+
+  right_F1_02:
+    - center: [0.01, 0.0, 0.015]
+      radius: 0.012
+
+  right_F1_03:
+    - center: [0.02, 0.0, 0.0]
+      radius: 0.012
+
+  right_F1_04:
+    - center: [0.01, 0.0, 0.0]
+      radius: 0.012
+
+  right_F1_TIP:
+    - center: [0.02, 0.0, 0.0]
+      radius: 0.012
+    - center: [0.04, 0.0, 0.0]
+      radius: 0.01
+
+  right_F2_01:
+    - center: [0.0, 0.0, 0.0]
+      radius: 0.015
+
+  right_F2_02:
+    - center: [0.01, 0.0, 0.015]
+      radius: 0.012
+
+  right_F2_03:
+    - center: [0.02, 0.0, 0.0]
+      radius: 0.012
+
+  right_F2_04:
+    - center: [0.01, 0.0, 0.0]
+      radius: 0.012
+
+  right_F2_TIP:
+    - center: [0.02, 0.0, 0.0]
+      radius: 0.012
+    - center: [0.04, 0.0, 0.0]
+      radius: 0.01
+
+  right_F3_01:
+    - center: [0.0, 0.0, 0.0]
+      radius: 0.015
+
+  right_F3_02:
+    - center: [0.01, 0.0, 0.015]
+      radius: 0.012
+
+  right_F3_03:
+    - center: [0.02, 0.0, 0.0]
+      radius: 0.012
+
+  right_F3_04:
+    - center: [0.01, 0.0, 0.0]
+      radius: 0.012
+
+  right_F3_TIP:
+    - center: [0.02, 0.0, 0.0]
+      radius: 0.012
+    - center: [0.04, 0.0, 0.0]
+      radius: 0.01

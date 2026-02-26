@@ -1,0 +1,226 @@
+##
+## Robot configuration for bimanual Panda arms with Tesollo DG3F grippers
+## Based on franka.yml and ur5e_robotiq_2f_140.yml
+##
+
+robot_cfg:
+  kinematics:
+    use_usd_kinematics: False
+    urdf_path: "robot/robot_description/rl/bimanual_panda_tesollo.urdf"
+    asset_root_path: "robot/robot_description"
+    base_link: "world"
+
+    # End-effector links - using gripper base (like panda_hand in franka.yml)
+    ee_link: "left_delto_base_link"
+    link_names: ["left_delto_base_link", "right_delto_base_link"]
+
+    # Collision links - include all major links from both arms
+    collision_link_names: [
+      # Left arm
+      'left_panda_link0', 'left_panda_link1', 'left_panda_link2', 'left_panda_link3',
+      'left_panda_link4', 'left_panda_link5', 'left_panda_link6', 'left_panda_link7',
+      'left_delto_base_link',
+      'left_F1_01', 'left_F1_02', 'left_F1_03', 'left_F1_04', 'left_F1_TIP',
+      'left_F2_01', 'left_F2_02', 'left_F2_03', 'left_F2_04', 'left_F2_TIP',
+      'left_F3_01', 'left_F3_02', 'left_F3_03', 'left_F3_04', 'left_F3_TIP',
+      # Right arm
+      'right_panda_link0', 'right_panda_link1', 'right_panda_link2', 'right_panda_link3',
+      'right_panda_link4', 'right_panda_link5', 'right_panda_link6', 'right_panda_link7',
+      'right_delto_base_link',
+      'right_F1_01', 'right_F1_02', 'right_F1_03', 'right_F1_04', 'right_F1_TIP',
+      'right_F2_01', 'right_F2_02', 'right_F2_03', 'right_F2_04', 'right_F2_TIP',
+      'right_F3_01', 'right_F3_02', 'right_F3_03', 'right_F3_04', 'right_F3_TIP',
+    ]
+
+    collision_spheres: 'spheres/bimanual_panda_tesollo.yml'
+    collision_sphere_buffer: 0.004
+
+    use_global_cumul: True
+
+    # Self-collision pairs to ignore (based on franka.yml and ur5e_robotiq_2f_140.yml)
+    self_collision_ignore: {
+      # Left arm self-collisions (from franka.yml pattern)
+      "left_panda_link0": ["left_panda_link1", "left_panda_link2"],
+      "left_panda_link1": ["left_panda_link2", "left_panda_link3", "left_panda_link4"],
+      "left_panda_link2": ["left_panda_link3", "left_panda_link4"],
+      "left_panda_link3": ["left_panda_link4", "left_panda_link6"],
+      "left_panda_link4": ["left_panda_link5", "left_panda_link6", "left_panda_link7"],
+      "left_panda_link5": ["left_panda_link6", "left_panda_link7", "left_delto_base_link"],
+      "left_panda_link6": ["left_panda_link7", "left_delto_base_link"],
+      "left_panda_link7": ["left_delto_base_link"],
+
+      # Left gripper base ignores all fingers (from robotiq pattern)
+      "left_delto_base_link": [
+        "left_F1_01", "left_F1_02", "left_F1_03", "left_F1_04", "left_F1_TIP",
+        "left_F2_01", "left_F2_02", "left_F2_03", "left_F2_04", "left_F2_TIP",
+        "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP",
+      ],
+
+      # Left gripper finger 1
+      "left_F1_01": ["left_F1_02", "left_F1_03", "left_F1_04", "left_F1_TIP",
+                     "left_F2_01", "left_F2_02", "left_F2_03", "left_F2_04", "left_F2_TIP",
+                     "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F1_02": ["left_F1_03", "left_F1_04", "left_F1_TIP",
+                     "left_F2_01", "left_F2_02", "left_F2_03", "left_F2_04", "left_F2_TIP",
+                     "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F1_03": ["left_F1_04", "left_F1_TIP",
+                     "left_F2_01", "left_F2_02", "left_F2_03", "left_F2_04", "left_F2_TIP",
+                     "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F1_04": ["left_F1_TIP",
+                     "left_F2_01", "left_F2_02", "left_F2_03", "left_F2_04", "left_F2_TIP",
+                     "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F1_TIP": ["left_F2_01", "left_F2_02", "left_F2_03", "left_F2_04", "left_F2_TIP",
+                      "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+
+      # Left gripper finger 2
+      "left_F2_01": ["left_F2_02", "left_F2_03", "left_F2_04", "left_F2_TIP",
+                     "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F2_02": ["left_F2_03", "left_F2_04", "left_F2_TIP",
+                     "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F2_03": ["left_F2_04", "left_F2_TIP",
+                     "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F2_04": ["left_F2_TIP",
+                     "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F2_TIP": ["left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+
+      # Left gripper finger 3
+      "left_F3_01": ["left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F3_02": ["left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F3_03": ["left_F3_04", "left_F3_TIP"],
+      "left_F3_04": ["left_F3_TIP"],
+
+      # Right arm self-collisions (mirror of left)
+      "right_panda_link0": ["right_panda_link1", "right_panda_link2"],
+      "right_panda_link1": ["right_panda_link2", "right_panda_link3", "right_panda_link4"],
+      "right_panda_link2": ["right_panda_link3", "right_panda_link4"],
+      "right_panda_link3": ["right_panda_link4", "right_panda_link6"],
+      "right_panda_link4": ["right_panda_link5", "right_panda_link6", "right_panda_link7"],
+      "right_panda_link5": ["right_panda_link6", "right_panda_link7", "right_delto_base_link"],
+      "right_panda_link6": ["right_panda_link7", "right_delto_base_link"],
+      "right_panda_link7": ["right_delto_base_link"],
+
+      # Right gripper base ignores all fingers
+      "right_delto_base_link": [
+        "right_F1_01", "right_F1_02", "right_F1_03", "right_F1_04", "right_F1_TIP",
+        "right_F2_01", "right_F2_02", "right_F2_03", "right_F2_04", "right_F2_TIP",
+        "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP",
+      ],
+
+      # Right gripper finger 1
+      "right_F1_01": ["right_F1_02", "right_F1_03", "right_F1_04", "right_F1_TIP",
+                      "right_F2_01", "right_F2_02", "right_F2_03", "right_F2_04", "right_F2_TIP",
+                      "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F1_02": ["right_F1_03", "right_F1_04", "right_F1_TIP",
+                      "right_F2_01", "right_F2_02", "right_F2_03", "right_F2_04", "right_F2_TIP",
+                      "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F1_03": ["right_F1_04", "right_F1_TIP",
+                      "right_F2_01", "right_F2_02", "right_F2_03", "right_F2_04", "right_F2_TIP",
+                      "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F1_04": ["right_F1_TIP",
+                      "right_F2_01", "right_F2_02", "right_F2_03", "right_F2_04", "right_F2_TIP",
+                      "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F1_TIP": ["right_F2_01", "right_F2_02", "right_F2_03", "right_F2_04", "right_F2_TIP",
+                       "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+
+      # Right gripper finger 2
+      "right_F2_01": ["right_F2_02", "right_F2_03", "right_F2_04", "right_F2_TIP",
+                      "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F2_02": ["right_F2_03", "right_F2_04", "right_F2_TIP",
+                      "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F2_03": ["right_F2_04", "right_F2_TIP",
+                      "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F2_04": ["right_F2_TIP",
+                      "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F2_TIP": ["right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+
+      # Right gripper finger 3
+      "right_F3_01": ["right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F3_02": ["right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F3_03": ["right_F3_04", "right_F3_TIP"],
+      "right_F3_04": ["right_F3_TIP"],
+    }
+
+    # Self-collision buffer (from franka.yml pattern)
+    self_collision_buffer: {
+      'left_panda_link0': 0.1,
+      'left_panda_link1': 0.05,
+      'left_delto_base_link': 0.02,
+      'right_panda_link0': 0.1,
+      'right_panda_link1': 0.05,
+      'right_delto_base_link': 0.02,
+    }
+
+    # Use mesh collision for arm links
+    mesh_link_names: [
+      'left_panda_link0', 'left_panda_link1', 'left_panda_link2', 'left_panda_link3',
+      'left_panda_link4', 'left_panda_link5', 'left_panda_link6', 'left_panda_link7',
+      'right_panda_link0', 'right_panda_link1', 'right_panda_link2', 'right_panda_link3',
+      'right_panda_link4', 'right_panda_link5', 'right_panda_link6', 'right_panda_link7',
+    ]
+
+    # Lock joints: null means all joints are active
+    # If you want to lock finger joints, uncomment and configure:
+    # lock_joints: {
+    #   'left_F1M1': 0.0, 'left_F1M2': 0.0, 'left_F1M3': 0.0, 'left_F1M4': 0.0,
+    #   'left_F2M1': 0.0, 'left_F2M2': 0.0, 'left_F2M3': 0.0, 'left_F2M4': 0.0,
+    #   'left_F3M1': 0.0, 'left_F3M2': 0.0, 'left_F3M3': 0.0, 'left_F3M4': 0.0,
+    #   'right_F1M1': 0.0, 'right_F1M2': 0.0, 'right_F1M3': 0.0, 'right_F1M4': 0.0,
+    #   'right_F2M1': 0.0, 'right_F2M2': 0.0, 'right_F2M3': 0.0, 'right_F2M4': 0.0,
+    #   'right_F3M1': 0.0, 'right_F3M2': 0.0, 'right_F3M3': 0.0, 'right_F3M4': 0.0,
+    # }
+    lock_joints: null
+
+    cspace:
+      # Joint names for both arms and all fingers (7 arm joints + 12 finger joints per arm)
+      joint_names: [
+        # Left arm (7 DoF)
+        'left_panda_joint1', 'left_panda_joint2', 'left_panda_joint3', 'left_panda_joint4',
+        'left_panda_joint5', 'left_panda_joint6', 'left_panda_joint7',
+        # Left gripper (12 DoF: 4 joints × 3 fingers)
+        'left_F1M1', 'left_F1M2', 'left_F1M3', 'left_F1M4',
+        'left_F2M1', 'left_F2M2', 'left_F2M3', 'left_F2M4',
+        'left_F3M1', 'left_F3M2', 'left_F3M3', 'left_F3M4',
+        # Right arm (7 DoF)
+        'right_panda_joint1', 'right_panda_joint2', 'right_panda_joint3', 'right_panda_joint4',
+        'right_panda_joint5', 'right_panda_joint6', 'right_panda_joint7',
+        # Right gripper (12 DoF: 4 joints × 3 fingers)
+        'right_F1M1', 'right_F1M2', 'right_F1M3', 'right_F1M4',
+        'right_F2M1', 'right_F2M2', 'right_F2M3', 'right_F2M4',
+        'right_F3M1', 'right_F3M2', 'right_F3M3', 'right_F3M4',
+      ]
+
+      # Retract configuration (neutral pose) - from franka.yml pattern
+      retract_config: [
+        # Left arm - neutral pose (from franka.yml: [0.0, -1.3, 0.0, -2.5, 0.0, 1.0, 0.0])
+        0.0, -1.3, 0.0, -2.5, 0.0, 1.0, 0.0,
+        # Left gripper - open configuration
+        0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+        # Right arm - neutral pose
+        0.0, -1.3, 0.0, -2.5, 0.0, 1.0, 0.0,
+        # Right gripper - open configuration
+        0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+      ]
+
+      # Null space weights (38 DoF total: 2 arms × (7 arm + 12 gripper))
+      null_space_weight: [
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,  # Left arm
+        0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,  # Left gripper (lower weight)
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,  # Right arm
+        0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,  # Right gripper (lower weight)
+      ]
+
+      # Configuration space distance weights
+      cspace_distance_weight: [
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,  # Left arm
+        0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,  # Left gripper
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,  # Right arm
+        0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,  # Right gripper
+      ]
+
+      # From franka.yml
+      max_jerk: 500.0
+      max_acceleration: 15.0

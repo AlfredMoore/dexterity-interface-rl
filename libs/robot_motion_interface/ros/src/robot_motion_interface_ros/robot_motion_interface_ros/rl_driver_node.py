@@ -90,6 +90,7 @@ class RLDriverNode(Node):
 
             self._tesollo_left.home(blocking=False)
             self._panda_left.home(blocking=False)
+            time.sleep(2.0)  # wait for homing to finish
             self._tesollo_right.home(blocking=False)
             self._panda_right.home(blocking=False)
             time.sleep(2.0)  # wait for homing to finish

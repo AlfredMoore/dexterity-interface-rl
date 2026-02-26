@@ -116,9 +116,12 @@ class RLPolicyNode(Node):
         self.policy_timer = self.create_timer(self.dt, self._policy_update_loop, callback_group=self.inference_grp)
 
         self.get_logger().info("RLPolicyNode initialized.")
+        input("[RLPolicyNode Init] Press Enter to go to pre-grasp state...")
         self._set_pre_grasp_state()
         time.sleep(2.0)  # Allow time to reach pre-grasp state
         self.get_logger().info("RLPolicyNode is in pre-grasp state.")
+        input("[RLPolicyNode Init] Press Enter to start policy inference...")
+
 
     def _pinocchio_init(self):
         # left and right hand share the same urdf but with different pose in world frame
