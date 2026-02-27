@@ -39,8 +39,14 @@ HIGH_PERF_QOS = QoSProfile(
 spec = importlib.util.find_spec("robot_motion_interface")
 if spec is None or spec.origin is None:
     raise RuntimeError(f"Cannot locate module spec for {__name__}")
-RMI_ROOT = Path(spec.origin).parent.parent.parent
-URDF_PATH = str((RMI_ROOT / "robot_description/rl/panda_w_tesollo.urdf").resolve())
+# spec.origin  = .../libs/robot_motion_interface/src/robot_motion_interface/__init__.py
+# .parent x3   = .../libs/robot_motion_interface/
+# .parent x4   = .../libs/
+RMI_ROOT  = Path(spec.origin).parent.parent.parent          # .../libs/robot_motion_interface/
+LIBS_ROOT = RMI_ROOT.parent                                  # .../libs/
+
+SINGLE_CHAIN_URDF_PATH = str((LIBS_ROOT / "robot_description/rl/panda_w_tesollo.urdf").resolve())
+DUAL_CHAIN_URDF_PATH   = str((LIBS_ROOT / "robot_description/rl/bimanual_panda_tesollo.urdf").resolve())
 
 class RLPolicyNode(Node):
     def __init__(self):
@@ -125,7 +131,7 @@ class RLPolicyNode(Node):
 
     def _pinocchio_init(self):
         # left and right hand share the same urdf but with different pose in world frame
-        self.pin_model = pin.buildModelFromUrdf(URDF_PATH)
+        self.pin_model = pin.buildModelFromUrdf(DUAL_CHAIN_URDF_PATH)
         self.pin_data = self.pin_model.createData()
         assert self.pin_model.nq == self._action_per_chain, f"Pinocchio model nq ({self.pin_model.nq}) does not match expected single chain action num ({self._action_per_chain})"
 
