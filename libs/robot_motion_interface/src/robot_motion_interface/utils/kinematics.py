@@ -18,7 +18,17 @@ import torch
 
 from curobo.types.base import TensorDeviceType
 from curobo.types.math import Pose
-from curobo.types.robot import JointState
+from curobo.types.state import JointState
+from curobo.types.robot import RobotConfig
+
+
+from curobo.util_file import (
+    get_robot_configs_path,
+    get_task_configs_path,
+    get_world_configs_path,
+    join_path,
+    load_yaml,
+)
 
 from curobo.geom.types import Cuboid, WorldConfig
 
@@ -193,7 +203,7 @@ class CuRoboBimanualMotionPlanner:
         num_trajopt_seeds: int = 4,
         grad_trajopt_iters: int = 500,
         interpolation_dt: float = 0.02,
-        collision_activation_distance: float = 0.025,
+        collision_activation_distance: float = 0.01,
     ) -> None:        
 
         self._device = device
@@ -202,13 +212,16 @@ class CuRoboBimanualMotionPlanner:
         self._joint_names   = joint_names if joint_names is not None else BIMANUAL_JOINT_NAMES
         self._interpolation_dt = interpolation_dt
 
-        tensor_args = TensorDeviceType(device=torch.device(device))
+        self.tensor_args = TensorDeviceType(device=torch.device(device))
+
+        robot_cfg = RobotConfig.from_dict(load_yaml(robot_cfg_path), self.tensor_args)
+        world_cfg = WorldConfig.from_dict(load_yaml(world_cfg_path))
 
         # Motion planner (trajectory generation)
         motion_gen_cfg = MotionGenConfig.load_from_robot_config(
-            robot_cfg=robot_cfg_path,
-            world_cfg=world_cfg_path,
-            tensor_args=tensor_args,
+            robot_cfg=robot_cfg,
+            world_model=world_cfg,
+            tensor_args=self.tensor_args,
             trajopt_tsteps=trajopt_tsteps,
             interpolation_steps=interpolation_steps,
             num_ik_seeds=num_ik_seeds,
@@ -225,8 +238,8 @@ class CuRoboBimanualMotionPlanner:
 
         # Standalone collision checker (same robot + world, no motion planning overhead)
         robot_world_cfg = RobotWorldConfig.load_from_config(
-            robot_cfg_path,
-            world_cfg_path,
+            robot_config=robot_cfg,
+            world_model=world_cfg,
             collision_activation_distance=0.0,  # 0.0 = report actual penetration depth
         )
         self._robot_world = RobotWorld(robot_world_cfg)
@@ -250,7 +263,7 @@ class CuRoboBimanualMotionPlanner:
     def _extract_trajectory(self, result) -> tuple[np.ndarray | None, bool, str]:
         if result.success.item():
             # get_full_js fills in any joints cuRobo omitted from planning
-            traj = self._motion_gen.get_full_js(result.get_interpolated_plan())
+            traj = result.get_interpolated_plan()
             return traj.position.cpu().numpy(), True, str(result.status)
         return None, False, str(result.status)
 
@@ -259,7 +272,7 @@ class CuRoboBimanualMotionPlanner:
         max_attempts: int,
         timeout: float,
         time_dilation_factor: float,
-    ) -> "MotionGenPlanConfig":
+    ) -> MotionGenPlanConfig:
         return MotionGenPlanConfig(
             enable_graph=False,
             enable_graph_attempt=3,
@@ -298,9 +311,10 @@ class CuRoboBimanualMotionPlanner:
         """
         result = self._motion_gen.plan_single(
             self._make_joint_state(q_start),
-            self._make_pose(left_target_pos, left_target_quat),
+            self._make_pose(left_target_pos, left_target_quat, ),
             self._make_plan_config(max_attempts, timeout, time_dilation_factor),
-            link_poses={self._right_ee_link: self._make_pose(right_target_pos, right_target_quat)},
+            link_poses=[self._make_pose(left_target_pos, left_target_quat),
+                        self._make_pose(right_target_pos, right_target_quat)],
         )
         return self._extract_trajectory(result)
 
