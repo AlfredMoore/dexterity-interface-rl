@@ -6,8 +6,9 @@
 robot_cfg:
   kinematics:
     use_usd_kinematics: False
-    urdf_path: "robot/robot_description/rl/bimanual_panda_tesollo.urdf"
-    asset_root_path: "robot/robot_description"
+    # PATH will be loaded in script flexibly
+    # urdf_path: "robot/robot_description/rl/bimanual_panda_tesollo.urdf"
+    # asset_root_path: "robot/robot_description"
     base_link: "world"
 
     # End-effector links - using gripper base (like panda_hand in franka.yml)
@@ -32,7 +33,7 @@ robot_cfg:
       'right_F3_01', 'right_F3_02', 'right_F3_03', 'right_F3_04', 'right_F3_TIP',
     ]
 
-    collision_spheres: 'spheres/bimanual_panda_tesollo.yml'
+    # collision_spheres: 'spheres/bimanual_panda_tesollo.yml'
     collision_sphere_buffer: 0.004
 
     use_global_cumul: True
@@ -150,12 +151,24 @@ robot_cfg:
       'right_delto_base_link': 0.02,
     }
 
-    # Use mesh collision for arm links
+    # Use mesh collision for arm links and hand/finger links
     mesh_link_names: [
+      # Left arm
       'left_panda_link0', 'left_panda_link1', 'left_panda_link2', 'left_panda_link3',
       'left_panda_link4', 'left_panda_link5', 'left_panda_link6', 'left_panda_link7',
+      # Left hand
+      'left_delto_base_link',
+      'left_F1_01', 'left_F1_02', 'left_F1_03', 'left_F1_04', 'left_F1_TIP',
+      'left_F2_01', 'left_F2_02', 'left_F2_03', 'left_F2_04', 'left_F2_TIP',
+      'left_F3_01', 'left_F3_02', 'left_F3_03', 'left_F3_04', 'left_F3_TIP',
+      # Right arm
       'right_panda_link0', 'right_panda_link1', 'right_panda_link2', 'right_panda_link3',
       'right_panda_link4', 'right_panda_link5', 'right_panda_link6', 'right_panda_link7',
+      # Right hand
+      'right_delto_base_link',
+      'right_F1_01', 'right_F1_02', 'right_F1_03', 'right_F1_04', 'right_F1_TIP',
+      'right_F2_01', 'right_F2_02', 'right_F2_03', 'right_F2_04', 'right_F2_TIP',
+      'right_F3_01', 'right_F3_02', 'right_F3_03', 'right_F3_04', 'right_F3_TIP',
     ]
 
     # Lock joints: null means all joints are active

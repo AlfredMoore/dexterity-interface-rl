@@ -1,13 +1,20 @@
 ##
 ## World configuration for bimanual setup with table
-## Table dimensions match the bimanual_arms.urdf.xacro specification
+##
+## Coordinate convention:
+##   CuRobo world origin = bimanual URDF "world" link
+##                       = robot mounting plane (≈ table surface)
+##
+##   left_panda_link0  z = +0.0225m  (base plate, above table surface)
+##   right_panda_link0 z = +0.0225m
+##
+##   Table extends DOWNWARD from z=0:
+##     top surface  = z = 0.0    (table surface, ≈ world origin)
+##     center       = z = -0.1   (pose z)
+##     bottom       = z = -0.2
 ##
 
 cuboid:
-  # Work table - positioned to match the mounting positions in bimanual URDF
-  # In bimanual_arms.urdf.xacro, table_top is at z=0.9144 with height 0.045
-  # Center of table_top is at z=0.9144
-  # We need the cuboid center, so: z = 0.9144 - 0.045/2 = 0.89175
   table:
-    dims: [1.8288, 0.62865, 0.045]  # x, y, z (from bimanual_arms.urdf.xacro)
-    pose: [0.0, 0.0, 0.89175, 1, 0, 0, 0]  # x, y, z, qw, qx, qy, qz
+    dims: [1.8288, 0.62865, 0.2]         # length x width x thickness (m)
+    pose: [0.0, 0.0, -0.1, 1, 0, 0, 0]  # center at z = -thickness/2 = -0.1
