@@ -9,6 +9,7 @@ Usage intent:
 from __future__ import annotations
 
 from pathlib import Path
+import copy
 
 import numpy as np
 import time
@@ -51,6 +52,7 @@ DEFAULT_BIMANUAL_URDF_PATH      = str((_ROBOT_DESC / "rl/bimanual_panda_tesollo.
 DEFAULT_CUROBO_ROBOT_CFG_PATH   = str((_CONFIGS_CUROBO / "robot/bimanual_panda_tesollo.yml").resolve())
 DEFAULT_COLLISION_SPHERES_PATH  = str((_CONFIGS_CUROBO / "robot/spheres/bimanual_panda_tesollo_spheres.yml").resolve())
 DEFAULT_CUROBO_WORLD_CFG_PATH   = str((_CONFIGS_CUROBO / "world/bimanual_table.yml").resolve())
+
 
 
 # ---------------------------------------------------------------------------
@@ -166,26 +168,6 @@ class PinocchioBimanualFK:
 # cuRobo backend
 # ---------------------------------------------------------------------------
 
-# Default joint ordering for bimanual_panda_tesollo (38 DoF).
-# Must match cspace.joint_names in the robot YAML config.
-BIMANUAL_JOINT_NAMES: list[str] = [
-    # Left arm (7)
-    "left_panda_joint1", "left_panda_joint2", "left_panda_joint3", "left_panda_joint4",
-    "left_panda_joint5", "left_panda_joint6", "left_panda_joint7",
-    # Left gripper (12)
-    "left_F1M1", "left_F1M2", "left_F1M3", "left_F1M4",
-    "left_F2M1", "left_F2M2", "left_F2M3", "left_F2M4",
-    "left_F3M1", "left_F3M2", "left_F3M3", "left_F3M4",
-    # Right arm (7)
-    "right_panda_joint1", "right_panda_joint2", "right_panda_joint3", "right_panda_joint4",
-    "right_panda_joint5", "right_panda_joint6", "right_panda_joint7",
-    # Right gripper (12)
-    "right_F1M1", "right_F1M2", "right_F1M3", "right_F1M4",
-    "right_F2M1", "right_F2M2", "right_F2M3", "right_F2M4",
-    "right_F3M1", "right_F3M2", "right_F3M3", "right_F3M4",
-]
-
-
 class CuRoboBimanualMotionPlanner:
     """
     Bimanual collision-free trajectory generation and collision checking via cuRobo.
@@ -240,7 +222,6 @@ class CuRoboBimanualMotionPlanner:
         self._device = device
         self._left_ee_link  = left_ee_link
         self._right_ee_link = right_ee_link
-        self._joint_names   = joint_names if joint_names is not None else BIMANUAL_JOINT_NAMES
         self._interpolation_dt = interpolation_dt
         self._robot_cfg_path = robot_cfg_path
         self._urdf_path      = urdf_path
@@ -253,6 +234,12 @@ class CuRoboBimanualMotionPlanner:
         robot_cfg_dict["robot_cfg"]["kinematics"]["urdf_path"] = urdf_path
         robot_cfg_dict["robot_cfg"]["kinematics"]["collision_spheres"] = spheres_path
         self.robot_cfg = RobotConfig.from_dict(robot_cfg_dict, self.tensor_args)
+
+        # Joint names: explicit override → YAML cspace.joint_names (single source of truth)
+        self._joint_names: list[str] = (
+            joint_names if joint_names is not None
+            else list(robot_cfg_dict["robot_cfg"]["kinematics"]["cspace"]["joint_names"])
+        )
 
         # Trajectory optimizer (no world model, self-collision only)
         trajopt_config = TrajOptSolverConfig.load_from_robot_config(
@@ -273,8 +260,20 @@ class CuRoboBimanualMotionPlanner:
         self._trajopt = TrajOptSolver(trajopt_config)
 
         # IK solver (for plan_to_pose: EE poses → joint config)
+        ik_robot_cfg_dict = copy.deepcopy(robot_cfg_dict)
+        self._lock_joints = {}
+        
+        self._retract_config = ik_robot_cfg_dict["robot_cfg"]["kinematics"]["cspace"]["retract_config"]
+        for j_name, j_val in zip(
+            self._joint_names, 
+            self._retract_config
+        ):
+            if "panda_joint" not in j_name:
+                self._lock_joints[j_name] = j_val
+        ik_robot_cfg_dict["robot_cfg"]["kinematics"]["lock_joints"] = self._lock_joints
+        
         ik_config = IKSolverConfig.load_from_robot_config(
-            robot_cfg=self.robot_cfg,
+            robot_cfg=RobotConfig.from_dict(ik_robot_cfg_dict, self.tensor_args),
             world_model=None,
             tensor_args=self.tensor_args,
             num_seeds=num_ik_seeds,
@@ -405,13 +404,19 @@ class CuRoboBimanualMotionPlanner:
         )
         if not result.success.any():
             return None, False
-        idx = result.success.flatten().nonzero(as_tuple=False)[0, 0].item()
-        q_js = JointState.from_position(
-            result.js_solution.position[idx].unsqueeze(0),
-            joint_names=self._internal_joint_names,
-        ).get_ordered_joint_state(self._joint_names)
-        return q_js.position.squeeze(0), True
+        # 1. get IK 14 unlocked joints
+        ik_active_names = self._ik_solver.kinematics.joint_names
+        ik_active_pos = result.solution.squeeze().cpu().numpy() # (14,)
 
+        full_q = np.array(self._retract_config, dtype=np.float32)
+        
+        for idx, name in enumerate(self._joint_names):
+            if name in ik_active_names:
+                full_q[idx] = ik_active_pos[ik_active_names.index(name)]
+
+        q_full = torch.tensor(full_q, dtype=torch.float32, device=self._device)
+
+        return q_full, True
     # ------------------------------------------------------------------
     # Trajectory planning — Cartesian EE space
     # ------------------------------------------------------------------
@@ -604,12 +609,11 @@ if __name__ == "__main__":
         print("Curobo smoke test")
         print("=" * 60)
         
-        print("\nInitializing CuRoboBimanualMotionPlanner (warmup may take ~30 s)...")
+        print("\n0. Initializing CuRoboBimanualMotionPlanner (warmup may take ~30 s)...")
         planner = CuRoboBimanualMotionPlanner(
             robot_cfg_path              = DEFAULT_CUROBO_ROBOT_CFG_PATH,
             left_ee_link                = "left_delto_base_link",
             right_ee_link               = "right_delto_base_link",
-            joint_names                 = BIMANUAL_JOINT_NAMES,
             device                      = "cuda:0",
             trajopt_tsteps              = 64,
             interpolation_steps         = 2000,
@@ -634,7 +638,7 @@ if __name__ == "__main__":
         # ------------------------------------------------------------------
         # Collision detection test
         # ------------------------------------------------------------------
-            
+        print("\n1. Collision check at key configurations...")
         _collision_check_test("HOME_Q", HOME_Q)
         planner.save_scene_as_mesh(HOME_Q, str((_LIBS_ROOT.parent / "models" / "robot_world_home_q.stl").resolve()))
         print(f"[INFO] Saved HOME_Q scene mesh to {str((_LIBS_ROOT.parent / 'models' / 'robot_world_home_q.stl').resolve())}")
@@ -646,6 +650,7 @@ if __name__ == "__main__":
         # ------------------------------------------------------------------
         # Traj Optimization test
         # ------------------------------------------------------------------
+        print("\n2. Trajectory planning test...")
         print("\nChecking endpoint validity at planner's activation distance...")
         home_ok     = planner.check_at_planning_distance(HOME_Q,     "HOME_Q")
         pregrasp_ok = planner.check_at_planning_distance(PRE_GRASP_Q, "PRE_GRASP_Q")
@@ -672,6 +677,7 @@ if __name__ == "__main__":
         # ------------------------------------------------------------------
         # IK solver test
         # ------------------------------------------------------------------
+        print("\n3. IK solver test...")
         IK_POSES = [
             {
                 "label": "HOME_POSE",

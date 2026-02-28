@@ -28,7 +28,21 @@ from scipy.spatial.transform import Rotation
 # ---------------------------------------------------------------------------
 
 def _add_rotation_noise(rot_matrix: np.ndarray, max_angle_deg: float = 15.0) -> Rotation:
-    """Apply a random small rotation to *rot_matrix* and return a Rotation."""
+    """Apply a small random rotation perturbation to a rotation matrix.
+
+    Samples a uniformly random unit axis and a uniform angle in
+    ``[0, max_angle_deg]``, builds the corresponding axis-angle rotation, and
+    pre-multiplies it onto *rot_matrix*.
+
+    Args:
+        rot_matrix: 3×3 orthonormal rotation matrix representing the base
+            orientation to perturb.
+        max_angle_deg: Maximum perturbation angle in degrees.  The actual angle
+            is sampled uniformly from ``[0, max_angle_deg]``.
+
+    Returns:
+        A scipy ``Rotation`` object representing the perturbed orientation.
+    """
     axis = np.random.randn(3)
     axis /= np.linalg.norm(axis)
     angle = np.random.uniform(0.0, np.deg2rad(max_angle_deg))
@@ -37,13 +51,27 @@ def _add_rotation_noise(rot_matrix: np.ndarray, max_angle_deg: float = 15.0) -> 
 
 
 def _rot_to_wxyz(r: Rotation) -> np.ndarray:
-    """scipy xyzw → wxyz."""
+    """Convert a scipy ``Rotation`` to a wxyz quaternion array.
+
+    Args:
+        r: Rotation in scipy's internal xyzw convention.
+
+    Returns:
+        Float32 NumPy array of shape ``(4,)`` in ``[w, x, y, z]`` order.
+    """
     q = r.as_quat()          # [x, y, z, w]
     return np.array([q[3], q[0], q[1], q[2]], dtype=np.float32)
 
 
 def _wxyz_to_scipy(q_wxyz: np.ndarray) -> Rotation:
-    """wxyz → scipy Rotation."""
+    """Convert a wxyz quaternion to a scipy ``Rotation``.
+
+    Args:
+        q_wxyz: 1-D array of shape ``(4,)`` in ``[w, x, y, z]`` order.
+
+    Returns:
+        Equivalent scipy ``Rotation`` object.
+    """
     return Rotation.from_quat([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]])
 
 
@@ -56,27 +84,28 @@ def filter_similar_poses(
     pos_threshold: float = 0.03,
     angle_threshold_deg: float = 15.0,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Remove near-duplicate poses from *poses*.
+    """Remove near-duplicate poses from a list (greedy, order-preserving).
 
-    A pose is considered duplicate of an already-kept pose when BOTH
-    its position distance is < *pos_threshold* (m) AND its rotation
-    distance is < *angle_threshold_deg* (°).
+    A pose is considered a duplicate of an already-kept pose when *both*
+    its position distance is below *pos_threshold* **and** its angular
+    distance is below *angle_threshold_deg*.  The position check is
+    vectorised; the quaternion check is performed only for the small subset
+    of position-close candidates.
 
-    The position check is vectorised (fast); the quaternion check is
-    applied only to the small set of position-close candidates.
+    Args:
+        poses: List of ``(pos, quat_wxyz)`` tuples where ``pos`` has shape
+            ``(3,)`` and ``quat_wxyz`` has shape ``(4,)`` in ``[w, x, y, z]``
+            order.
+        pos_threshold: Euclidean distance threshold in metres.  A candidate
+            pose only undergoes the additional rotation check when its distance
+            to some already-kept pose is below this value.
+        angle_threshold_deg: Rotation-distance threshold in degrees.  A pose
+            is discarded when its rotation differs from a position-close
+            already-kept pose by less than this angle.
 
-    Parameters
-    ----------
-    poses:
-        List of (pos [3,], quat_wxyz [4,]) tuples.
-    pos_threshold:
-        Euclidean position threshold in metres.
-    angle_threshold_deg:
-        Rotation angle threshold in degrees.
-
-    Returns
-    -------
-    Filtered list (order-preserving, greedy).
+    Returns:
+        Filtered list of ``(pos, quat_wxyz)`` tuples in original order.
+        All position arrays are ``float32``.
     """
     if not poses:
         return []
@@ -125,11 +154,27 @@ def generate_left_arm_candidates(
     z_range: tuple[float, float] = (0.05, 0.07),
     noise_deg: float = 15.0,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Sample left-arm (left_delto_base_link) EE poses.
+    """Sample left-arm end-effector poses in a hollow-cylinder workspace.
 
-    Position : hollow cylinder, r ∈ r_range, z ∈ z_range.
-    Frame    : z-axis radially inward (horizontal), x-axis tangential
-               (horizontal), y-axis = [0, 0, +1] (world up / vertical).
+    Each pose is constructed analytically so that the local z-axis points
+    radially inward toward the world vertical axis (lying in the xy-plane)
+    and the local x-axis lies tangentially in the horizontal plane.  A small
+    random rotation noise is then added on top.
+
+    Args:
+        num_samples: Number of candidate poses to generate before any
+            filtering.
+        r_range: ``(r_min, r_max)`` radial distance from the world vertical
+            axis in metres.  Samples are drawn uniformly over this interval.
+        z_range: ``(z_min, z_max)`` height range in metres.  Samples are drawn
+            uniformly over this interval.
+        noise_deg: Maximum perturbation angle in degrees applied as a random
+            rotation on top of the analytical EE frame.
+
+    Returns:
+        List of *num_samples* ``(pos, quat_wxyz)`` tuples.  ``pos`` is a
+        float32 array of shape ``(3,)``; ``quat_wxyz`` is a float32 array of
+        shape ``(4,)`` in ``[w, x, y, z]`` order.
     """
     poses = []
     for _ in range(num_samples):
@@ -164,10 +209,28 @@ def generate_right_arm_candidates(
     z_range: tuple[float, float] = (0.15, 0.30),
     noise_deg: float = 15.0,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Sample right-arm (right_delto_base_link) EE poses.
+    """Sample right-arm end-effector poses in a solid-cylinder workspace.
 
-    Position : solid cylinder, r ∈ [0, r_max] (area-uniform), z ∈ z_range.
-    Frame    : z-axis points from the sampled position toward world origin.
+    Each pose is constructed analytically so that the local z-axis points
+    from the sampled position toward the world origin (hand faces inward /
+    downward).  A small random rotation noise is then added on top.
+
+    Args:
+        num_samples: Number of candidate poses to generate before any
+            filtering.
+        r_max: Maximum radial distance from the world vertical axis in metres.
+            Samples are drawn with area-uniform distribution over
+            ``[0, r_max]``, i.e. ``r = sqrt(U) * r_max`` with
+            ``U ~ Uniform(0, 1)``.
+        z_range: ``(z_min, z_max)`` height range in metres.  Samples are drawn
+            uniformly over this interval.
+        noise_deg: Maximum perturbation angle in degrees applied as a random
+            rotation on top of the analytical EE frame.
+
+    Returns:
+        List of *num_samples* ``(pos, quat_wxyz)`` tuples.  ``pos`` is a
+        float32 array of shape ``(3,)``; ``quat_wxyz`` is a float32 array of
+        shape ``(4,)`` in ``[w, x, y, z]`` order.
     """
     poses = []
     for _ in range(num_samples):
@@ -211,17 +274,32 @@ def sample_bimanual_pregrasp(
     angle_threshold_deg: float = 15.0,
     noise_deg: float = 15.0,
 ) -> list[tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]]:
-    """Generate a Cartesian-product set of bimanual pre-grasp EE poses.
+    """Generate all pairwise combinations of filtered bimanual pre-grasp poses.
 
-    Steps
-    -----
-    1. Sample *n_raw* left-arm poses and *n_raw* right-arm poses.
-    2. Independently filter near-duplicates from each arm.
-    3. Return itertools.product(left, right) — every (left, right) pair.
+    Sampling pipeline:
 
-    Returns
-    -------
-    List of  ((l_pos, l_quat_wxyz), (r_pos, r_quat_wxyz)).
+    1. Draw *n_raw* raw candidates for each arm independently.
+    2. Remove near-duplicate poses from each arm's candidate set via
+       :func:`filter_similar_poses`.
+    3. Return the full Cartesian product of the two filtered sets.
+
+    The total number of returned pairs is ``len(left) × len(right)`` after
+    deduplication, which is typically much smaller than ``n_raw²``.
+
+    Args:
+        n_raw: Number of raw candidates to draw per arm before filtering.
+        pos_threshold: Euclidean position threshold in metres passed to
+            :func:`filter_similar_poses`.
+        angle_threshold_deg: Rotation-distance threshold in degrees passed to
+            :func:`filter_similar_poses`.
+        noise_deg: Maximum random rotation noise in degrees added to each
+            analytically constructed EE frame.
+
+    Returns:
+        List of ``((l_pos, l_quat_wxyz), (r_pos, r_quat_wxyz))`` tuples, one
+        per bimanual pose combination.  Each ``pos`` is a float32 array of
+        shape ``(3,)`` and each ``quat_wxyz`` is a float32 array of shape
+        ``(4,)`` in ``[w, x, y, z]`` order.
     """
     raw_left  = generate_left_arm_candidates(n_raw, noise_deg=noise_deg)
     raw_right = generate_right_arm_candidates(n_raw, noise_deg=noise_deg)
@@ -244,23 +322,31 @@ def visualize_pregrasp_poses(
     arrow_len: float = 0.045,
     save_path: str | None = None,
 ) -> None:
-    """Plot sampled EE poses with x/y/z frame axes in five 3D subplots.
+    """Visualise sampled EE poses as 3-axis orientation arrows in 3-D subplots.
 
-    Each subplot shows n_sample // n_plots points (half left, half right).
-    Three arrows per point show the local x (light), y (mid), z (dark) axes.
+    Draws *n_plots* Matplotlib 3-D subplots arranged in rows of three.  Each
+    subplot shows a random subset of the provided poses with three quiver
+    arrows per point representing the local x (light colour), y (mid colour),
+    and z (dark colour) axes.  Left-arm poses use a blue palette; right-arm
+    poses use an orange palette.
 
-    Parameters
-    ----------
-    left_poses / right_poses:
-        Output of generate_left/right_arm_candidates or filter_similar_poses.
-    n_sample:
-        Total points to sample (split evenly between left and right).
-    n_plots:
-        Number of 3D subplots (arranged in a 2×3 grid, last cell empty).
-    arrow_len:
-        Length of each axis arrow in metres.
-    save_path:
-        If given, save the figure to this path (in addition to plt.show()).
+    Args:
+        left_poses: Left-arm candidate poses as ``(pos, quat_wxyz)`` tuples,
+            typically the output of :func:`filter_similar_poses` applied to
+            :func:`generate_left_arm_candidates`.
+        right_poses: Right-arm candidate poses in the same format.
+        n_sample: Total number of poses to display across all subplots,
+            split evenly between the two arms and across *n_plots* panels.
+        n_plots: Number of 3-D subplots to create.  Panels are arranged in
+            rows of three; unused cells in the last row are hidden.
+        arrow_len: Base length of each axis arrow in metres.  The x- and
+            y-axis arrows are additionally scaled to 0.5× to reduce visual
+            clutter.
+        save_path: If provided, the figure is saved to this file path (PNG,
+            PDF, etc.) in addition to being shown interactively.
+
+    Returns:
+        None.  Calls ``plt.show()`` and optionally writes *save_path*.
     """
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
@@ -402,3 +488,98 @@ if __name__ == "__main__":
     print("\nRendering pose visualisation ...")
     visualize_pregrasp_poses(filt_l, filt_r, n_sample=60, n_plots=6,
                              save_path="models/pregrasp_poses.png")
+
+    # IK filtering example (requires a running CuRoboBimanualMotionPlanner):
+    #
+    #   from robot_motion_interface.utils.kinematics import CuRoboBimanualMotionPlanner
+    #   planner = CuRoboBimanualMotionPlanner(robot_cfg_path="...", collision_activation_distance=0.025)
+    #   ik_results = filter_by_ik(filt_l, filt_r, planner, max_pairs=500, verbose=True)
+    #   print(f"\nFeasible bimanual pre-grasp poses: {len(ik_results)}")
+    #   for (l_pos, l_quat), (r_pos, r_quat), q_sol in ik_results[:3]:
+    #       print(f"  left={np.round(l_pos, 3)}  right={np.round(r_pos, 3)}")
+    #       print(f"  q_sol={np.round(q_sol, 3)}")
+
+    # IKResult: ((l_pos, l_quat_wxyz), (r_pos, r_quat_wxyz), q_solution [n_joints,])
+    IKResult = tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray], np.ndarray]
+
+    def filter_by_ik(
+        left_poses: list[tuple[np.ndarray, np.ndarray]],
+        right_poses: list[tuple[np.ndarray, np.ndarray]],
+        planner,  # CuRoboBimanualMotionPlanner — avoids circular import
+        max_pairs: int | None = None,
+        shuffle: bool = True,
+        verbose: bool = True,
+    ) -> list[IKResult]:
+        """Filter bimanual pose pairs by IK feasibility.
+
+        Iterates over every (left, right) Cartesian-product combination (up to
+        *max_pairs*) and keeps only those for which the bimanual IK solver
+        finds a valid, self-collision-free joint configuration.
+
+        Args:
+            left_poses: Filtered left-arm candidate poses as ``(pos, quat_wxyz)``
+                tuples, typically from :func:`filter_similar_poses`.
+            right_poses: Filtered right-arm candidate poses in the same format.
+            planner: A ready (warmed-up) ``CuRoboBimanualMotionPlanner``
+                instance whose ``solve_ik`` method will be called.
+            max_pairs: Maximum number of combinations to test.  ``None`` tests
+                the full Cartesian product (``len(left) × len(right)`` pairs).
+            shuffle: If ``True``, randomly shuffle the Cartesian product before
+                testing so that feasible results are spread across the whole
+                workspace rather than clustered around the first few left poses.
+            verbose: If ``True``, print a progress line every 100 pairs and a
+                summary line at the end.
+
+        Returns:
+            List of ``IKResult`` triples
+            ``((l_pos, l_quat_wxyz), (r_pos, r_quat_wxyz), q_sol)`` where
+            ``q_sol`` is a float32 NumPy array of shape ``(n_joints,)``
+            containing the full joint solution (arm + gripper joints for both
+            arms).
+        """
+        pairs: list[tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]] = list(
+            itertools.product(left_poses, right_poses)
+        )
+        if shuffle:
+            rng = np.random.default_rng()
+            rng.shuffle(pairs)  # type: ignore[arg-type]
+        if max_pairs is not None:
+            pairs = pairs[:max_pairs]
+
+        n_total = len(pairs)
+        results: list[IKResult] = []
+
+        for i, ((l_pos, l_quat), (r_pos, r_quat)) in enumerate(pairs):
+            q_sol, ok = planner.solve_ik(l_pos, l_quat, r_pos, r_quat)
+            if ok:
+                # q_sol is a torch.Tensor on GPU; convert once, store as numpy
+                q_np = q_sol.detach().cpu().numpy().astype(np.float32)
+                results.append(((l_pos, l_quat), (r_pos, r_quat), q_np))
+
+            if verbose and (i + 1) % 100 == 0:
+                pct = 100.0 * len(results) / (i + 1)
+                print(f"  [{i + 1:>{len(str(n_total))}}/{n_total}]  "
+                    f"feasible: {len(results)}  ({pct:.1f} %)")
+
+        if verbose:
+            pct = 100.0 * len(results) / max(n_total, 1)
+            print(f"IK filter done — {len(results)}/{n_total} pairs feasible ({pct:.1f} %)")
+
+        return results
+
+    from .kinematics import CuRoboBimanualMotionPlanner, DEFAULT_CUROBO_ROBOT_CFG_PATH
+    planner = CuRoboBimanualMotionPlanner(
+        robot_cfg_path              = DEFAULT_CUROBO_ROBOT_CFG_PATH,
+        left_ee_link                = "left_delto_base_link",
+        right_ee_link               = "right_delto_base_link",
+        device                      = "cuda:0",
+        trajopt_tsteps              = 64,
+        interpolation_steps         = 2000,
+        num_ik_seeds                = 50,
+        num_trajopt_seeds           = 32,
+        grad_trajopt_iters          = 800,
+        interpolation_dt            = 0.02,
+        collision_activation_distance = 0.005,
+    )
+    
+    filter_by_ik(filt_l, filt_r, planner=planner, max_pairs=None, verbose=True)  # planner=None for smoke test
