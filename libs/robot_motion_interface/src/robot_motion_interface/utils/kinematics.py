@@ -11,6 +11,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import time
+import pinocchio as pin
 
 import torch
 
@@ -32,6 +34,7 @@ from curobo.geom.types import Cuboid, WorldConfig
 
 from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig, MotionGenPlanConfig
 from curobo.wrap.model.robot_world import RobotWorld, RobotWorldConfig
+from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
 
 # ---------------------------------------------------------------------------
 # Project-relative path resolution
@@ -47,6 +50,21 @@ DEFAULT_BIMANUAL_URDF_PATH      = str((_ROBOT_DESC / "rl/bimanual_panda_tesollo.
 DEFAULT_CUROBO_ROBOT_CFG_PATH   = str((_CONFIGS_CUROBO / "robot/bimanual_panda_tesollo.yml").resolve())
 DEFAULT_COLLISION_SPHERES_PATH  = str((_CONFIGS_CUROBO / "robot/spheres/bimanual_panda_tesollo_spheres.yml").resolve())
 DEFAULT_CUROBO_WORLD_CFG_PATH   = str((_CONFIGS_CUROBO / "world/bimanual_table.yml").resolve())
+
+# Finger joint lock values used during IK.
+# M1=0, M2=0, M3=π/4 (≈45°), M4=π/6 (≈30°) — same for every finger on both hands.
+# Only the 7+7 arm joints are optimised; fingers are held fixed at these values.
+_FINGER_JOINT_LOCK: dict[str, float] = {
+    j: v
+    for side in ("left", "right")
+    for f in (1, 2, 3)
+    for j, v in [
+        (f"{side}_F{f}M1", 0.0),
+        (f"{side}_F{f}M2", 0.0),
+        (f"{side}_F{f}M3", 0.7853981633974483),   # π/4
+        (f"{side}_F{f}M4", 0.5235987755982988),   # π/6
+    ]
+}
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +90,10 @@ class PinocchioBimanualFK:
             left_hand_base_names  = ["left_delto_base_link"],
             right_hand_base_names = ["right_delto_base_link"],
         )
-        l_base, r_base, l_tips, r_tips = fk.forward(q_left, q_right)
+        l_base, l_tips, r_base, r_tips = fk.forward(q_left, q_right)
+        # each array: [n, 7] = [x, y, z, qw, qx, qy, qz]
+        l_base_pos,  l_base_quat  = l_base[:, :3],  l_base[:, 3:]
+        l_tips_pos,  l_tips_quat  = l_tips[:, :3],  l_tips[:, 3:]
     """
 
     def __init__(
@@ -84,9 +105,7 @@ class PinocchioBimanualFK:
         left_hand_base_names: list[str],
         right_hand_base_names: list[str],
     ) -> None:
-        
-        import pinocchio as pin
-        
+                
         self._pin = pin
         self._action_per_chain = action_per_chain
 
@@ -116,19 +135,43 @@ class PinocchioBimanualFK:
             ids.append(fid)
         return ids
 
+    def _frame_pose(self, fid: int) -> np.ndarray:
+        """Return [7,] = [x, y, z, qw, qx, qy, qz] for a frame (world frame, float32).
+
+        Pinocchio internal convention:
+          data.oMf[i].rotation  -> 3×3 SO(3) matrix
+          pin.Quaternion(R)      -> Quaternion with .w .x .y .z components
+          .coeffs()              -> [qx, qy, qz, qw]  (xyzw, pinocchio order)
+        We output wxyz to match cuRobo / Isaac convention.
+        """
+        pose = self.data.oMf[fid]
+        t = pose.translation
+        q = self._pin.Quaternion(pose.rotation)
+        return np.array([t[0], t[1], t[2], q.w, q.x, q.y, q.z], dtype=np.float32)
+
     def forward(
         self,
         q_left: np.ndarray,
         q_right: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Run FK and return 7-DoF poses for hand bases and fingertips in world frame.
+
+        Returns:
+            l_base   : float32 [n_base, 7]  left  hand base  poses
+            l_tips   : float32 [n_tips, 7]  left  fingertip  poses
+            r_base   : float32 [n_base, 7]  right hand base  poses
+            r_tips   : float32 [n_tips, 7]  right fingertip  poses
+
+        Each row: [x, y, z, qw, qx, qy, qz]  (position + quaternion, wxyz convention)
+        """
         q = np.concatenate([q_left, q_right]).astype(np.float64)
         self._pin.forwardKinematics(self.model, self.data, q)
         self._pin.updateFramePlacements(self.model, self.data)
 
-        l_hand_base  = np.array([self.data.oMf[i].translation for i in self.l_hand_base_ids],  dtype=np.float32)
-        l_fingertips = np.array([self.data.oMf[i].translation for i in self.l_fingertip_ids],  dtype=np.float32)
-        r_hand_base  = np.array([self.data.oMf[i].translation for i in self.r_hand_base_ids],  dtype=np.float32)
-        r_fingertips = np.array([self.data.oMf[i].translation for i in self.r_fingertip_ids],  dtype=np.float32)
+        l_hand_base  = np.array([self._frame_pose(i) for i in self.l_hand_base_ids],  dtype=np.float32)
+        l_fingertips = np.array([self._frame_pose(i) for i in self.l_fingertip_ids],  dtype=np.float32)
+        r_hand_base  = np.array([self._frame_pose(i) for i in self.r_hand_base_ids],  dtype=np.float32)
+        r_fingertips = np.array([self._frame_pose(i) for i in self.r_fingertip_ids],  dtype=np.float32)
 
         return l_hand_base, l_fingertips, r_hand_base, r_fingertips
 
@@ -244,9 +287,17 @@ class CuRoboBimanualMotionPlanner:
         self._collision_activation_distance = collision_activation_distance
 
         self._motion_gen = MotionGen(motion_gen_cfg)
+        t_start = time.time()
         self._motion_gen.warmup()
+        t_end = time.time()
+        print(f"MotionGen warmup took {(t_end - t_start):.6f} seconds.")
+
         self._motion_gen.world_coll_checker.clear_cache()
         self._motion_gen.reset(reset_seed=False)
+
+        # IK solver — built lazily on first call to solve_ik()
+        self._ik_solver: IKSolver | None = None
+        self._ik_arm_joint_names: list[str] = []
 
         # cuRobo builds its internal joint ordering from the URDF kinematic-chain traversal,
         # which may differ from self._joint_names (our user-facing order).
@@ -370,6 +421,132 @@ class CuRoboBimanualMotionPlanner:
             self._make_plan_config(max_attempts, timeout, time_dilation_factor),
         )
         return self._extract_trajectory(result)
+
+    # ------------------------------------------------------------------
+    # IK solver (lazy-init, finger joints locked)
+    # ------------------------------------------------------------------
+
+    def _ensure_ik_solver(self, num_seeds: int = 30) -> None:
+        """Build the IK solver on first call.
+
+        Finger joints are locked at the values in ``_FINGER_JOINT_LOCK``
+        (M1=0, M2=0, M3=π/4, M4=π/6) so the optimiser only moves the
+        7+7 arm joints.  A separate RobotConfig is loaded for this purpose
+        so the main MotionGen model is not affected.
+        """
+        if self._ik_solver is not None:
+            return
+
+        robot_cfg_dict = load_yaml(self._robot_cfg_path)
+        robot_cfg_dict["robot_cfg"]["kinematics"]["urdf_path"]         = self._urdf_path
+        robot_cfg_dict["robot_cfg"]["kinematics"]["collision_spheres"] = self._spheres_path
+        robot_cfg_dict["robot_cfg"]["kinematics"]["lock_joints"] = _FINGER_JOINT_LOCK
+
+        ik_robot_cfg = RobotConfig.from_dict(robot_cfg_dict, self.tensor_args)
+        ik_cfg = IKSolverConfig.load_from_robot_config(
+            ik_robot_cfg,
+            world_model=self.world_cfg,
+            num_seeds=num_seeds,
+            position_threshold=0.005,
+            rotation_threshold=0.05,
+            self_collision_check=True,
+            self_collision_opt=True,
+            tensor_args=self.tensor_args,
+        )
+        self._ik_solver = IKSolver(ik_cfg)
+        # Active joint names in solver's internal order (14 arm joints, no fingers)
+        self._ik_arm_joint_names = list(self._ik_solver.rollout_fn.joint_names)
+        print(f"IKSolver ready: {len(self._ik_arm_joint_names)} active joints "
+              f"(fingers locked: M1=0, M2=0, M3=π/4, M4=π/6)  seeds={num_seeds}")
+
+    def solve_ik(
+        self,
+        left_target_pos: np.ndarray,   # (3,) or (n, 3)   world frame
+        left_target_quat: np.ndarray,  # (4,) or (n, 4)   wxyz
+        right_target_pos: np.ndarray,  # (3,) or (n, 3)
+        right_target_quat: np.ndarray, # (4,) or (n, 4)   wxyz
+        num_seeds: int = 30,
+        max_batch: int = 200,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Solve bimanual IK for batched (left, right) EE pose pairs.
+
+        Finger joints are fixed at the values in ``_FINGER_JOINT_LOCK``
+        (M1=0, M2=0, M3=π/4, M4=π/6) and excluded from optimisation.
+        The primary EE is ``left_delto_base_link``; ``right_delto_base_link``
+        is constrained via ``link_poses``.
+
+        Parameters
+        ----------
+        left_target_pos / left_target_quat:
+            Desired pose of left_delto_base_link.
+            Shape (3,)/(4,) for one goal or (n, 3)/(n, 4) for a batch.
+        right_target_pos / right_target_quat:
+            Desired pose of right_delto_base_link (same shape conventions).
+        num_seeds:
+            Random IK seeds per goal.  More seeds → higher success rate, slower.
+        max_batch:
+            Goals per GPU kernel call.  Large batches are chunked automatically.
+
+        Returns
+        -------
+        q_solutions : (n, 38) float32 in BIMANUAL_JOINT_NAMES order.
+                      Finger joints are set to the locked values.
+                      Failed rows are filled with NaN.
+        success     : (n,) bool
+        """
+        self._ensure_ik_solver(num_seeds)
+        assert self._ik_solver is not None
+
+        l_pos  = np.atleast_2d(left_target_pos).astype(np.float32)   # (n, 3)
+        l_quat = np.atleast_2d(left_target_quat).astype(np.float32)  # (n, 4)
+        r_pos  = np.atleast_2d(right_target_pos).astype(np.float32)
+        r_quat = np.atleast_2d(right_target_quat).astype(np.float32)
+        n = l_pos.shape[0]
+
+        # Map IK solver's active joint names → columns in the full 38-DOF config
+        full_idx    = {name: i for i, name in enumerate(self._joint_names)}
+        arm_to_full = [full_idx[j] for j in self._ik_arm_joint_names if j in full_idx]
+
+        # Pre-fill output with locked finger values; arm joints are written per-batch below.
+        q_full = np.zeros((n, len(self._joint_names)), dtype=np.float32)
+        for jname, jval in _FINGER_JOINT_LOCK.items():
+            if jname in full_idx:
+                q_full[:, full_idx[jname]] = jval
+        success = np.zeros(n, dtype=bool)
+
+        for start in range(0, n, max_batch):
+            end    = min(start + max_batch, n)
+
+            goal_pose = Pose(
+                position  = torch.tensor(l_pos[start:end],  device=self._device),
+                quaternion= torch.tensor(l_quat[start:end], device=self._device),
+            )
+            right_pose = Pose(
+                position  = torch.tensor(r_pos[start:end],  device=self._device),
+                quaternion= torch.tensor(r_quat[start:end], device=self._device),
+            )
+
+            result = self._ik_solver.solve_batch(
+                goal_pose,
+                link_poses={self._right_ee_link: right_pose},
+                return_seeds=1,
+            )
+
+            succ = result.success.view(-1).cpu().numpy().astype(bool)  # (batch,)
+            success[start:end] = succ
+
+            # solution shape: [batch, n_arm_dof] (return_seeds=1)
+            q_arm = result.solution.view(end - start, -1).cpu().numpy()
+
+            # Place arm joints into the correct columns of q_full
+            for arm_i, full_i in enumerate(arm_to_full):
+                q_full[start:end, full_i] = q_arm[:, arm_i]
+
+        q_full[~success] = np.nan
+        n_ok = int(success.sum())
+        print(f"IK: {n_ok}/{n} goals solved  "
+              f"({100 * n_ok / max(n, 1):.1f}%)")
+        return q_full, success
 
     # ------------------------------------------------------------------
     # Collision checking
@@ -541,59 +718,222 @@ if __name__ == "__main__":
         0.0, 0.0, 0.7853981633974483, 0.5235987755982988,
     ], dtype=np.float32)
 
-    print("\nInitializing CuRoboBimanualMotionPlanner (warmup may take ~30 s)...")
-    planner = CuRoboBimanualMotionPlanner(
-        robot_cfg_path              = DEFAULT_CUROBO_ROBOT_CFG_PATH,
-        world_cfg_path              = DEFAULT_CUROBO_WORLD_CFG_PATH,
-        left_ee_link                = "left_delto_base_link",
-        right_ee_link               = "right_delto_base_link",
-        joint_names                 = BIMANUAL_JOINT_NAMES,
-        device                      = "cuda:0",
-        trajopt_tsteps              = 64,
-        interpolation_steps         = 2000,
-        num_ik_seeds                = 50,
-        num_trajopt_seeds           = 32,   # was 12; 38-DoF bimanual needs significantly more seeds
-        grad_trajopt_iters          = 800,  # was 800
-        interpolation_dt            = 0.02,
-        collision_activation_distance = 0.005,  # was 0.005; increased to provide better gradients for optimizer
-    )
 
-
-    def _check_and_print(name, q):
-        world_col, self_col = planner.is_in_collision(q, verbose=True)
-        if world_col or self_col:
-            print(f"[COLLISION] {name}  world={world_col}  self={self_col}")
-        else:
-            print(f"[OK] {name} is collision-free.")
-
-    print("\nChecking HOME_Q for collision...")
-    _check_and_print("HOME_Q", HOME_Q)
-    
-    print("\nSaving HOME_Q scene mesh for debug visualization...")
-    planner.save_scene_as_mesh(HOME_Q, str((_LIBS_ROOT.parent / "models" / "robot_world_home_q.stl").resolve()))
-
-    print("\nChecking PRE_GRASP_Q for collision...")
-    _check_and_print("PRE_GRASP_Q", PRE_GRASP_Q)
-    
-    print("\nSaving pre-grasp scene mesh for debug visualization...")
-    planner.save_scene_as_mesh(PRE_GRASP_Q, str((_LIBS_ROOT.parent / "models" / "robot_world_pregrasp_q.stl").resolve()))
+    def test_curobo():
         
-    print("\nChecking endpoint validity at planner's activation distance...")
-    home_ok     = planner.check_at_planning_distance(HOME_Q,     "HOME_Q")
-    pregrasp_ok = planner.check_at_planning_distance(PRE_GRASP_Q, "PRE_GRASP_Q")
-    if not home_ok or not pregrasp_ok:
-        print("[WARN] One or both endpoints are invalid at the planner's activation distance.")
-        print("       Reduce collision_activation_distance or adjust the joint configuration.")
-
-    print(f"\nPlanning trajectory from HOME_Q to PRE_GRASP_Q...")
-    traj, ok, status = planner.plan_to_joint(HOME_Q, PRE_GRASP_Q)
-    if ok:
-        print(
-            f"[OK] Trajectory: {traj.shape[0]} steps x {traj.shape[1]} DoF  "
-            f"(dt={planner._interpolation_dt:.3f}s, "
-            f"~{traj.shape[0] * planner._interpolation_dt:.1f}s total)"
+        print("\n" + "=" * 60)
+        print("Curobo smoke test")
+        print("=" * 60)
+        
+        print("\nInitializing CuRoboBimanualMotionPlanner (warmup may take ~30 s)...")
+        planner = CuRoboBimanualMotionPlanner(
+            robot_cfg_path              = DEFAULT_CUROBO_ROBOT_CFG_PATH,
+            world_cfg_path              = DEFAULT_CUROBO_WORLD_CFG_PATH,
+            left_ee_link                = "left_delto_base_link",
+            right_ee_link               = "right_delto_base_link",
+            joint_names                 = BIMANUAL_JOINT_NAMES,
+            device                      = "cuda:0",
+            trajopt_tsteps              = 64,
+            interpolation_steps         = 2000,
+            num_ik_seeds                = 50,
+            num_trajopt_seeds           = 32,   # was 12; 38-DoF bimanual needs significantly more seeds
+            grad_trajopt_iters          = 800,  # was 800
+            interpolation_dt            = 0.02,
+            collision_activation_distance = 0.005,  # was 0.005; increased to provide better gradients for optimizer
         )
-        print(f"     Start : {traj[0]}")
-        print(f"     End   : {traj[-1]}")
-    else:
-        print(f"[FAIL] Planning failed: {status}")
+
+
+        def _check_and_print(name, q):
+            world_col, self_col = planner.is_in_collision(q, verbose=True)
+            if world_col or self_col:
+                print(f"[COLLISION] {name}  world={world_col}  self={self_col}")
+            else:
+                print(f"[OK] {name} is collision-free.")
+
+        print("\nChecking HOME_Q for collision...")
+        t_start = time.time()
+        _check_and_print("HOME_Q", HOME_Q)
+        t_end = time.time()
+        print(f"Collision check took {(t_end - t_start):.6f} seconds.")
+        
+        print("\nSaving HOME_Q scene mesh for debug visualization...")
+        t_start = time.time()
+        planner.save_scene_as_mesh(HOME_Q, str((_LIBS_ROOT.parent / "models" / "robot_world_home_q.stl").resolve()))
+        t_end = time.time()
+        print(f"Scene mesh saved in {(t_end - t_start):.6f} seconds.")
+
+
+        print("\nChecking PRE_GRASP_Q for collision...")
+        t_start = time.time()
+        _check_and_print("PRE_GRASP_Q", PRE_GRASP_Q)
+        t_end = time.time()
+        print(f"Collision check took {(t_end - t_start):.6f} seconds.")
+        
+        print("\nSaving pre-grasp scene mesh for debug visualization...")
+        t_start = time.time()
+        planner.save_scene_as_mesh(PRE_GRASP_Q, str((_LIBS_ROOT.parent / "models" / "robot_world_pregrasp_q.stl").resolve()))
+        t_end = time.time()
+        print(f"Scene mesh saved in {(t_end - t_start):.6f} seconds.")
+            
+        print("\nChecking endpoint validity at planner's activation distance...")
+        home_ok     = planner.check_at_planning_distance(HOME_Q,     "HOME_Q")
+        pregrasp_ok = planner.check_at_planning_distance(PRE_GRASP_Q, "PRE_GRASP_Q")
+        if not home_ok or not pregrasp_ok:
+            print("[WARN] One or both endpoints are invalid at the planner's activation distance.")
+            print("       Reduce collision_activation_distance or adjust the joint configuration.")
+
+        print(f"\nPlanning trajectory from HOME_Q to PRE_GRASP_Q...")
+        t_start = time.time()
+        traj, ok, status = planner.plan_to_joint(HOME_Q, PRE_GRASP_Q)
+        if ok:
+            print(
+                f"[OK] Trajectory: {traj.shape[0]} steps x {traj.shape[1]} DoF  "
+                f"(dt={planner._interpolation_dt:.3f}s, "
+                f"~{traj.shape[0] * planner._interpolation_dt:.1f}s total)"
+            )
+            print(f"     Start : {traj[0]}")
+            print(f"     End   : {traj[-1]}")
+        else:
+            print(f"[FAIL] Planning failed: {status}")
+        t_end = time.time()
+        print(f"Planning took {(t_end - t_start):.6f} seconds.")
+
+        # ------------------------------------------------------------------
+        # IK smoke test — 3 solve_ik calls
+        # ------------------------------------------------------------------
+        print("\n" + "-" * 60)
+        print("IK smoke test  (3 batches)")
+        print("-" * 60)
+
+        _N_PER_CHAIN = 19   # 7 arm + 12 finger joints per chain
+
+        # Pinocchio FK to compute ground-truth EE poses at known joint configs.
+        fk = PinocchioBimanualFK(
+            urdf_path=DEFAULT_BIMANUAL_URDF_PATH,
+            action_per_chain=_N_PER_CHAIN,
+            left_fingertip_names =["left_F1_TIP_TOP",  "left_F2_TIP_TOP",  "left_F3_TIP_TOP"],
+            right_fingertip_names=["right_F1_TIP_TOP", "right_F2_TIP_TOP", "right_F3_TIP_TOP"],
+            left_hand_base_names =["left_delto_base_link"],
+            right_hand_base_names=["right_delto_base_link"],
+        )
+
+        def _fk_ee(q_full):
+            """Return (l_pos, l_quat, r_pos, r_quat) at q_full via Pinocchio."""
+            lb, _, rb, _ = fk.forward(q_full[:_N_PER_CHAIN], q_full[_N_PER_CHAIN:])
+            return lb[0, :3], lb[0, 3:], rb[0, :3], rb[0, 3:]   # all wxyz
+
+        # Test case 1 — FK at HOME_Q  (arm in "ready" position)
+        # Test case 2 — FK at PRE_GRASP_Q  (known near-goal config)
+        # Test case 3 — FK at PRE_GRASP_Q + small random noise  (nearby reachable target)
+        from scipy.spatial.transform import Rotation as _R
+        rng = np.random.default_rng(7)
+        noise_pos  = rng.uniform(-0.02, 0.02, 3).astype(np.float32)
+        axis = rng.standard_normal(3); axis /= np.linalg.norm(axis)
+        dq   = _R.from_rotvec(axis * np.deg2rad(5.0)).as_quat()       # xyzw
+        dq_w = np.array([dq[3], dq[0], dq[1], dq[2]], dtype=np.float32)  # wxyz
+
+        def _qmul(a, b):   # wxyz quaternion product
+            aw, ax, ay, az = a;  bw, bx, by, bz = b
+            return np.array([aw*bw-ax*bx-ay*by-az*bz,
+                             aw*bx+ax*bw+ay*bz-az*by,
+                             aw*by-ax*bz+ay*bw+az*bx,
+                             aw*bz+ax*by-ay*bx+az*bw], dtype=np.float32)
+
+        lp_h, lq_h, rp_h, rq_h = _fk_ee(HOME_Q)
+        lp_p, lq_p, rp_p, rq_p = _fk_ee(PRE_GRASP_Q)
+
+        test_cases = [
+            ("HOME_Q    → IK",
+             lp_h, lq_h, rp_h, rq_h),
+            ("PRE_GRASP → IK",
+             lp_p, lq_p, rp_p, rq_p),
+            ("PRE_GRASP + noise → IK",
+             lp_p + noise_pos, _qmul(dq_w, lq_p),
+             rp_p + noise_pos * 0.5, _qmul(dq_w, rq_p)),
+        ]
+
+        for idx, (label, lp, lq, rp, rq) in enumerate(test_cases):
+            print(f"\n  [IK test {idx+1}/3]  {label}")
+            print(f"    left  target  pos={np.round(lp, 3)}  quat(wxyz)={np.round(lq, 3)}")
+            print(f"    right target  pos={np.round(rp, 3)}  quat(wxyz)={np.round(rq, 3)}")
+            t_start = time.time()
+            q_sols, succ = planner.solve_ik(
+                left_target_pos=lp,   left_target_quat=lq,
+                right_target_pos=rp,  right_target_quat=rq,
+            )
+            t_end = time.time()
+            print(f"    solve_ik took {(t_end - t_start):.3f} s")
+            if succ[0]:
+                q_sol = q_sols[0]
+                # Verify via FK: position error at the IK solution
+                lb2, _, rb2, _ = fk.forward(q_sol[:_N_PER_CHAIN], q_sol[_N_PER_CHAIN:])
+                l_err = np.linalg.norm(lb2[0, :3] - lp)
+                r_err = np.linalg.norm(rb2[0, :3] - rp)
+                print(f"    [OK] left pos-err={l_err*1000:.1f} mm   right pos-err={r_err*1000:.1f} mm")
+                print(f"    q_sol arm-left  = {np.round(q_sol[:7], 3)}")
+                print(f"    q_sol arm-right = {np.round(q_sol[19:26], 3)}")
+                _check_and_print(f"IK_sol_{idx+1}", q_sol)
+            else:
+                print(f"    [FAIL] IK did not converge for this target.")
+
+    # ------------------------------------------------------------------
+    # Pinocchio FK smoke test
+    # ------------------------------------------------------------------
+    # Bimanual URDF has 38 DoF (nq = 2 * action_per_chain = 2 * 19).
+    # PinocchioBimanualFK takes q_left (19,) and q_right (19,) separately,
+    # concatenates them internally in URDF joint declaration order.
+    #
+    # Frame names verified against bimanual_panda_tesollo.urdf:
+    #   hand base  : left_delto_base_link / right_delto_base_link
+    #   fingertips : left_F{1,2,3}_TIP_TOP / right_F{1,2,3}_TIP_TOP
+    #
+    # Key difference vs rl_policy_node.py (old single-chain approach):
+    #   Old node: two separate pin models, each nq=19, called FK twice.
+    #   New class: one bimanual model, nq=38, called FK once with both arms.
+    # ------------------------------------------------------------------
+
+    def test_pinocchio():
+        
+        import time
+        
+        ACTION_PER_CHAIN = 19  # 7 arm + 12 finger joints
+        LEFT_FINGERTIP_NAMES  = ["left_F1_TIP_TOP",  "left_F2_TIP_TOP",  "left_F3_TIP_TOP"]
+        RIGHT_FINGERTIP_NAMES = ["right_F1_TIP_TOP", "right_F2_TIP_TOP", "right_F3_TIP_TOP"]
+        LEFT_HAND_BASE_NAMES  = ["left_delto_base_link"]
+        RIGHT_HAND_BASE_NAMES = ["right_delto_base_link"]
+        
+        print("\n" + "=" * 60)
+        print("Pinocchio FK smoke test")
+        print("=" * 60)
+        
+        fk = PinocchioBimanualFK(
+            urdf_path             = DEFAULT_BIMANUAL_URDF_PATH,
+            action_per_chain      = ACTION_PER_CHAIN,
+            left_fingertip_names  = LEFT_FINGERTIP_NAMES,
+            right_fingertip_names = RIGHT_FINGERTIP_NAMES,
+            left_hand_base_names  = LEFT_HAND_BASE_NAMES,
+            right_hand_base_names = RIGHT_HAND_BASE_NAMES,
+        )
+        print(f"Pinocchio model nq={fk.model.nq}  (expected {ACTION_PER_CHAIN * 2})")
+
+        for _ in range(1):
+            for label, q_full in [("HOME_Q", HOME_Q), ("PRE_GRASP_Q", PRE_GRASP_Q)]:
+                q_left  = q_full[:ACTION_PER_CHAIN]
+                q_right = q_full[ACTION_PER_CHAIN:]
+                
+                t_start = time.time()
+                l_base, l_tips, r_base, r_tips = fk.forward(q_left, q_right)
+                t_end = time.time()
+                # Each array: [n, 7] = [x, y, z, qw, qx, qy, qz]
+                print(f"\n--- {label}  ({(t_end-t_start)*1000:.2f} ms) ---")
+                for name, pose in zip(LEFT_HAND_BASE_NAMES, l_base):
+                    print(f"  L base  {name:28s} pos={pose[:3]}  quat(wxyz)={pose[3:]}")
+                for name, pose in zip(RIGHT_HAND_BASE_NAMES, r_base):
+                    print(f"  R base  {name:28s} pos={pose[:3]}  quat(wxyz)={pose[3:]}")
+                for name, pose in zip(LEFT_FINGERTIP_NAMES, l_tips):
+                    print(f"  L tip   {name:28s} pos={pose[:3]}  quat(wxyz)={pose[3:]}")
+                for name, pose in zip(RIGHT_FINGERTIP_NAMES, r_tips):
+                    print(f"  R tip   {name:28s} pos={pose[:3]}  quat(wxyz)={pose[3:]}")
+        
+    test_pinocchio()
+    test_curobo()

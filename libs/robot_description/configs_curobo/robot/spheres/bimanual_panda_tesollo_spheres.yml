@@ -315,79 +315,100 @@ collision_spheres:
       radius: 0.01
 
   # ===== TABLE TOP =====
-  # 9×4 grid (0.20m spacing), radius=0.085m, center z=0 (box center in table_top frame)
-  # → sphere top at world z=+0.0625m (6.25cm above table surface)
-  # → arm links must stay above ~6-7cm from table to avoid self-collision cost
+  # 9x5 grid, r=1.0m, spacing=0.19m, center_z=-0.9775m (link frame)
+  # Sphere TOPS at link frame z=+0.0225 = world z=0 (table surface)
+  # Sphere centers 1m BELOW the table surface: world z = -1.0m
+  # Large radius -> small curvature -> flat surface approximation -> fewer spheres needed
+  # h_detect (r_robot=0.012, act_dist=0.005) = 0.1006m > spacing/2 ✓
+  # Sphere-sphere overlap (same link) is ignored by cuRobo self-collision checker
   table_top:
-    - center: [-0.8, -0.3, 0.0]
-      radius: 0.085
-    - center: [-0.8, -0.1, 0.0]
-      radius: 0.085
-    - center: [-0.8, 0.1, 0.0]
-      radius: 0.085
-    - center: [-0.8, 0.3, 0.0]
-      radius: 0.085
-    - center: [-0.6, -0.3, 0.0]
-      radius: 0.085
-    - center: [-0.6, -0.1, 0.0]
-      radius: 0.085
-    - center: [-0.6, 0.1, 0.0]
-      radius: 0.085
-    - center: [-0.6, 0.3, 0.0]
-      radius: 0.085
-    - center: [-0.4, -0.3, 0.0]
-      radius: 0.085
-    - center: [-0.4, -0.1, 0.0]
-      radius: 0.085
-    - center: [-0.4, 0.1, 0.0]
-      radius: 0.085
-    - center: [-0.4, 0.3, 0.0]
-      radius: 0.085
-    - center: [-0.2, -0.3, 0.0]
-      radius: 0.085
-    - center: [-0.2, -0.1, 0.0]
-      radius: 0.085
-    - center: [-0.2, 0.1, 0.0]
-      radius: 0.085
-    - center: [-0.2, 0.3, 0.0]
-      radius: 0.085
-    - center: [0.0, -0.3, 0.0]
-      radius: 0.085
-    - center: [0.0, -0.1, 0.0]
-      radius: 0.085
-    - center: [0.0, 0.1, 0.0]
-      radius: 0.085
-    - center: [0.0, 0.3, 0.0]
-      radius: 0.085
-    - center: [0.2, -0.3, 0.0]
-      radius: 0.085
-    - center: [0.2, -0.1, 0.0]
-      radius: 0.085
-    - center: [0.2, 0.1, 0.0]
-      radius: 0.085
-    - center: [0.2, 0.3, 0.0]
-      radius: 0.085
-    - center: [0.4, -0.3, 0.0]
-      radius: 0.085
-    - center: [0.4, -0.1, 0.0]
-      radius: 0.085
-    - center: [0.4, 0.1, 0.0]
-      radius: 0.085
-    - center: [0.4, 0.3, 0.0]
-      radius: 0.085
-    - center: [0.6, -0.3, 0.0]
-      radius: 0.085
-    - center: [0.6, -0.1, 0.0]
-      radius: 0.085
-    - center: [0.6, 0.1, 0.0]
-      radius: 0.085
-    - center: [0.6, 0.3, 0.0]
-      radius: 0.085
-    - center: [0.8, -0.3, 0.0]
-      radius: 0.085
-    - center: [0.8, -0.1, 0.0]
-      radius: 0.085
-    - center: [0.8, 0.1, 0.0]
-      radius: 0.085
-    - center: [0.8, 0.3, 0.0]
-      radius: 0.085
+    - center: [-0.76, -0.38, -0.9775]
+      radius: 1.0
+    - center: [-0.76, -0.19, -0.9775]
+      radius: 1.0
+    - center: [-0.76, 0.0, -0.9775]
+      radius: 1.0
+    - center: [-0.76, 0.19, -0.9775]
+      radius: 1.0
+    - center: [-0.76, 0.38, -0.9775]
+      radius: 1.0
+    - center: [-0.57, -0.38, -0.9775]
+      radius: 1.0
+    - center: [-0.57, -0.19, -0.9775]
+      radius: 1.0
+    - center: [-0.57, 0.0, -0.9775]
+      radius: 1.0
+    - center: [-0.57, 0.19, -0.9775]
+      radius: 1.0
+    - center: [-0.57, 0.38, -0.9775]
+      radius: 1.0
+    - center: [-0.38, -0.38, -0.9775]
+      radius: 1.0
+    - center: [-0.38, -0.19, -0.9775]
+      radius: 1.0
+    - center: [-0.38, 0.0, -0.9775]
+      radius: 1.0
+    - center: [-0.38, 0.19, -0.9775]
+      radius: 1.0
+    - center: [-0.38, 0.38, -0.9775]
+      radius: 1.0
+    - center: [-0.19, -0.38, -0.9775]
+      radius: 1.0
+    - center: [-0.19, -0.19, -0.9775]
+      radius: 1.0
+    - center: [-0.19, 0.0, -0.9775]
+      radius: 1.0
+    - center: [-0.19, 0.19, -0.9775]
+      radius: 1.0
+    - center: [-0.19, 0.38, -0.9775]
+      radius: 1.0
+    - center: [0.0, -0.38, -0.9775]
+      radius: 1.0
+    - center: [0.0, -0.19, -0.9775]
+      radius: 1.0
+    - center: [0.0, 0.0, -0.9775]
+      radius: 1.0
+    - center: [0.0, 0.19, -0.9775]
+      radius: 1.0
+    - center: [0.0, 0.38, -0.9775]
+      radius: 1.0
+    - center: [0.19, -0.38, -0.9775]
+      radius: 1.0
+    - center: [0.19, -0.19, -0.9775]
+      radius: 1.0
+    - center: [0.19, 0.0, -0.9775]
+      radius: 1.0
+    - center: [0.19, 0.19, -0.9775]
+      radius: 1.0
+    - center: [0.19, 0.38, -0.9775]
+      radius: 1.0
+    - center: [0.38, -0.38, -0.9775]
+      radius: 1.0
+    - center: [0.38, -0.19, -0.9775]
+      radius: 1.0
+    - center: [0.38, 0.0, -0.9775]
+      radius: 1.0
+    - center: [0.38, 0.19, -0.9775]
+      radius: 1.0
+    - center: [0.38, 0.38, -0.9775]
+      radius: 1.0
+    - center: [0.57, -0.38, -0.9775]
+      radius: 1.0
+    - center: [0.57, -0.19, -0.9775]
+      radius: 1.0
+    - center: [0.57, 0.0, -0.9775]
+      radius: 1.0
+    - center: [0.57, 0.19, -0.9775]
+      radius: 1.0
+    - center: [0.57, 0.38, -0.9775]
+      radius: 1.0
+    - center: [0.76, -0.38, -0.9775]
+      radius: 1.0
+    - center: [0.76, -0.19, -0.9775]
+      radius: 1.0
+    - center: [0.76, 0.0, -0.9775]
+      radius: 1.0
+    - center: [0.76, 0.19, -0.9775]
+      radius: 1.0
+    - center: [0.76, 0.38, -0.9775]
+      radius: 1.0
