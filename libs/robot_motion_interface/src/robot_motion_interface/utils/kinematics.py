@@ -310,6 +310,24 @@ class CuRoboBimanualMotionPlanner:
         )
         self._robot_world_plan = RobotWorld(robot_world_plan_cfg)
 
+    def __del__(self) -> None:
+        """Release internal cuRobo solvers and return freed GPU memory to the CUDA driver.
+
+        PyTorch uses a caching allocator: memory freed by deleting tensors/modules
+        stays in PyTorch's own free-block pool until empty_cache() is called.
+        This only affects the current process — other processes have independent
+        CUDA contexts and are unaffected.  Active tensors in the same process
+        (e.g. a policy network) are also unaffected; only the pool of already-free
+        blocks is returned to the driver.
+        """
+        for attr in ("_trajopt", "_ik_solver", "_robot_world", "_robot_world_plan"):
+            try:
+                delattr(self, attr)
+            except AttributeError:
+                pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def _warmup(self) -> None:
         """Run dummy solves to trigger CUDA graph compilation."""
         q_ret = self._trajopt.retract_config  # [1, dof], internal order
