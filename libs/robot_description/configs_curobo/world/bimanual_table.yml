@@ -14,7 +14,17 @@
 ##     bottom       = z = -0.2
 ##
 
+# Table is now part of the robot URDF (table_top link) and handled via
+# self-collision checking with collision spheres. Do not re-add it here
+# to avoid double collision checking and conflicting gradients.
+#
+# cuRobo's primitive collision checker requires at least one obstacle to
+# initialize — an empty world raises "Primitive Collision has no obstacles".
+# The floor plane below serves as a minimal placeholder: it sits 5 m below
+# the workspace so it never affects planning or gradients.
+#
+# Add dynamic obstacles (boxes, objects) here at runtime via update_world().
 cuboid:
-  table:
-    dims: [1.8288, 0.62865, 0.2]         # length x width x thickness (m)
-    pose: [0.0, 0.0, -0.1, 1, 0, 0, 0]  # center at z = -thickness/2 = -0.1
+  floor_placeholder:
+    dims: [2.0, 2.0, 0.01]   # thin slab, 10 m × 10 m
+    pose: [0.0, 0.0, -1.0, 1.0, 0.0, 0.0, 0.0]  # 5 m below workspace

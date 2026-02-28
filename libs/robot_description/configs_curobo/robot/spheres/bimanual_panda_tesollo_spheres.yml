@@ -313,3 +313,81 @@ collision_spheres:
       radius: 0.012
     - center: [0.04, 0.0, 0.0]
       radius: 0.01
+
+  # ===== TABLE TOP =====
+  # 9×4 grid (0.20m spacing), radius=0.085m, center z=0 (box center in table_top frame)
+  # → sphere top at world z=+0.0625m (6.25cm above table surface)
+  # → arm links must stay above ~6-7cm from table to avoid self-collision cost
+  table_top:
+    - center: [-0.8, -0.3, 0.0]
+      radius: 0.085
+    - center: [-0.8, -0.1, 0.0]
+      radius: 0.085
+    - center: [-0.8, 0.1, 0.0]
+      radius: 0.085
+    - center: [-0.8, 0.3, 0.0]
+      radius: 0.085
+    - center: [-0.6, -0.3, 0.0]
+      radius: 0.085
+    - center: [-0.6, -0.1, 0.0]
+      radius: 0.085
+    - center: [-0.6, 0.1, 0.0]
+      radius: 0.085
+    - center: [-0.6, 0.3, 0.0]
+      radius: 0.085
+    - center: [-0.4, -0.3, 0.0]
+      radius: 0.085
+    - center: [-0.4, -0.1, 0.0]
+      radius: 0.085
+    - center: [-0.4, 0.1, 0.0]
+      radius: 0.085
+    - center: [-0.4, 0.3, 0.0]
+      radius: 0.085
+    - center: [-0.2, -0.3, 0.0]
+      radius: 0.085
+    - center: [-0.2, -0.1, 0.0]
+      radius: 0.085
+    - center: [-0.2, 0.1, 0.0]
+      radius: 0.085
+    - center: [-0.2, 0.3, 0.0]
+      radius: 0.085
+    - center: [0.0, -0.3, 0.0]
+      radius: 0.085
+    - center: [0.0, -0.1, 0.0]
+      radius: 0.085
+    - center: [0.0, 0.1, 0.0]
+      radius: 0.085
+    - center: [0.0, 0.3, 0.0]
+      radius: 0.085
+    - center: [0.2, -0.3, 0.0]
+      radius: 0.085
+    - center: [0.2, -0.1, 0.0]
+      radius: 0.085
+    - center: [0.2, 0.1, 0.0]
+      radius: 0.085
+    - center: [0.2, 0.3, 0.0]
+      radius: 0.085
+    - center: [0.4, -0.3, 0.0]
+      radius: 0.085
+    - center: [0.4, -0.1, 0.0]
+      radius: 0.085
+    - center: [0.4, 0.1, 0.0]
+      radius: 0.085
+    - center: [0.4, 0.3, 0.0]
+      radius: 0.085
+    - center: [0.6, -0.3, 0.0]
+      radius: 0.085
+    - center: [0.6, -0.1, 0.0]
+      radius: 0.085
+    - center: [0.6, 0.1, 0.0]
+      radius: 0.085
+    - center: [0.6, 0.3, 0.0]
+      radius: 0.085
+    - center: [0.8, -0.3, 0.0]
+      radius: 0.085
+    - center: [0.8, -0.1, 0.0]
+      radius: 0.085
+    - center: [0.8, 0.1, 0.0]
+      radius: 0.085
+    - center: [0.8, 0.3, 0.0]
+      radius: 0.085

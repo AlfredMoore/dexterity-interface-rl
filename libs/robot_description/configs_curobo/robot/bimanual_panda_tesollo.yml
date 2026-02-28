@@ -31,6 +31,8 @@ robot_cfg:
       'right_F1_01', 'right_F1_02', 'right_F1_03', 'right_F1_04', 'right_F1_TIP',
       'right_F2_01', 'right_F2_02', 'right_F2_03', 'right_F2_04', 'right_F2_TIP',
       'right_F3_01', 'right_F3_02', 'right_F3_03', 'right_F3_04', 'right_F3_TIP',
+      # Table
+      'table_top',
     ]
 
     # collision_spheres: 'spheres/bimanual_panda_tesollo.yml'
@@ -41,7 +43,7 @@ robot_cfg:
     # Self-collision pairs to ignore (based on franka.yml and ur5e_robotiq_2f_140.yml)
     self_collision_ignore: {
       # Left arm self-collisions (from franka.yml pattern)
-      "left_panda_link0": ["left_panda_link1", "left_panda_link2"],
+      "left_panda_link0": ["left_panda_link1", "left_panda_link2", "table_top"],
       "left_panda_link1": ["left_panda_link2", "left_panda_link3", "left_panda_link4"],
       "left_panda_link2": ["left_panda_link3", "left_panda_link4"],
       "left_panda_link3": ["left_panda_link4", "left_panda_link6"],
@@ -91,7 +93,7 @@ robot_cfg:
       "left_F3_04": ["left_F3_TIP"],
 
       # Right arm self-collisions (mirror of left)
-      "right_panda_link0": ["right_panda_link1", "right_panda_link2"],
+      "right_panda_link0": ["right_panda_link1", "right_panda_link2", "table_top"],
       "right_panda_link1": ["right_panda_link2", "right_panda_link3", "right_panda_link4"],
       "right_panda_link2": ["right_panda_link3", "right_panda_link4"],
       "right_panda_link3": ["right_panda_link4", "right_panda_link6"],
@@ -139,16 +141,22 @@ robot_cfg:
       "right_F3_02": ["right_F3_03", "right_F3_04", "right_F3_TIP"],
       "right_F3_03": ["right_F3_04", "right_F3_TIP"],
       "right_F3_04": ["right_F3_TIP"],
+
+      # Table
+      "table_top": [
+        "left_panda_link0", "left_panda_link1", 
+        "right_panda_link0", "right_panda_link1"
+      ],
     }
 
     # Self-collision buffer (from franka.yml pattern)
     self_collision_buffer: {
-      'left_panda_link0': 0.1,
+      'left_panda_link0': 0.05,
       'left_panda_link1': 0.05,
-      'left_delto_base_link': 0.02,
-      'right_panda_link0': 0.1,
+      'left_delto_base_link': 0.002,
+      'right_panda_link0': 0.05,
       'right_panda_link1': 0.05,
-      'right_delto_base_link': 0.02,
+      'right_delto_base_link': 0.002,
     }
 
     # Use mesh collision for arm links and hand/finger links
@@ -169,6 +177,7 @@ robot_cfg:
       'right_F1_01', 'right_F1_02', 'right_F1_03', 'right_F1_04', 'right_F1_TIP',
       'right_F2_01', 'right_F2_02', 'right_F2_03', 'right_F2_04', 'right_F2_TIP',
       'right_F3_01', 'right_F3_02', 'right_F3_03', 'right_F3_04', 'right_F3_TIP',
+      # table_top uses a box primitive in the URDF, not a mesh file — do NOT add here
     ]
 
     # Lock joints: null means all joints are active

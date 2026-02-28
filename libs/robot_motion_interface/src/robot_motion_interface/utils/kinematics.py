@@ -45,7 +45,7 @@ _CONFIGS_CUROBO = _ROBOT_DESC / "configs_curobo"
 DEFAULT_BIMANUAL_URDF_PATH      = str((_ROBOT_DESC / "rl/bimanual_panda_tesollo.urdf").resolve())
 
 DEFAULT_CUROBO_ROBOT_CFG_PATH   = str((_CONFIGS_CUROBO / "robot/bimanual_panda_tesollo.yml").resolve())
-DEFAULT_COLLISION_SPHERES_PATH  = str((_CONFIGS_CUROBO / "robot/spheres/bimanual_panda_tesollo.yml").resolve())
+DEFAULT_COLLISION_SPHERES_PATH  = str((_CONFIGS_CUROBO / "robot/spheres/bimanual_panda_tesollo_spheres.yml").resolve())
 DEFAULT_CUROBO_WORLD_CFG_PATH   = str((_CONFIGS_CUROBO / "world/bimanual_table.yml").resolve())
 
 
@@ -241,6 +241,8 @@ class CuRoboBimanualMotionPlanner:
             collision_activation_distance=collision_activation_distance,
             evaluate_interpolated_trajectory=True,
         )
+        self._collision_activation_distance = collision_activation_distance
+
         self._motion_gen = MotionGen(motion_gen_cfg)
         self._motion_gen.warmup()
         self._motion_gen.world_coll_checker.clear_cache()
@@ -376,63 +378,53 @@ class CuRoboBimanualMotionPlanner:
     def is_in_collision(
         self,
         q: np.ndarray,  # (n_joints,)
+        verbose: bool = False,
     ) -> tuple[bool, bool]:
         """
         Check whether a joint configuration is in collision.
 
         cuRobo cost convention: cost == 0 → free, cost > 0 → collision.
-        collision_activation_distance=0.0 means only actual penetration is reported.
+
+        Args:
+            q       : (n_joints,) joint configuration.
+            verbose : If True and collision detected, print the non-zero entries of
+                      d_world and d_self (indices + values) for quick debugging.
 
         Returns:
-            world_in_collision : True if any link sphere penetrates a world obstacle.
-            self_in_collision  : True if any link-sphere pair penetrates each other.
+            world_in_collision : True if any sphere penetrates a world obstacle.
+            self_in_collision  : True if any sphere pair penetrates each other.
         """
         q_t = self._make_joint_state(q).position
         d_world, d_self = self._robot_world.get_world_self_collision_distance_from_joints(q_t)
-        return bool((d_world > 0.0).any().item()), bool((d_self > 0.0).any().item())
+        world_col = bool((d_world > 0.0).any().item())
+        self_col  = bool((d_self  > 0.0).any().item())
+        if verbose and (world_col or self_col):
+            if world_col:
+                mask = d_world > 0.0
+                print(f"  d_world nonzero idx={mask.nonzero(as_tuple=False).squeeze(-1).tolist()}"
+                      f"  values={d_world[mask].tolist()}")
+            if self_col:
+                mask = d_self > 0.0
+                print(f"  d_self  nonzero idx={mask.nonzero(as_tuple=False).squeeze(-1).tolist()}"
+                      f"  values={d_self[mask].tolist()}")
+        return world_col, self_col
 
-    def get_collision_details(
-        self,
-        q: np.ndarray,  # (n_joints,)
-    ) -> dict:
+    def check_at_planning_distance(self, q: np.ndarray, label: str = "") -> bool:
         """
-        Return per-link collision details for debugging.
+        Check whether q is valid from the planner's perspective (using the planner's
+        collision_activation_distance, not the 0.0 used by is_in_collision).
 
-        Iterates over every collision link, checks only its spheres against the world,
-        and reports links with non-zero cost (actual penetration).
+        If this returns False, plan_to_joint will ALWAYS fail regardless of other settings,
+        because the start/goal itself is considered "in collision" by MotionGen.
 
-        Returns dict with keys:
-            "world_links"  : list of (link_name, cost) for links with world collision.
-            "self_col"     : bool — overall self-collision status.
-            "self_cost"    : float — raw self-collision cost (0 = free).
-
-        Example:
-            details = planner.get_collision_details(q)
-            if details["world_links"]:
-                for link, cost in details["world_links"]:
-                    print(f"  {link}: penetration cost = {cost:.4f}")
+        Returns True if the config is valid for planning.
         """
-        q_t   = self._make_joint_state(q).position
-        state = self._robot_world.get_kinematics(q_t)
-        sph   = state.link_spheres_tensor          # [1, n_spheres, 4]
-        kin   = self._robot_world.kinematics.kinematics_config
-
-        world_links: list[tuple[str, float]] = []
-        for link_name in kin.collision_link_names:
-            sph_idx = kin.get_sphere_index_from_link_name(link_name)
-            if sph_idx.numel() == 0:
-                continue
-            link_sph = sph[:, sph_idx, :].unsqueeze(1)  # [1, 1, k, 4]
-            cost = self._robot_world.get_collision_distance(link_sph).sum().item()
-            if cost > 0.0:
-                world_links.append((link_name, cost))
-
-        d_self    = self._robot_world.get_self_collision_distance(sph.unsqueeze(1)).sum().item()
-        return {
-            "world_links": world_links,
-            "self_col":    d_self > 0.0,
-            "self_cost":   d_self,
-        }
+        js = self._make_joint_state(q)
+        valid, status = self._motion_gen.check_start_state(js)
+        tag = "[VALID@plan_dist]  " if valid else "[INVALID@plan_dist]"
+        suffix = f" {label}" if label else ""
+        print(f"{tag}{suffix}: {status}  (activation_distance={self._collision_activation_distance}m)")
+        return bool(valid)
 
     # ------------------------------------------------------------------
     # Dynamic world updates
@@ -510,6 +502,16 @@ class CuRoboBimanualMotionPlanner:
         for obj in self.world_cfg.objects:
             scene.add_obstacle(obj)
 
+        # table_top uses a <box> primitive in the URDF (no mesh file), so it is not
+        # captured by get_robot_as_mesh. Add it explicitly as a cuboid for visualization.
+        # Dimensions and pose must match add_table_top() in generate_bimanual_panda_tesollo.py:
+        #   box: 1.8288 × 0.62865 × 0.045 m, top face at z=0 → centre at z=-0.0225
+        scene.add_obstacle(Cuboid(
+            name="table_top_visual",
+            pose=[0.0, 0.0, -0.0225, 1.0, 0.0, 0.0, 0.0],
+            dims=[1.8288, 0.62865, 0.045],
+        ))
+
         scene.save_world_as_mesh(str(Path(save_path).resolve()), process_color=False)
 
 
@@ -539,7 +541,7 @@ if __name__ == "__main__":
         0.0, 0.0, 0.7853981633974483, 0.5235987755982988,
     ], dtype=np.float32)
 
-    print("Initializing CuRoboBimanualMotionPlanner (warmup may take ~30 s)...")
+    print("\nInitializing CuRoboBimanualMotionPlanner (warmup may take ~30 s)...")
     planner = CuRoboBimanualMotionPlanner(
         robot_cfg_path              = DEFAULT_CUROBO_ROBOT_CFG_PATH,
         world_cfg_path              = DEFAULT_CUROBO_WORLD_CFG_PATH,
@@ -547,13 +549,13 @@ if __name__ == "__main__":
         right_ee_link               = "right_delto_base_link",
         joint_names                 = BIMANUAL_JOINT_NAMES,
         device                      = "cuda:0",
-        trajopt_tsteps              = 34,
+        trajopt_tsteps              = 64,
         interpolation_steps         = 2000,
-        num_ik_seeds                = 30,
-        num_trajopt_seeds           = 4,
-        grad_trajopt_iters          = 500,
+        num_ik_seeds                = 50,
+        num_trajopt_seeds           = 32,   # was 12; 38-DoF bimanual needs significantly more seeds
+        grad_trajopt_iters          = 800,  # was 800
         interpolation_dt            = 0.02,
-        collision_activation_distance = 0.025,
+        collision_activation_distance = 0.005,  # was 0.005; increased to provide better gradients for optimizer
     )
     
     
@@ -565,14 +567,9 @@ if __name__ == "__main__":
     planner.save_scene_as_mesh(PRE_GRASP_Q, str((_LIBS_ROOT.parent / "models" / "robot_world_pregrasp_q.stl").resolve()))
 
     def _check_and_print(name, q):
-        world_col, self_col = planner.is_in_collision(q)
+        world_col, self_col = planner.is_in_collision(q, verbose=True)
         if world_col or self_col:
             print(f"[COLLISION] {name}  world={world_col}  self={self_col}")
-            details = planner.get_collision_details(q)
-            for link, cost in details["world_links"]:
-                print(f"    world  {link:40s}  cost={cost:.4f}")
-            if details["self_col"]:
-                print(f"    self   cost={details['self_cost']:.4f}")
         else:
             print(f"[OK] {name} is collision-free.")
 
@@ -582,6 +579,13 @@ if __name__ == "__main__":
     print("\nChecking PRE_GRASP_Q for collision...")
     _check_and_print("PRE_GRASP_Q", PRE_GRASP_Q)
         
+    print("\nChecking endpoint validity at planner's activation distance...")
+    home_ok     = planner.check_at_planning_distance(HOME_Q,     "HOME_Q")
+    pregrasp_ok = planner.check_at_planning_distance(PRE_GRASP_Q, "PRE_GRASP_Q")
+    if not home_ok or not pregrasp_ok:
+        print("[WARN] One or both endpoints are invalid at the planner's activation distance.")
+        print("       Reduce collision_activation_distance or adjust the joint configuration.")
+
     print(f"\nPlanning trajectory from HOME_Q to PRE_GRASP_Q...")
     traj, ok, status = planner.plan_to_joint(HOME_Q, PRE_GRASP_Q)
     if ok:
