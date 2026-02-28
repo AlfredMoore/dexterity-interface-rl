@@ -557,14 +557,7 @@ if __name__ == "__main__":
         interpolation_dt            = 0.02,
         collision_activation_distance = 0.005,  # was 0.005; increased to provide better gradients for optimizer
     )
-    
-    
-    
-    print("\nSaving initial scene mesh for debug visualization...")
-    planner.save_scene_as_mesh(HOME_Q, str((_LIBS_ROOT.parent / "models" / "robot_world_home_q.stl").resolve()))
-    
-    print("\nSaving pre-grasp scene mesh for debug visualization...")
-    planner.save_scene_as_mesh(PRE_GRASP_Q, str((_LIBS_ROOT.parent / "models" / "robot_world_pregrasp_q.stl").resolve()))
+
 
     def _check_and_print(name, q):
         world_col, self_col = planner.is_in_collision(q, verbose=True)
@@ -575,9 +568,15 @@ if __name__ == "__main__":
 
     print("\nChecking HOME_Q for collision...")
     _check_and_print("HOME_Q", HOME_Q)
+    
+    print("\nSaving HOME_Q scene mesh for debug visualization...")
+    planner.save_scene_as_mesh(HOME_Q, str((_LIBS_ROOT.parent / "models" / "robot_world_home_q.stl").resolve()))
 
     print("\nChecking PRE_GRASP_Q for collision...")
     _check_and_print("PRE_GRASP_Q", PRE_GRASP_Q)
+    
+    print("\nSaving pre-grasp scene mesh for debug visualization...")
+    planner.save_scene_as_mesh(PRE_GRASP_Q, str((_LIBS_ROOT.parent / "models" / "robot_world_pregrasp_q.stl").resolve()))
         
     print("\nChecking endpoint validity at planner's activation distance...")
     home_ok     = planner.check_at_planning_distance(HOME_Q,     "HOME_Q")
