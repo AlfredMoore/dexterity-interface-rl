@@ -32,7 +32,9 @@ from curobo.util_file import (
 
 from curobo.geom.types import Cuboid, WorldConfig
 
-from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig, MotionGenPlanConfig
+from curobo.rollout.rollout_base import Goal
+from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
+from curobo.wrap.reacher.trajopt import TrajOptSolver, TrajOptSolverConfig
 from curobo.wrap.model.robot_world import RobotWorld, RobotWorldConfig
 
 # ---------------------------------------------------------------------------
@@ -220,14 +222,12 @@ class CuRoboBimanualMotionPlanner:
     def __init__(
         self,
         robot_cfg_path: str = DEFAULT_CUROBO_ROBOT_CFG_PATH,
-        world_cfg_path: str = DEFAULT_CUROBO_WORLD_CFG_PATH,
         urdf_path: str = DEFAULT_BIMANUAL_URDF_PATH,
         spheres_path: str = DEFAULT_COLLISION_SPHERES_PATH,
         left_ee_link: str = "left_delto_base_link",
         right_ee_link: str = "right_delto_base_link",
         joint_names: list[str] | None = None,
         device: str = "cuda:0",
-        # MotionGen tuning parameters
         trajopt_tsteps: int = 34,
         interpolation_steps: int = 2000,
         num_ik_seeds: int = 30,
@@ -235,7 +235,7 @@ class CuRoboBimanualMotionPlanner:
         grad_trajopt_iters: int = 500,
         interpolation_dt: float = 0.02,
         collision_activation_distance: float = 0.01,
-    ) -> None:        
+    ) -> None:
 
         self._device = device
         self._left_ee_link  = left_ee_link
@@ -247,63 +247,95 @@ class CuRoboBimanualMotionPlanner:
         self._spheres_path   = spheres_path
         self._collision_activation_distance = collision_activation_distance
 
-
         self.tensor_args = TensorDeviceType(device=torch.device(device))
 
         robot_cfg_dict = load_yaml(robot_cfg_path)
         robot_cfg_dict["robot_cfg"]["kinematics"]["urdf_path"] = urdf_path
         robot_cfg_dict["robot_cfg"]["kinematics"]["collision_spheres"] = spheres_path
         self.robot_cfg = RobotConfig.from_dict(robot_cfg_dict, self.tensor_args)
-        self.world_cfg = WorldConfig.from_dict(load_yaml(world_cfg_path))
 
-        # Motion planner (trajectory generation)
-        motion_gen_cfg = MotionGenConfig.load_from_robot_config(
+        # Trajectory optimizer (no world model, self-collision only)
+        trajopt_config = TrajOptSolverConfig.load_from_robot_config(
             robot_cfg=self.robot_cfg,
             world_model=None,
             tensor_args=self.tensor_args,
-            trajopt_tsteps=trajopt_tsteps,
+            self_collision_check=True,
+            self_collision_opt=True,
+            traj_tsteps=trajopt_tsteps,
             interpolation_steps=interpolation_steps,
-            num_ik_seeds=num_ik_seeds,
-            num_trajopt_seeds=num_trajopt_seeds,
+            num_seeds=num_trajopt_seeds,
             grad_trajopt_iters=grad_trajopt_iters,
             interpolation_dt=interpolation_dt,
-            collision_activation_distance=self._collision_activation_distance,
+            collision_activation_distance=collision_activation_distance,
             evaluate_interpolated_trajectory=True,
+            use_cuda_graph=True,
         )
+        self._trajopt = TrajOptSolver(trajopt_config)
 
-        self._motion_gen = MotionGen(motion_gen_cfg)
+        # IK solver (for plan_to_pose: EE poses → joint config)
+        ik_config = IKSolverConfig.load_from_robot_config(
+            robot_cfg=self.robot_cfg,
+            world_model=None,
+            tensor_args=self.tensor_args,
+            num_seeds=num_ik_seeds,
+            self_collision_check=True,
+            self_collision_opt=True,
+            use_cuda_graph=True,
+        )
+        self._ik_solver = IKSolver(ik_config)
+
+        # Warmup: triggers CUDA graph compilation for both solvers
         t_start = time.time()
-        self._motion_gen.warmup()
+        self._warmup()
         t_end = time.time()
-        print(f"MotionGen warmup took {(t_end - t_start):.6f} seconds.")
+        print(f"TrajOpt+IK warmup took {(t_end - t_start):.6f} seconds.")
 
-        # self._motion_gen.world_coll_checker.clear_cache()
-        self._motion_gen.reset(reset_seed=False)
+        # cuRobo internal joint ordering (URDF kinematic-chain traversal order).
+        # All cuRobo APIs expect joints in this order; we reorder inputs/outputs accordingly.
+        self._internal_joint_names: list[str] = list(self._trajopt.rollout_fn.joint_names)
 
-        # cuRobo builds its internal joint ordering from the URDF kinematic-chain traversal,
-        # which may differ from self._joint_names (our user-facing order).
-        # All cuRobo APIs (MotionGen, RobotWorld, CudaRobotModel) expect joints in this
-        # internal order. We cache it here so we can reorder inputs/outputs consistently.
-        self._internal_joint_names: list[str] = list(self._motion_gen.rollout_fn.joint_names)
-
-        # Standalone collision checker (same robot + world, no motion planning overhead)
+        # Collision checker at exact penetration (self_collision_check)
         robot_world_cfg = RobotWorldConfig.load_from_config(
             robot_config=self.robot_cfg,
             world_model=None,
-            collision_activation_distance=0.0,  # 0.0 = report actual penetration depth
+            self_collision_activation_distance=0.0,
         )
         self._robot_world = RobotWorld(robot_world_cfg)
+
+        # Collision checker at planning activation distance (check_at_planning_distance)
+        robot_world_plan_cfg = RobotWorldConfig.load_from_config(
+            robot_config=self.robot_cfg,
+            world_model=None,
+            self_collision_activation_distance=collision_activation_distance,
+        )
+        self._robot_world_plan = RobotWorld(robot_world_plan_cfg)
+
+    def _warmup(self) -> None:
+        """Run dummy solves to trigger CUDA graph compilation."""
+        q_ret = self._trajopt.retract_config  # [1, dof], internal order
+        goal = Goal(
+            goal_state=JointState.from_position(q_ret),
+            current_state=JointState.from_position(q_ret),
+        )
+        self._trajopt.solve_single(goal)
+
+        dummy_pos  = torch.zeros(3, dtype=self.tensor_args.dtype)
+        dummy_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=self.tensor_args.dtype)
+        self.solve_ik(
+            left_pos=dummy_pos.numpy(), left_quat=dummy_quat.numpy(),
+            right_pos=dummy_pos.numpy(), right_quat=dummy_quat.numpy(),
+        )
 
     # ------------------------------------------------------------------
     # Shared helpers
     # ------------------------------------------------------------------
 
-    def _make_joint_state(self, q: np.ndarray) -> JointState:
+    def _make_joint_state(self, q: np.ndarray | torch.Tensor) -> JointState:
         """Return a JointState with positions reordered to cuRobo's internal joint order."""
-        js = JointState.from_position(
-            torch.tensor(q, dtype=torch.float32, device=self._device).unsqueeze(0),
-            joint_names=self._joint_names,
-        )
+        q_t = torch.as_tensor(q, dtype=torch.float32, device=self._device)
+        if q_t.dim() == 1:
+            q_t = q_t.unsqueeze(0)
+        js = JointState.from_position(q_t, joint_names=self._joint_names)
         return js.get_ordered_joint_state(self._internal_joint_names)
 
     def _make_pose(self, pos: np.ndarray, quat: np.ndarray) -> Pose:
@@ -313,27 +345,54 @@ class CuRoboBimanualMotionPlanner:
         )
 
     def _extract_trajectory(self, result) -> tuple[np.ndarray | None, bool, str]:
-        if result.success.item():
-            traj = result.get_interpolated_plan()
-            # traj is in cuRobo's internal joint order; reorder to self._joint_names order.
+        if result.success.any().item():
+            traj = result.interpolated_solution
+            if traj is None:
+                traj = result.solution
             if traj.joint_names is not None:
                 traj = traj.get_ordered_joint_state(self._joint_names)
-            return traj.position.cpu().numpy(), True, str(result.status)
-        return None, False, str(result.status)
+            pos = traj.position
+            if pos.dim() == 3:
+                pos = pos[0]  # [T, dof]
+            return pos.cpu().numpy(), True, "success"
+        return None, False, "trajopt_failed"
 
-    def _make_plan_config(
+    # ------------------------------------------------------------------
+    # IK
+    # ------------------------------------------------------------------
+
+    def solve_ik(
         self,
-        max_attempts: int,
-        timeout: float,
-        time_dilation_factor: float,
-    ) -> MotionGenPlanConfig:
-        return MotionGenPlanConfig(
-            enable_graph=False,
-            enable_graph_attempt=3,
-            max_attempts=max_attempts,
-            timeout=timeout,
-            time_dilation_factor=time_dilation_factor,
+        left_pos: np.ndarray | torch.Tensor,   # (3,)  xyz in world frame
+        left_quat: np.ndarray | torch.Tensor,  # (4,)  w x y z
+        right_pos: np.ndarray | torch.Tensor,  # (3,)  xyz in world frame
+        right_quat: np.ndarray | torch.Tensor, # (4,)  w x y z
+    ) -> tuple[torch.Tensor | None, bool]:
+        """
+        Solve bimanual IK for given left and right EE poses simultaneously.
+
+        Left EE is the primary goal; right EE is enforced via link_poses constraint.
+        Both are solved jointly in a single optimization pass.
+
+        Returns:
+            q_solution : (n_joints,) float32 tensor on self._device, in self._joint_names order,
+                         or None if IK failed.
+            success    : True if a valid solution was found.
+        """
+        left_pose  = self._make_pose(left_pos,  left_quat)
+        right_pose = self._make_pose(right_pos, right_quat)
+        result = self._ik_solver.solve_single(
+            left_pose,
+            link_poses={self._right_ee_link: right_pose},
         )
+        if not result.success.any():
+            return None, False
+        idx = result.success.flatten().nonzero(as_tuple=False)[0, 0].item()
+        q_js = JointState.from_position(
+            result.js_solution.position[idx].unsqueeze(0),
+            joint_names=self._internal_joint_names,
+        ).get_ordered_joint_state(self._joint_names)
+        return q_js.position.squeeze(0), True
 
     # ------------------------------------------------------------------
     # Trajectory planning — Cartesian EE space
@@ -346,31 +405,25 @@ class CuRoboBimanualMotionPlanner:
         left_target_quat: np.ndarray,   # (4,)  w x y z
         right_target_pos: np.ndarray,   # (3,)  xyz in world frame
         right_target_quat: np.ndarray,  # (4,)  w x y z
-        max_attempts: int = 10,
-        timeout: float = 10.0,
-        time_dilation_factor: float = 1.0,
     ) -> tuple[np.ndarray | None, bool, str]:
         """
-        Plan a collision-free trajectory to the given dual-arm Cartesian EE poses.
+        Plan a self-collision-free trajectory to the given dual-arm Cartesian EE poses.
 
-        The primary EE (left_ee_link) is passed as the main IK goal; the secondary EE
-        (right_ee_link) is constrained via link_poses — matching multi_arm_reacher.py
-        convention from cuRobo examples.
+        Calls solve_ik to obtain q_goal, then runs TrajOpt joint-to-joint.
 
         Returns:
             trajectory  : (T, n_joints) float32 numpy array, or None if planning failed.
                           T waypoints spaced interpolation_dt seconds apart.
             success     : True if a valid trajectory was found.
-            status      : Human-readable status string from cuRobo.
+            status      : Human-readable status string.
         """
-        result = self._motion_gen.plan_single(
-            self._make_joint_state(q_start),
-            self._make_pose(left_target_pos, left_target_quat, ),
-            self._make_plan_config(max_attempts, timeout, time_dilation_factor),
-            link_poses=[self._make_pose(left_target_pos, left_target_quat),
-                        self._make_pose(right_target_pos, right_target_quat)],
+        q_goal, ik_ok = self.solve_ik(
+            left_target_pos, left_target_quat,
+            right_target_pos, right_target_quat,
         )
-        return self._extract_trajectory(result)
+        if not ik_ok:
+            return None, False, "ik_failed"
+        return self.plan_to_joint(q_start, q_goal)
 
     # ------------------------------------------------------------------
     # Trajectory planning — joint space
@@ -380,28 +433,21 @@ class CuRoboBimanualMotionPlanner:
         self,
         q_start: np.ndarray,    # (n_joints,)
         q_goal: np.ndarray,     # (n_joints,)
-        max_attempts: int = 10,
-        timeout: float = 10.0,
-        time_dilation_factor: float = 1.0,
     ) -> tuple[np.ndarray | None, bool, str]:
         """
-        Plan a collision-free trajectory to the given target joint configuration.
-
-        Useful for moving to a known pre-grasp joint state (e.g. from env.yaml
-        init poses) while guaranteeing collision avoidance along the path.
+        Plan a self-collision-free trajectory to the given target joint configuration.
 
         Returns:
             trajectory  : (T, n_joints) float32 numpy array, or None if planning failed.
                           T waypoints spaced interpolation_dt seconds apart.
             success     : True if a valid trajectory was found.
-            status      : Human-readable status string from cuRobo.
+            status      : Human-readable status string.
         """
-        result = self._motion_gen.plan_single_js(
-            self._make_joint_state(q_start),
-            self._make_joint_state(q_goal),
-            self._make_plan_config(max_attempts, timeout, time_dilation_factor),
+        goal = Goal(
+            goal_state=self._make_joint_state(q_goal),
+            current_state=self._make_joint_state(q_start),
         )
-        return self._extract_trajectory(result)
+        return self._extract_trajectory(self._trajopt.solve_single(goal))
 
     # ------------------------------------------------------------------
     # Collision checking
@@ -442,50 +488,25 @@ class CuRoboBimanualMotionPlanner:
 
     def check_at_planning_distance(self, q: np.ndarray, label: str = "") -> bool:
         """
-        Check whether q is valid from the planner's perspective (using the planner's
-        collision_activation_distance, not the 0.0 used by is_in_collision).
+        Check whether q is free of self-collision within the planner's activation distance.
 
-        If this returns False, plan_to_joint will ALWAYS fail regardless of other settings,
-        because the start/goal itself is considered "in collision" by MotionGen.
+        Uses a separate RobotWorld instance with self_collision_activation_distance set to
+        collision_activation_distance, so the result matches what TrajOpt considers valid.
 
         Returns True if the config is valid for planning.
         """
-        js = self._make_joint_state(q)
-        valid, status = self._motion_gen.check_start_state(js)
+        q_t = self._make_joint_state(q).position
+        if q_t.dim() == 1:
+            q_t = q_t.unsqueeze(0)
+        kin_state = self._robot_world_plan.get_kinematics(q_t)
+        d_self = self._robot_world_plan.get_self_collision(
+            kin_state.link_spheres_tensor.unsqueeze(1)
+        )
+        valid = not bool((d_self > 0.0).any().item())
         tag = "[VALID@plan_dist]  " if valid else "[INVALID@plan_dist]"
         suffix = f" {label}" if label else ""
-        print(f"{tag}{suffix}: {status}  (activation_distance={self._collision_activation_distance}m)")
-        return bool(valid)
-
-    # ------------------------------------------------------------------
-    # Dynamic world updates
-    # ------------------------------------------------------------------
-
-    def update_world(
-        self,
-        cuboids: list[dict] | None = None,
-    ) -> None:
-        """
-        Replace the current world obstacles with a new set of cuboids.
-
-        Args:
-            cuboids: List of obstacle dicts, each with:
-                       "name" : str
-                       "pose" : [x, y, z, qw, qx, qy, qz]
-                       "dims" : [size_x, size_y, size_z]
-
-        Example:
-            planner.update_world([
-                {"name": "box",   "pose": [0.0, 0.0, 1.0, 1, 0, 0, 0], "dims": [0.1, 0.1, 0.3]},
-                {"name": "table", "pose": [0.0, 0.0, 0.89, 1, 0, 0, 0], "dims": [1.8, 0.6, 0.04]},
-            ])
-        """
-
-        cuboid_objs = [
-            Cuboid(name=c["name"], pose=c["pose"], dims=c["dims"])
-            for c in (cuboids or [])
-        ]
-        self._motion_gen.update_world(WorldConfig(cuboid=cuboid_objs))
+        print(f"{tag}{suffix}  (activation_distance={self._collision_activation_distance}m)")
+        return valid
 
     # ------------------------------------------------------------------
     # Debug visualisation
@@ -528,21 +549,7 @@ class CuRoboBimanualMotionPlanner:
         js_ordered   = js.get_ordered_joint_state(kin_model.joint_names)
         robot_meshes = kin_model.get_robot_as_mesh(js_ordered.position)
 
-        # Combine robot link meshes with static world obstacles
         scene = WorldConfig(mesh=robot_meshes[:])
-        for obj in self.world_cfg.objects:
-            scene.add_obstacle(obj)
-
-        # table_top uses a <box> primitive in the URDF (no mesh file), so it is not
-        # captured by get_robot_as_mesh. Add it explicitly as a cuboid for visualization.
-        # Dimensions and pose must match add_table_top() in generate_bimanual_panda_tesollo.py:
-        #   box: 1.8288 × 0.62865 × 0.045 m, top face at z=0 → centre at z=-0.0225
-        scene.add_obstacle(Cuboid(
-            name="table_top_visual",
-            pose=[0.0, 0.0, -0.0225, 1.0, 0.0, 0.0, 0.0],
-            dims=[1.8288, 0.62865, 0.045],
-        ))
-
         scene.save_world_as_mesh(str(Path(save_path).resolve()), process_color=False)
 
 
@@ -582,7 +589,6 @@ if __name__ == "__main__":
         print("\nInitializing CuRoboBimanualMotionPlanner (warmup may take ~30 s)...")
         planner = CuRoboBimanualMotionPlanner(
             robot_cfg_path              = DEFAULT_CUROBO_ROBOT_CFG_PATH,
-            world_cfg_path              = DEFAULT_CUROBO_WORLD_CFG_PATH,
             left_ee_link                = "left_delto_base_link",
             right_ee_link               = "right_delto_base_link",
             joint_names                 = BIMANUAL_JOINT_NAMES,
@@ -590,10 +596,10 @@ if __name__ == "__main__":
             trajopt_tsteps              = 64,
             interpolation_steps         = 2000,
             num_ik_seeds                = 50,
-            num_trajopt_seeds           = 32,   # was 12; 38-DoF bimanual needs significantly more seeds
-            grad_trajopt_iters          = 800,  # was 800
+            num_trajopt_seeds           = 32,
+            grad_trajopt_iters          = 800,
             interpolation_dt            = 0.02,
-            collision_activation_distance = 0.005,  # was 0.005; increased to provide better gradients for optimizer
+            collision_activation_distance = 0.005,
         )
 
 
@@ -606,13 +612,22 @@ if __name__ == "__main__":
                 print(f"[OK] {name} is collision-free.")
             t_end = time.time()
             print(f"Collision check took {(t_end - t_start):.6f} seconds.\n")
+        
+        # ------------------------------------------------------------------
+        # Collision detection test
+        # ------------------------------------------------------------------
             
         _collision_check_test("HOME_Q", HOME_Q)
         planner.save_scene_as_mesh(HOME_Q, str((_LIBS_ROOT.parent / "models" / "robot_world_home_q.stl").resolve()))
+        print(f"[INFO] Saved HOME_Q scene mesh to {str((_LIBS_ROOT.parent / 'models' / 'robot_world_home_q.stl').resolve())}")
 
         _collision_check_test("PRE_GRASP_Q", PRE_GRASP_Q)
         planner.save_scene_as_mesh(PRE_GRASP_Q, str((_LIBS_ROOT.parent / "models" / "robot_world_pregrasp_q.stl").resolve()))
+        print(f"[INFO] Saved PRE_GRASP_Q scene mesh to {str((_LIBS_ROOT.parent / 'models' / 'robot_world_pregrasp_q.stl').resolve())}")
 
+        # ------------------------------------------------------------------
+        # Traj Optimization test
+        # ------------------------------------------------------------------
         print("\nChecking endpoint validity at planner's activation distance...")
         home_ok     = planner.check_at_planning_distance(HOME_Q,     "HOME_Q")
         pregrasp_ok = planner.check_at_planning_distance(PRE_GRASP_Q, "PRE_GRASP_Q")
@@ -635,6 +650,41 @@ if __name__ == "__main__":
             print(f"[FAIL] Planning failed: {status}")
         t_end = time.time()
         print(f"Planning took {(t_end - t_start):.6f} seconds.")
+
+        # ------------------------------------------------------------------
+        # IK solver test
+        # ------------------------------------------------------------------
+        IK_POSES = [
+            {
+                "label": "HOME_POSE",
+                "left_pos":   np.array([-0.25110966, -0.092,     0.48428035], dtype=np.float32),
+                "left_quat":  np.array([ 9.422508e-12, 1.0, -1.999867e-04, -2.980232e-08], dtype=np.float32),
+                "right_pos":  np.array([ 0.25190964, -0.092,     0.48428035], dtype=np.float32),
+                "right_quat": np.array([ 2.980232e-08, 1.999867e-04, 1.0, 9.422508e-12], dtype=np.float32),
+            },
+            {
+                "label": "PREGRASP_POSE",
+                "left_pos":   np.array([ 0.00075642, -0.188734,  0.05798346], dtype=np.float32),
+                "left_quat":  np.array([ 0.36853078, -0.07235682, 0.70111525,  0.6061246],  dtype=np.float32),
+                "right_pos":  np.array([-0.0425072,  -0.0159787,  0.21864755], dtype=np.float32),
+                "right_quat": np.array([ 0.04083621,  0.04871807, 0.997932,    0.00951763], dtype=np.float32),
+            },
+        ]
+
+        print("\nTesting solve_ik...")
+        for pose in IK_POSES:
+            t_start = time.time()
+            q_sol, ok = planner.solve_ik(
+                pose["left_pos"],  pose["left_quat"],
+                pose["right_pos"], pose["right_quat"],
+            )
+            t_end = time.time()
+            elapsed_ms = (t_end - t_start) * 1000.0
+            if ok:
+                print(f"[OK]   {pose['label']}  ({elapsed_ms:.1f} ms)")
+                print(f"       q = {q_sol.cpu().numpy()}")
+            else:
+                print(f"[FAIL] {pose['label']}: IK failed  ({elapsed_ms:.1f} ms)")
 
     # ------------------------------------------------------------------
     # Pinocchio FK smoke test
