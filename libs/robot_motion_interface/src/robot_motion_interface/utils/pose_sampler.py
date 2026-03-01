@@ -21,7 +21,8 @@ import itertools
 
 import numpy as np
 from scipy.spatial.transform import Rotation
-
+import torch
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -558,7 +559,7 @@ if __name__ == "__main__":
 
             if verbose and (i + 1) % 100 == 0:
                 pct = 100.0 * len(results) / (i + 1)
-                print(f"  [{i + 1:>{len(str(n_total))}}/{n_total}]  "
+                print(f"  [{i + 1:>{len(str(n_total))}}/{n_total} {(i + 1)/n_total:.1%}]  "
                     f"feasible: {len(results)}  ({pct:.1f} %)")
 
         if verbose:
@@ -567,7 +568,11 @@ if __name__ == "__main__":
 
         return results
 
-    from .kinematics import CuRoboBimanualMotionPlanner, DEFAULT_CUROBO_ROBOT_CFG_PATH
+    try:
+        from .kinematics import CuRoboBimanualMotionPlanner, DEFAULT_CUROBO_ROBOT_CFG_PATH
+    except ImportError:
+        from kinematics import CuRoboBimanualMotionPlanner, DEFAULT_CUROBO_ROBOT_CFG_PATH
+
     planner = CuRoboBimanualMotionPlanner(
         robot_cfg_path              = DEFAULT_CUROBO_ROBOT_CFG_PATH,
         left_ee_link                = "left_delto_base_link",
@@ -582,4 +587,21 @@ if __name__ == "__main__":
         collision_activation_distance = 0.005,
     )
     
-    filter_by_ik(filt_l, filt_r, planner=planner, max_pairs=None, verbose=True)  # planner=None for smoke test
+    feasible_pre_grasp_q = filter_by_ik(filt_l, filt_r, planner=planner, max_pairs=None, verbose=True)
+    print(f"\nFeasible bimanual pre-grasp poses: {len(feasible_pre_grasp_q)}")
+
+    if len(feasible_pre_grasp_q) > 0:
+        # ((l_pos, l_quat), (r_pos, r_quat), q_sol))
+        q_list = [item[2] for item in feasible_pre_grasp_q]
+        
+        q_tensor = torch.tensor(np.array(q_list), dtype=torch.float32)
+        print(f"\n[INFO] Generated Tensor Shape: {q_tensor.shape} (Expected: N x 38)")
+
+        save_dir = Path("models")
+        save_dir.mkdir(parents=True, exist_ok=True)
+        save_path = save_dir / "pre_grasp_q_samples.pt"
+        
+        torch.save(q_tensor, save_path)
+        print(f"[SUCCESS] Saved {len(feasible_pre_grasp_q)} feasible pre-grasp poses to {save_path.resolve()}")
+    else:
+        print("\n[WARN] No feasible pre-grasp poses were found. Nothing to save.")
