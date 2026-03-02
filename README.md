@@ -11,15 +11,6 @@ cd <path to>/dexterity-interface-rl
 docker run --name handrl-driver --rm -it --privileged --gpus all -v $(pwd)/libs:/workspace/libs -v $(pwd)/app:/workspace/app --net=host dex-driver
 ```
 
-### Policy Container (On inference computer)
-```bash
-docker build -f Dockerfile.policy -t dex-policy .
-```
-```bash
-cd <path to>/dexterity-interface-rl
-docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd)/libs:/workspace/libs -v $(pwd)/app:/workspace/app --net=host dex-policy
-```
-
 ROS2 Build
 ```bash
 cd /workspace/libs/robot_motion_interface/ros
@@ -50,6 +41,14 @@ ROS2 Run Test Node
 ros2 run robot_motion_interface_ros test_node
 ```
 
+### Policy Container (On inference computer)
+```bash
+docker build -f Dockerfile.policy -t dex-policy .
+```
+```bash
+cd <path to>/dexterity-interface-rl
+docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd)/libs:/workspace/libs -v $(pwd)/app:/workspace/app --net=host dex-policy
+```
 
 # Dexterity Interface
 
