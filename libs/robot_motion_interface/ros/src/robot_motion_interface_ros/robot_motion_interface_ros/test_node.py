@@ -1,26 +1,65 @@
+"""
+Interactive bimanual trajectory test node.
+
+Workflow
+--------
+1. Subscribes to /joint_states from rl_driver_node → q_start.
+2. Loads pre-sampled pre-grasp joint configs from a .pt file.
+3. Keyboard loop lets the user browse and select a target config → q_goal.
+4. On 'g' / Enter: collision-check q_goal, then plan a collision-free
+   trajectory with cuRobo, then replay it at the configured dt.
+
+Keyboard commands (type + Enter)
+---------------------------------
+  n          select next config
+  p          select previous config
+  <number>   jump to that config index
+  g / Enter  plan and execute current selection
+  q          quit
+"""
+import threading
+
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
 from sensor_msgs.msg import JointState
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 import numpy as np
+import torch
 import yaml
 from pathlib import Path
 import importlib.util
 
 from robot_motion_interface.utils.kinematics import CuRoboBimanualMotionPlanner
 
-# --- QoS Config: low latency (Best Effort) ---
+# --- QoS ---
 HIGH_PERF_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     durability=DurabilityPolicy.VOLATILE,
     history=HistoryPolicy.KEEP_LAST,
-    depth=1
+    depth=1,
 )
 
 spec = importlib.util.find_spec("robot_motion_interface")
 if spec is None or spec.origin is None:
     raise RuntimeError("Cannot locate robot_motion_interface")
-RMI_ROOT = Path(spec.origin).parent.parent.parent
+# spec.origin  = .../libs/robot_motion_interface/src/robot_motion_interface/__init__.py
+# .parent x3   = .../libs/robot_motion_interface/   (_RMI_ROOT)
+# .parent x4   = .../libs/
+# .parent x5   = project root
+
+_RMI_ROOT     = Path(spec.origin).parent.parent.parent
+_LIBS_ROOT = _RMI_ROOT.parent
+_PROJECT_ROOT = _LIBS_ROOT.parent
+
+_ROBOT_DESC = _LIBS_ROOT / "robot_description"
+_CONFIGS_CUROBO = _ROBOT_DESC / "configs_curobo"
+
+DEFAULT_BIMANUAL_URDF_PATH      = str((_ROBOT_DESC / "rl/bimanual_panda_tesollo.urdf").resolve())
+
+DEFAULT_CUROBO_ROBOT_CFG_PATH   = str((_CONFIGS_CUROBO / "robot/bimanual_panda_tesollo.yml").resolve())
+DEFAULT_COLLISION_SPHERES_PATH  = str((_CONFIGS_CUROBO / "robot/spheres/bimanual_panda_tesollo_spheres.yml").resolve())
+DEFAULT_CUROBO_WORLD_CFG_PATH   = str((_CONFIGS_CUROBO / "world/bimanual_table.yml").resolve())
 
 # dim: 7(L_arm) + 12(L_hand) + 7(R_arm) + 12(R_hand) = 38
 HOME_Q = np.array([
@@ -30,123 +69,215 @@ HOME_Q = np.array([
     0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
 ], dtype=np.float32)
 
-PRE_GRASP_Q = np.array([
-    # --- Left Joint Pose (19 dims) ---
-    -0.6981317007977318, 0.9075712110370514, 0.14835298641951802, -1.8657569703819383,
-    1.3788101090755203, 1.6126842288427605, 2.0943951023931953,   # panda 1-7
-    0.0, 0.0, 0.7853981633974483, 0.5235987755982988,             # F1M1-M4
-    0.0, 0.0, 0.7853981633974483, 0.5235987755982988,             # F2M1-M4
-    0.0, 0.0, 0.7853981633974483, 0.5235987755982988,             # F3M1-M4
-    # --- Right Joint Pose (19 dims) ---
-    -0.19198621771937624, 0.32986722862692824, 0.07853981633974483, -1.8936822384138476,
-    -0.059341194567807204, 2.1415189921970423, 0.8000065692366409, # panda 1-7
-    0.0, 0.0, 0.7853981633974483, 0.5235987755982988,             # F1M1-M4
-    0.0, 0.0, 0.7853981633974483, 0.5235987755982988,             # F2M1-M4
-    0.0, 0.0, 0.7853981633974483, 0.5235987755982988,             # F3M1-M4
-], dtype=np.float32)
+_IDLE      = "IDLE"
+_PLANNING  = "PLANNING"
+_EXECUTING = "EXECUTING"
 
 
 class BimanualTrajTestNode(Node):
     def __init__(self):
         super().__init__('bimanual_traj_test_node')
 
-        # read config to get joint names (ensure order consistency with driver_node)
-        default_config = str(RMI_ROOT / 'config' / 'rl_bimanual_driver_config.yaml')
-        self.declare_parameter('config_path', default_config)
-        config_path = self.get_parameter('config_path').get_parameter_value().string_value
+        # ── Parameters ────────────────────────────────────────────────────────
+        default_cfg      = str(_RMI_ROOT / 'config' / 'rl_bimanual_driver_config.yaml')
+        default_pregrasp = str(_PROJECT_ROOT / 'models' / 'pre_grasp_q_samples.pt')
+        self.declare_parameter('config_path',    default_cfg)
+        self.declare_parameter('pregrasp_path',  default_pregrasp)
+        config_path   = self.get_parameter('config_path').get_parameter_value().string_value
+        pregrasp_path = self.get_parameter('pregrasp_path').get_parameter_value().string_value
 
-        self.get_logger().info(f"Loading config from: {config_path}")
+        self.get_logger().info(f"Config:   {config_path}")
+        self.get_logger().info(f"Pregrasp: {pregrasp_path}")
 
         with open(config_path, 'r') as f:
             cfg = yaml.safe_load(f)
 
-        # joint names
-        l_joint_names = cfg['left_panda_joint_names'] + cfg['left_tesollo_joint_names']
-        l_joint_names = ['l_' + name for name in l_joint_names]
-        r_joint_names = cfg['right_panda_joint_names'] + cfg['right_tesollo_joint_names']
-        r_joint_names = ['r_' + name for name in r_joint_names]
-        self.joint_names = l_joint_names + r_joint_names
+        # ── Joint names (must match driver_node order) ─────────────────────
+        l_names = ['left_' + n for n in cfg['left_panda_joint_names']  + cfg['left_tesollo_joint_names']]
+        r_names = ['right_' + n for n in cfg['right_panda_joint_names'] + cfg['right_tesollo_joint_names']]
+        self.joint_names: list[str] = l_names + r_names   # 38 names
 
-        # target joint state publisher
+        # ── Load pre-grasp configs ──────────────────────────────────────────
+        pregrasp_tensor = torch.load(pregrasp_path, weights_only=True)   # (N, 38)
+        self._pregrasp_qs: np.ndarray = pregrasp_tensor.numpy().astype(np.float32)
+        self._n_configs = len(self._pregrasp_qs)
+        if self._n_configs == 0:
+            raise RuntimeError(f"No pre-grasp configs found in {pregrasp_path}")
+        self.get_logger().info(f"Loaded {self._n_configs} pre-grasp configs.")
+
+        # ── State ─────────────────────────────────────────────────────────────
+        self._lock            = threading.Lock()
+        self._state           = _IDLE
+        self._q_current: np.ndarray | None = None
+        self._selected_idx    = 0
+        self._traj: np.ndarray | None = None
+        self._traj_index      = 0
+
+        # ── cuRobo planner ────────────────────────────────────────────────────
+        self.get_logger().info("Initializing cuRobo (warmup may take ~30 s)...")
+        self._planner = CuRoboBimanualMotionPlanner(
+            robot_cfg_path              = DEFAULT_CUROBO_ROBOT_CFG_PATH,
+            left_ee_link                = "left_delto_base_link",
+            right_ee_link               = "right_delto_base_link",
+            device                      = "cuda:0",
+            trajopt_tsteps              = 64,
+            interpolation_steps         = 2000,
+            num_ik_seeds                = 50,
+            num_trajopt_seeds           = 32,
+            grad_trajopt_iters          = 800,
+            interpolation_dt            = 0.02,
+            collision_activation_distance = 0.005,
+        )
+
+        # ── ROS pub / sub ─────────────────────────────────────────────────────
         self.target_pub = self.create_publisher(JointState, '/target_joint_states', HIGH_PERF_QOS)
+        self.create_subscription(JointState, '/joint_states', self._js_callback, HIGH_PERF_QOS)
 
-        # Generate collision-free trajectory using cuRobo
-        result = self._build_trajectory()
-        if result is None:
-            self.get_logger().error("Trajectory planning failed — node will not publish.")
-            return
-
-        self.traj, traj_dt = result
-        self.traj_index = 0
-        self.timer = self.create_timer(traj_dt, self.timer_callback)
-
-        self.get_logger().info(
-            f"Test Node ready. Trajectory: {len(self.traj)} steps "
-            f"(dt={traj_dt:.3f}s, ~{len(self.traj) * traj_dt:.1f}s total). "
-            f"Publishing to /target_joint_states."
+        # Execution timer (always ticking; no-ops when not in EXECUTING state)
+        self._exec_timer = self.create_timer(
+            self._planner._interpolation_dt, self._exec_callback
         )
 
-    def _build_trajectory(self) -> tuple[np.ndarray, float] | None:
-        """
-        1. Initialise cuRobo planner.
-        2. Check PRE_GRASP_Q for world and self collision.
-        3. If collision-free, plan HOME_Q → PRE_GRASP_Q and return (traj, dt).
-        4. If in collision or planning fails, log the reason and return None.
-        """
+        # ── Keyboard thread ────────────────────────────────────────────────────
+        self._kb_thread = threading.Thread(target=self._keyboard_loop, daemon=True)
+        self._kb_thread.start()
+
+        self._print_status()
         self.get_logger().info(
-            "Initializing cuRobo motion planner (warmup may take ~30 s)..."
+            "Ready. Commands (type + Enter): "
+            "[n] next  [p] prev  [<number>] jump  [g/Enter] plan+execute  [q] quit"
         )
-        planner = CuRoboBimanualMotionPlanner()
 
-        # --- Collision check ---
-        self.get_logger().info("Checking PRE_GRASP_Q for collision...")
-        world_col, self_col = planner.is_in_collision(PRE_GRASP_Q)
-        if world_col or self_col:
-            self.get_logger().error(
-                f"PRE_GRASP_Q is in collision "
-                f"(world={world_col}, self={self_col}). Aborting."
-            )
-            return None
-        self.get_logger().info("PRE_GRASP_Q is collision-free.")
+    # ── Joint state subscription ───────────────────────────────────────────────
+    def _js_callback(self, msg: JointState) -> None:
+        """Extract current joint positions in self.joint_names order."""
+        q = np.array(msg.position, dtype=np.float32,)
+        with self._lock:
+            self._q_current = q
 
-        # --- Trajectory planning ---
-        self.get_logger().info(
-            "Planning collision-free trajectory HOME_Q → PRE_GRASP_Q..."
-        )
-        traj, ok, status = planner.plan_to_joint(HOME_Q, PRE_GRASP_Q)
-        if not ok:
-            self.get_logger().error(f"cuRobo planning failed: {status}. Aborting.")
-            return None
-
-        self.get_logger().info(
-            f"Trajectory planned: {traj.shape[0]} steps "
-            f"(dt={planner._interpolation_dt:.3f}s, "
-            f"~{traj.shape[0] * planner._interpolation_dt:.1f}s total)."
-        )
-        return traj, planner._interpolation_dt
-
-    def timer_callback(self):
-        if self.traj_index >= len(self.traj):
-            self.get_logger().info("Trajectory complete.")
-            self.timer.cancel()
-            self.destroy_node()
-            rclpy.shutdown()
-            return
+    # ── Execution timer callback ───────────────────────────────────────────────
+    def _exec_callback(self) -> None:
+        with self._lock:
+            if self._state != _EXECUTING or self._traj is None:
+                return
+            if self._traj_index >= len(self._traj):
+                self.get_logger().info("Trajectory complete. Back to IDLE.")
+                self._traj  = None
+                self._state = _IDLE
+                return
+            q = self._traj[self._traj_index]
+            self._traj_index += 1
 
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = self.joint_names
-        msg.position = self.traj[self.traj_index].tolist()
-
+        msg.name         = self.joint_names
+        msg.position     = q.tolist()
         self.target_pub.publish(msg)
-        self.traj_index += 1
+
+    # ── Keyboard loop (blocking, runs in daemon thread) ────────────────────────
+    def _keyboard_loop(self) -> None:
+        while rclpy.ok():
+            try:
+                prompt = f"[{self._selected_idx}/{self._n_configs - 1}]> "
+                raw = input(prompt).strip()
+            except EOFError:
+                break
+
+            if raw == 'q':
+                rclpy.shutdown()
+                break
+            elif raw == 'n':
+                with self._lock:
+                    self._selected_idx = (self._selected_idx + 1) % self._n_configs
+                self._print_status()
+            elif raw == 'p':
+                with self._lock:
+                    self._selected_idx = (self._selected_idx - 1) % self._n_configs
+                self._print_status()
+            elif raw.isdigit():
+                idx = int(raw) % self._n_configs
+                with self._lock:
+                    self._selected_idx = idx
+                self._print_status()
+            elif raw in ('g', ''):
+                self._trigger_plan()
+            else:
+                self.get_logger().warn(f"Unknown command: '{raw}'")
+
+    # ── Helpers ────────────────────────────────────────────────────────────────
+    def _print_status(self) -> None:
+        with self._lock:
+            idx = self._selected_idx
+        q = self._pregrasp_qs[idx]
+        self.get_logger().info(
+            f"Selected [{idx}/{self._n_configs - 1}]  "
+            f"left_arm={np.round(q[:7], 3).tolist()}  "
+            f"right_arm={np.round(q[19:26], 3).tolist()}"
+        )
+
+    def _trigger_plan(self) -> None:
+        with self._lock:
+            if self._state == _EXECUTING:
+                self.get_logger().warn("Already executing — wait for completion.")
+                return
+            if self._state == _PLANNING:
+                self.get_logger().warn("Already planning — please wait.")
+                return
+            q_start = self._q_current
+            q_goal  = self._pregrasp_qs[self._selected_idx].copy()
+            self._state = _PLANNING
+
+        if q_start is None:
+            self.get_logger().error("No /joint_states received yet. Cannot plan.")
+            with self._lock:
+                self._state = _IDLE
+            return
+
+        threading.Thread(
+            target=self._plan_and_execute, args=(q_start, q_goal), daemon=True
+        ).start()
+
+    def _plan_and_execute(self, q_start: np.ndarray, q_goal: np.ndarray) -> None:
+        # 1. Collision check on target
+        self.get_logger().info("Checking target config for collision...")
+        self_col = self._planner.self_collision_check(q_goal)
+        if self_col:
+            self.get_logger().error(
+                f"Target config is in self collision (self={self_col}). Aborting."
+            )
+            with self._lock:
+                self._state = _IDLE
+            return
+        self.get_logger().info("Target is collision-free. Planning trajectory...")
+
+        # 2. Plan
+        traj, ok, status = self._planner.plan_to_joint(q_start, q_goal)
+        if not ok:
+            self.get_logger().error(f"cuRobo planning failed: {status}. Aborting.")
+            with self._lock:
+                self._state = _IDLE
+            return
+
+        dt = self._planner._interpolation_dt
+        self.get_logger().info(
+            f"Trajectory ready: {traj.shape[0]} steps "
+            f"(dt={dt:.3f}s, ~{traj.shape[0] * dt:.1f}s total). Executing..."
+        )
+
+        # 3. Hand off to exec timer
+        with self._lock:
+            self._traj       = traj
+            self._traj_index = 0
+            self._state      = _EXECUTING
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = BimanualTrajTestNode()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

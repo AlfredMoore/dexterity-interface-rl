@@ -170,35 +170,89 @@ class PinocchioBimanualFK:
 
 class CuRoboBimanualMotionPlanner:
     """
-    Bimanual collision-free trajectory generation and collision checking via cuRobo.
+    GPU-accelerated bimanual collision-free trajectory planning via cuRobo.
 
-    Intended for offline / pre-grasp use, NOT the real-time policy control loop.
+    Uses TrajOptSolver for joint-space trajectory optimisation with self-collision
+    avoidance.  World-obstacle collision is NOT enforced by the planner itself —
+    use self_collision_check / check_at_planning_distance for that.
 
-    Requires a CUDA-capable GPU and two config YAMLs:
-      robot_cfg_path  — robot kinematics + collision spheres
-                        (e.g. "robot/robot_description/configs/robot/bimanual_panda_tesollo.yml")
-      world_cfg_path  — static world obstacles (table, shelves, etc.)
-                        (e.g. "robot/robot_description/configs/world/bimanual_table.yml")
+    Intended for offline / pre-grasp use, NOT the real-time 60 Hz policy loop.
+    Requires a CUDA-capable GPU.
 
-    Paths are relative to cuRobo's working directory (same convention as cuRobo examples).
+    Constructor parameters
+    ----------------------
+    robot_cfg_path              : absolute path to the cuRobo robot YAML
+                                  (kinematics, cspace, collision spheres)
+    urdf_path                   : absolute path to the bimanual URDF (overrides
+                                  the path stored inside robot_cfg_path at runtime)
+    spheres_path                : absolute path to the collision-sphere YAML
+    left_ee_link                : name of the primary (left) EE link
+    right_ee_link               : name of the secondary (right) EE link
+                                  (used as a link_poses constraint in IK)
+    joint_names                 : 38-DoF ordered joint name list; defaults to
+                                  cspace.joint_names from robot_cfg_path
+    device                      : CUDA device string, e.g. "cuda:0"
+    trajopt_tsteps              : number of time steps for the trajectory optimiser
+    interpolation_steps         : number of waypoints in the interpolated output
+    num_ik_seeds                : parallel IK seeds
+    num_trajopt_seeds           : parallel TrajOpt seeds
+    grad_trajopt_iters          : gradient iterations per TrajOpt seed
+    interpolation_dt            : time between consecutive output waypoints (s)
+    collision_activation_distance : self-collision margin used by TrajOpt and
+                                  check_at_planning_distance (metres)
 
-    Example:
+    Key methods
+    -----------
+    solve_ik(left_pos, left_quat, right_pos, right_quat)
+        → (q_full_38, success)
+        Bimanual IK: arm joints solved jointly, gripper joints fixed at the
+        retract_config from the robot YAML.
+
+    plan_to_joint(q_start, q_goal)
+        → (traj, success, status)
+        Joint-space TrajOpt with self-collision avoidance.
+        traj is (T, 38) float32 at interpolation_dt seconds per step.
+
+    plan_to_pose(q_start, left_pos, left_quat, right_pos, right_quat)
+        → (traj, success, status)
+        Cartesian planning: solve_ik internally to get q_goal, then plan_to_joint.
+
+    self_collision_check(q, verbose=False)
+        → bool
+        Check for actual sphere penetration (activation_distance = 0).
+
+    check_at_planning_distance(q, label="")
+        → bool
+        Check against the planner's collision_activation_distance margin.
+
+    save_scene_as_mesh(q, save_path)
+        Export robot geometry to STL for offline debug visualisation.
+
+    Example
+    -------
         planner = CuRoboBimanualMotionPlanner(
-            robot_cfg_path="/workspace/libs/robot_description/configs/robot/bimanual_panda_tesollo.yml",
-            world_cfg_path="/workspace/libs/robot_description/configs/world/bimanual_table.yml",
+            trajopt_tsteps=34,
+            interpolation_dt=0.02,
+            collision_activation_distance=0.025,
         )
-        traj, ok, status = planner.plan(
-            q_start           = np.zeros(38),
-            left_target_pos   = np.array([0.3,  0.3, 1.0]),
-            left_target_quat  = np.array([1.0, 0.0, 0.0, 0.0]),   # w x y z
-            right_target_pos  = np.array([0.3, -0.3, 1.0]),
-            right_target_quat = np.array([1.0, 0.0, 0.0, 0.0]),
-        )
-        if ok:
-            # traj: (T, 38) numpy array — joint positions at each timestep
-            execute(traj)
 
-        in_world, in_self = planner.is_in_collision(q)
+        # Joint-space planning (most common)
+        traj, ok, status = planner.plan_to_joint(HOME_Q, PRE_GRASP_Q)
+        if ok:
+            execute(traj)   # traj: (T, 38) float32, waypoints at 0.02 s
+
+        # Cartesian planning
+        traj, ok, status = planner.plan_to_pose(
+            HOME_Q,
+            left_pos=np.array([0.3, 0.3, 0.8]), left_quat=np.array([1, 0, 0, 0]),
+            right_pos=np.array([0.3, -0.3, 0.8]), right_quat=np.array([1, 0, 0, 0]),
+        )
+
+        # Collision checking before planning
+        if planner.self_collision_check(PRE_GRASP_Q):
+            print("target is in self-collision — skipping")
+        elif not planner.check_at_planning_distance(PRE_GRASP_Q):
+            print("target is within the planner activation margin — may cause issues")
     """
 
     def __init__(
@@ -386,15 +440,27 @@ class CuRoboBimanualMotionPlanner:
         right_quat: np.ndarray | torch.Tensor, # (4,)  w x y z
     ) -> tuple[torch.Tensor | None, bool]:
         """
-        Solve bimanual IK for given left and right EE poses simultaneously.
+        Solve bimanual IK for the given left and right EE poses simultaneously.
 
-        Left EE is the primary goal; right EE is enforced via link_poses constraint.
-        Both are solved jointly in a single optimization pass.
+        Left EE is the primary goal passed to IKSolver.solve_single; right EE is
+        enforced as a secondary constraint via link_poses. Both arms are solved in
+        a single joint optimisation pass.
+
+        Gripper joints (non-panda joints) are locked at the retract_config values
+        specified in the robot YAML and are not part of the IK optimisation.
+        The returned q_full always covers all 38 DoF, with locked joints filled
+        from retract_config.
+
+        Args:
+            left_pos   : (3,) xyz position of left EE in world frame.
+            left_quat  : (4,) quaternion [w, x, y, z] of left EE orientation.
+            right_pos  : (3,) xyz position of right EE in world frame.
+            right_quat : (4,) quaternion [w, x, y, z] of right EE orientation.
 
         Returns:
-            q_solution : (n_joints,) float32 tensor on self._device, in self._joint_names order,
-                         or None if IK failed.
-            success    : True if a valid solution was found.
+            q_full  : (38,) float32 tensor on self._device in self._joint_names
+                      order, or None if IK failed.
+            success : True if a valid self-collision-free IK solution was found.
         """
         left_pose  = self._make_pose(left_pos,  left_quat)
         right_pose = self._make_pose(right_pos, right_quat)
@@ -430,15 +496,23 @@ class CuRoboBimanualMotionPlanner:
         right_target_quat: np.ndarray,  # (4,)  w x y z
     ) -> tuple[np.ndarray | None, bool, str]:
         """
-        Plan a self-collision-free trajectory to the given dual-arm Cartesian EE poses.
+        Plan a self-collision-free trajectory to the given bimanual EE poses.
 
-        Calls solve_ik to obtain q_goal, then runs TrajOpt joint-to-joint.
+        Pipeline: solve_ik(left_target, right_target) → q_goal → plan_to_joint.
+        If IK fails, returns immediately without calling TrajOpt.
+
+        Args:
+            q_start           : (n_joints,) current joint configuration.
+            left_target_pos   : (3,) target xyz for left EE in world frame.
+            left_target_quat  : (4,) target orientation [w, x, y, z] for left EE.
+            right_target_pos  : (3,) target xyz for right EE in world frame.
+            right_target_quat : (4,) target orientation [w, x, y, z] for right EE.
 
         Returns:
-            trajectory  : (T, n_joints) float32 numpy array, or None if planning failed.
-                          T waypoints spaced interpolation_dt seconds apart.
-            success     : True if a valid trajectory was found.
-            status      : Human-readable status string.
+            trajectory : (T, n_joints) float32 numpy array — waypoints at
+                         interpolation_dt second intervals — or None on failure.
+            success    : True if a valid trajectory was found.
+            status     : "success" | "ik_failed" | "trajopt_failed".
         """
         q_goal, ik_ok = self.solve_ik(
             left_target_pos, left_target_quat,
@@ -460,11 +534,19 @@ class CuRoboBimanualMotionPlanner:
         """
         Plan a self-collision-free trajectory to the given target joint configuration.
 
+        Uses TrajOptSolver with self-collision avoidance. World obstacles are NOT
+        checked here — call self_collision_check or check_at_planning_distance
+        separately to verify start/goal safety before planning.
+
+        Args:
+            q_start : (n_joints,) current joint configuration in self._joint_names order.
+            q_goal  : (n_joints,) target joint configuration in self._joint_names order.
+
         Returns:
-            trajectory  : (T, n_joints) float32 numpy array, or None if planning failed.
-                          T waypoints spaced interpolation_dt seconds apart.
-            success     : True if a valid trajectory was found.
-            status      : Human-readable status string.
+            trajectory : (T, n_joints) float32 numpy array — waypoints at
+                         interpolation_dt second intervals — or None on failure.
+            success    : True if a valid trajectory was found.
+            status     : "success" | "trajopt_failed".
         """
         goal = Goal(
             goal_state=self._make_joint_state(q_goal),
@@ -482,18 +564,19 @@ class CuRoboBimanualMotionPlanner:
         verbose: bool = False,
     ) -> bool:
         """
-        Check whether a joint configuration is in collision.
+        Check whether a joint configuration is in actual sphere-sphere self-collision.
 
-        cuRobo cost convention: cost == 0 → free, cost > 0 → collision.
+        Uses a RobotWorld with activation_distance = 0, so only real penetration
+        (cost > 0) triggers a True result. World obstacles are NOT checked.
+        cuRobo cost convention: cost == 0 → free, cost > 0 → spheres overlap.
 
         Args:
-            q       : (n_joints,) joint configuration.
-            verbose : If True and collision detected, print the non-zero entries of
-                      d_world and d_self (indices + values) for quick debugging.
+            q       : (n_joints,) joint configuration in self._joint_names order.
+            verbose : If True and collision detected, print the non-zero indices
+                      and values of d_self for quick debugging.
 
         Returns:
-            world_in_collision : True if any sphere penetrates a world obstacle.
-            self_in_collision  : True if any sphere pair penetrates each other.
+            True if any sphere pair is in self-collision, False otherwise.
         """
         q_t = self._make_joint_state(q).position
         if q_t.dim() == 1:
@@ -511,12 +594,21 @@ class CuRoboBimanualMotionPlanner:
 
     def check_at_planning_distance(self, q: np.ndarray, label: str = "") -> bool:
         """
-        Check whether q is free of self-collision within the planner's activation distance.
+        Check whether q is clear of self-collision at the planner's activation margin.
 
-        Uses a separate RobotWorld instance with self_collision_activation_distance set to
-        collision_activation_distance, so the result matches what TrajOpt considers valid.
+        Uses a separate RobotWorld with self_collision_activation_distance set to
+        collision_activation_distance (from the constructor), matching the margin
+        that TrajOpt uses internally. A config that passes here is guaranteed to
+        be accepted as a valid start/goal by plan_to_joint.
 
-        Returns True if the config is valid for planning.
+        Always prints a one-line status summary to stdout regardless of the result.
+
+        Args:
+            q     : (n_joints,) joint configuration in self._joint_names order.
+            label : Optional string appended to the printed status line.
+
+        Returns:
+            True if the config is free of self-collision within the activation margin.
         """
         q_t = self._make_joint_state(q).position
         if q_t.dim() == 1:
