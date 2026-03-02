@@ -1,15 +1,23 @@
 # Dexterity Interface for RL
 
 ## Quick Start
-Docker Image Build
+
+### Driver Container (On driver computer)
 ```bash
-docker build -t dex-interface .
+docker build -f Dockerfile.driver -t dex-driver .
+```
+```bash
+cd <path to>/dexterity-interface-rl
+docker run --name handrl-driver --rm -it --privileged --gpus all -v $(pwd)/libs:/workspace/libs -v $(pwd)/app:/workspace/app --net=host dex-driver
 ```
 
-Docker Run the Container
+### Policy Container (On inference computer)
 ```bash
-cd ~/simulation/dexterity-interface-rl
-docker run --name handrl --rm -it --privileged  -v $(pwd)/libs:/workspace/libs -v $(pwd)/app:/workspace/app --net=host dex-interface
+docker build -f Dockerfile.policy -t dex-policy .
+```
+```bash
+cd <path to>/dexterity-interface-rl
+docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd)/libs:/workspace/libs -v $(pwd)/app:/workspace/app --net=host dex-policy
 ```
 
 ROS2 Build
