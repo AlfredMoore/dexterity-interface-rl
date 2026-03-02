@@ -1,11 +1,12 @@
 # Dockerfile.policy
-# Policy inference: CUDA 12.8 + Python 3.11 + ROS2 Jazzy + Pinocchio + PyTorch + cuRobo
+# Policy inference: CUDA 12.4 + Ubuntu 24.04 + Python 3.11 + ROS2 Jazzy (source) + Pinocchio + PyTorch + cuRobo
 #
-# NOTE: Base image uses cuda 12.4 to match the host driver version.
-#       torch cu128 is used (torch 2.7.0 bundles its own CUDA 12.8 runtime,
-#       which does not conflict with the system nvcc 12.4).
+# Ubuntu 24.04 defaults to Python 3.12, but the policy requires Python 3.11.
+# Python 3.11 is installed via deadsnakes PPA, and ROS2 Jazzy is built from source
+# targeting Python 3.11 (pre-built Jazzy apt packages bind to Python 3.12).
+# torch cu128: torch 2.7.0 bundles its own CUDA 12.8 runtime, compatible with nvcc 12.4.
 
-FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+FROM nvidia/cuda:12.4.1-devel-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive
 SHELL ["/bin/bash", "-c"]
 
@@ -16,6 +17,8 @@ ENV ROS_ROOT=/ros2_jazzy
 ########################################################
 #                   System Packages                    #
 ########################################################
+RUN apt-get update && apt-get upgrade -y && apt-get clean
+
 RUN apt-get update && apt-get install -y \
     curl \
     git \
@@ -47,7 +50,7 @@ RUN add-apt-repository -y ppa:deadsnakes/ppa && \
         python3.11-venv \
  && rm -rf /var/lib/apt/lists/*
 
-# Set system python3 → python3.11
+# Override system python3 (3.12) to point to python3.11
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 && \
     update-alternatives --install /usr/bin/python  python  /usr/bin/python3.11 1
 
@@ -56,11 +59,11 @@ RUN curl -s https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py && \
     python3.11 /tmp/get-pip.py --force-reinstall && \
     rm /tmp/get-pip.py
 
-# pybind11 headers where CMake can find them
+# Expose python3.11 headers where CMake can find them
 RUN ln -sf /usr/include/python3.11 /usr/include/python3
 RUN python3.11 -m pip install "pybind11[global]"
 
-# Python env vars — used by colcon cmake and local C++ builds
+# Python env vars used by colcon cmake and local C++ builds
 ENV PYTHON_EXECUTABLE=/usr/bin/python3.11
 ENV Python3_EXECUTABLE=/usr/bin/python3.11
 ENV PYTHON_INCLUDE_DIR=/usr/include/python3.11
@@ -69,21 +72,21 @@ ENV PYTHONPATH=/usr/local/lib/python3.11/dist-packages
 
 
 ########################################################
-#               ROS 2 Jazzy (from source)              #
-#   ROS2 Jazzy pre-built packages target Ubuntu 24.04. #
-#   On Ubuntu 22.04 we must compile from source and    #
-#   explicitly target Python 3.11 via cmake flags.     #
+#      ROS 2 Jazzy (built from source, Python 3.11)   #
+#  Pre-built Jazzy apt packages bind to Python 3.12.  #
+#  Source build with cmake flags is required to make  #
+#  rclpy compatible with Python 3.11.                 #
 ########################################################
 
-# Locale (required by ROS2 build)
+# Locale
 RUN apt-get update && apt-get install -y locales && \
     locale-gen en_US en_US.UTF-8 && \
     update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 && \
     rm -rf /var/lib/apt/lists/*
 ENV LANG=en_US.UTF-8
 
-# ROS2 apt key + source (needed for ros-dev-tools / rosdep definitions)
-RUN wget -q https://raw.githubusercontent.com/ros/rosdistro/master/ros.asc && \
+# ROS2 apt key and source (provides rosdep definitions and ros-dev-tools)
+RUN wget https://raw.githubusercontent.com/ros/rosdistro/master/ros.asc && \
     apt-key add ros.asc && rm ros.asc && \
     sh -c 'echo "deb [arch=$(dpkg --print-architecture)] http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" \
         > /etc/apt/sources.list.d/ros2-latest.list'
@@ -145,7 +148,6 @@ RUN cd ${ROS_ROOT} && colcon build \
         "-DPYTHON_INCLUDE_DIR=/usr/include/python3.11" \
         "-DPYTHON_LIBRARY=/usr/lib/x86_64-linux-gnu/libpython3.11.so"
 
-# Copy system libs that some packages expect alongside ROS libs
 RUN cp /usr/lib/x86_64-linux-gnu/libtinyxml2.so* ${ROS_ROOT}/install/lib/ || true && \
     cp /usr/lib/x86_64-linux-gnu/libssl.so*       ${ROS_ROOT}/install/lib/ || true && \
     cp /usr/lib/x86_64-linux-gnu/libcrypto.so*    ${ROS_ROOT}/install/lib/ || true
@@ -153,10 +155,6 @@ RUN cp /usr/lib/x86_64-linux-gnu/libtinyxml2.so* ${ROS_ROOT}/install/lib/ || tru
 
 ########################################################
 #                    Pinocchio                         #
-#   robotpkg provides C++ headers + cmake config      #
-#   (needed by robot_motion CMakeLists).               #
-#   The py3* glob will install whatever Python version #
-#   robotpkg provides for jammy (typically py311).     #
 ########################################################
 RUN mkdir -p /etc/apt/keyrings && \
     curl -fsSL http://robotpkg.openrobots.org/packages/debian/robotpkg.asc \
@@ -199,24 +197,16 @@ RUN git clone --recurse-submodules https://github.com/frankarobotics/libfranka.g
 
 ########################################################
 #          PyTorch 2.7.0 + cuRobo + rsl-rl             #
-#                                                      #
-#   Install order matters:                             #
-#     1. torch (cuRobo detects it at compile time)     #
-#     2. curobo (compiles CUDA kernels via nvcc+ninja) #
-#     3. rsl-rl                                        #
+#  Install order matters: torch → curobo → rsl-rl     #
 ########################################################
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
-
-# Ensure nvcc from CUDA devel image is on PATH
 ENV PATH="/usr/local/cuda/bin:${PATH}"
 
 RUN python3.11 -m pip install \
     torch==2.7.0 torchvision==0.22.0 \
     --index-url https://download.pytorch.org/whl/cu128
 
-# cuRobo: ninja is already installed via apt (ninja-build).
-# --no-build-isolation lets the build reuse the installed torch + nvcc.
-# Compilation takes ~10-20 minutes.
+# ninja installed via apt, --no-build-isolation reuses installed torch + nvcc. ~10-20 min.
 RUN python3.11 -m pip install curobo --no-build-isolation
 
 RUN python3.11 -m pip install rsl-rl-lib==2.3.3
@@ -253,7 +243,7 @@ RUN python3.11 -m pip install \
 
 
 ########################################################
-#                  Environment                         #
+#                   Environment                        #
 ########################################################
 RUN echo "source ${ROS_ROOT}/install/setup.bash" >> /root/.bashrc
 
