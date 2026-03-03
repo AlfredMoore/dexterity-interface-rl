@@ -8,7 +8,7 @@ docker build -f Dockerfile.driver -t dex-driver .
 ```
 ```bash
 cd <path to>/dexterity-interface-rl
-docker run --name handrl-driver --rm -it --privileged --gpus all -v $(pwd)/libs:/workspace/libs -v $(pwd)/app:/workspace/app --net=host dex-driver
+docker run --name handrl-driver --rm -it --privileged -v $(pwd)/libs:/workspace/libs -v $(pwd)/app:/workspace/app --net=host dex-driver
 ```
 
 ROS2 Build
@@ -27,7 +27,7 @@ If it says `libfranka: Move command rejected: command not possible in the curren
 
 Open Another Bash and Enter the Running Container
 ```bash
-docker exec -it handrl bash
+docker exec -it handrl-driver bash
 ```
 
 Enter and Source ROS2 Workspace
@@ -38,7 +38,7 @@ source install/setup.bash
 
 ROS2 Run Test Node
 ```bash
-ros2 run robot_motion_interface_ros test_node
+ros2 run robot_motion_interface_ros test_pre_grasp
 ```
 
 ### Policy Container (On inference computer)
