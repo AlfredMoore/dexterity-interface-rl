@@ -1,4 +1,4 @@
-from abc import abstractmethod
+from abc import abstractmethod, ABC
 from dataclasses import dataclass
 from typing import Literal
 import yaml
@@ -6,7 +6,7 @@ import numpy as np
 
 
 @dataclass
-class CameraIntrinsics:
+class CameraIntrinsics(ABC):
     """
     Pin-hole camera intrinsics for a single stream. 
     Uses Brown distortion model.
@@ -61,7 +61,7 @@ class RGBDFrame:
     frame_id: str
 
 
-class RGBDCameraInterface:
+class RGBDCameraInterface(ABC):
     def __init__(self,
                  color_intrinsics: CameraIntrinsics,
                  depth_intrinsics: CameraIntrinsics,

@@ -151,8 +151,7 @@ class BimanualTrajTestNode(Node):
     # ── Joint state subscription ───────────────────────────────────────────────
     def _js_callback(self, msg: JointState) -> None:
         """Extract current joint positions in self.joint_names order."""
-        name_to_pos = dict(zip(msg.name, msg.position))
-        q = np.array([name_to_pos.get(n, 0.0) for n in self.joint_names], dtype=np.float32)
+        q = np.array(msg.position, dtype=np.float32)
         with self._lock:
             self._q_current = q
 

@@ -9,6 +9,7 @@ import cv2
 import yaml
 import os
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+from rclpy.parameter import Parameter
 
 # --- QoS Config: low latency (Best Effort) ---
 
@@ -24,6 +25,7 @@ class CVPerceptionNode(Node):
         super().__init__('cv_perception_node')
         
         self.declare_parameter('config_path', Parameter.Type.STRING)
+        self.declare_parameter('cv_model_path', Parameter.Type.STRING)
         config_path: str = self.get_parameter('config_path').value
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"Config file not found at: {config_path}")
@@ -42,17 +44,32 @@ class CVPerceptionNode(Node):
         
         self.rs_profile = self.rs_pipeline.start(self.rs_config)
         self.rs_align = rs.align(rs.stream.color) # Alignment: Depth -> Color
-        self.get_logger().info("RealSense Pipeline and rs_config initialized.")
-        
+
+        # log RealSense device info
+        rs_device = self.rs_profile.get_device()
+        self.get_logger().info(
+            f"RealSense initialized: "
+            f"device={rs_device.get_info(rs.camera_info.name)}  "
+            f"serial={rs_device.get_info(rs.camera_info.serial_number)}  "
+            f"color=640x480@{self.rs_fps}fps"
+        )
+
         # 2. model loading (GPU)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.cv_model = torch.jit.load(self.get_parameter('cv_model_path').value, map_location=self.device).eval()
-        
+
         # 3. publisher (publish object pose)
         self.object_detection_pub = self.create_publisher(Detection3D, '/object_detection', HIGH_PERF_QOS)
-        
+
         # vision timer
-        self.create_timer(1.0/self.get_parameter('rs_fps').value, self.cv_update_loop)
+        self.create_timer(1.0/self.rs_fps, self.cv_update_loop)
+
+        self.get_logger().info(
+            f"CVPerceptionNode ready: "
+            f"device={self.device}  "
+            f"timer={self.rs_fps} Hz  "
+            f"topic=/object_detection"
+        )
 
     def cv_update_loop(self):
         try:
@@ -82,7 +99,7 @@ class CVPerceptionNode(Node):
             self.get_logger().warn(f"CV Error: {e}")
 
     def __del__(self):
-        self.pipeline.stop()
+        self.rs_pipeline.stop()
 
 def main(args=None):
     rclpy.init(args=args)

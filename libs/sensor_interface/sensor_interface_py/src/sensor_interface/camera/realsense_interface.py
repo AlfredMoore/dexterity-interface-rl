@@ -304,6 +304,9 @@ class RealsenseInterface(RGBDCameraInterface):
 
             # Small sleep to avoid busy-waiting
             time.sleep(0.001)
+    
+    def __del__(self):
+        self.stop()
 
 
 if __name__ == "__main__":
