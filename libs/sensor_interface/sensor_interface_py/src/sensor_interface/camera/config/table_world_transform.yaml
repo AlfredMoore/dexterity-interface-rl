@@ -1,0 +1,21 @@
+metadata:
+  frame: world
+  origin: floor_center_table
+  notes: Replace with the measured transform for your camera setup.
+T_world_color:
+- - -0.991581686
+  - -0.061842384
+  - 0.113759742
+  - -0.114454795
+- - -0.128432562
+  - 0.581415293
+  - -0.803406083
+  - 0.565513629
+- - -0.016457107
+  - -0.811253213
+  - -0.584463333
+  - 1.289942967
+- - 0.0
+  - 0.0
+  - 0.0
+  - 1.0

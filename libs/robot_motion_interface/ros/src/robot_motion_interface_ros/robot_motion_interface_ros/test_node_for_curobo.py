@@ -55,11 +55,9 @@ _PROJECT_ROOT = _LIBS_ROOT.parent
 _ROBOT_DESC = _LIBS_ROOT / "robot_description"
 _CONFIGS_CUROBO = _ROBOT_DESC / "configs_curobo"
 
-DEFAULT_BIMANUAL_URDF_PATH      = str((_ROBOT_DESC / "rl/bimanual_panda_tesollo.urdf").resolve())
-
-DEFAULT_CUROBO_ROBOT_CFG_PATH   = str((_CONFIGS_CUROBO / "robot/bimanual_panda_tesollo.yml").resolve())
-DEFAULT_COLLISION_SPHERES_PATH  = str((_CONFIGS_CUROBO / "robot/spheres/bimanual_panda_tesollo_spheres.yml").resolve())
-DEFAULT_CUROBO_WORLD_CFG_PATH   = str((_CONFIGS_CUROBO / "world/bimanual_table.yml").resolve())
+DEFAULT_BIMANUAL_URDF_PATH     = str((_ROBOT_DESC / "rl/bimanual_panda_tesollo.urdf").resolve())
+DEFAULT_CUROBO_ROBOT_CFG_PATH  = str((_CONFIGS_CUROBO / "robot/bimanual_panda_tesollo.yml").resolve())
+DEFAULT_COLLISION_SPHERES_PATH = str((_CONFIGS_CUROBO / "robot/spheres/bimanual_panda_tesollo_spheres.yml").resolve())
 
 # dim: 7(L_arm) + 12(L_hand) + 7(R_arm) + 12(R_hand) = 38
 HOME_Q = np.array([
@@ -117,6 +115,8 @@ class BimanualTrajTestNode(Node):
         self.get_logger().info("Initializing cuRobo (warmup may take ~30 s)...")
         self._planner = CuRoboBimanualMotionPlanner(
             robot_cfg_path              = DEFAULT_CUROBO_ROBOT_CFG_PATH,
+            urdf_path                   = DEFAULT_BIMANUAL_URDF_PATH,
+            spheres_path                = DEFAULT_COLLISION_SPHERES_PATH,
             left_ee_link                = "left_delto_base_link",
             right_ee_link               = "right_delto_base_link",
             device                      = "cuda:0",
@@ -151,7 +151,8 @@ class BimanualTrajTestNode(Node):
     # ── Joint state subscription ───────────────────────────────────────────────
     def _js_callback(self, msg: JointState) -> None:
         """Extract current joint positions in self.joint_names order."""
-        q = np.array(msg.position, dtype=np.float32,)
+        name_to_pos = dict(zip(msg.name, msg.position))
+        q = np.array([name_to_pos.get(n, 0.0) for n in self.joint_names], dtype=np.float32)
         with self._lock:
             self._q_current = q
 
