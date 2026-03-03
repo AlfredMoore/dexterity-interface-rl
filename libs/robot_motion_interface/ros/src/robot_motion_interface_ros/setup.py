@@ -26,6 +26,7 @@ setup(
             'rl_policy = robot_motion_interface_ros.rl_policy_node:main',
             'cv_node = robot_motion_interface_ros.cv_node:main',
             'test_pre_grasp = robot_motion_interface_ros.test_node_pre_grasp:main',
+            'test_curobo = robot_motion_interface_ros.test_node_for_curobo:main',
         ],
     },
 )

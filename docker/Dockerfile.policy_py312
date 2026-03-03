@@ -106,6 +106,10 @@ RUN rm -rf build/ && \
     cmake --install build && \
     ldconfig
 
+# policy node dependencies
+RUN apt-get update && apt-get install -y \
+    apt install ros-jazzy-vision-msgs
+
 ENV CONDA_DIR=/root/miniconda3
 RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh  && \
     bash Miniconda3-latest-Linux-x86_64.sh -b  -p $CONDA_DIR && \
@@ -122,11 +126,8 @@ RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh  
     pip install -e /workspace/libs/sensor_interface/sensor_interface_py && \
     pip install numpy==1.26 scipy ninja pyyaml matplotlib && \
     pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128 && \
-    pip install pybind11 lark
+    pip install pybind11 lark pyrealsense2 opencv-python>=4.8.0
 
-# policy node dependencies
-RUN apt-get update && apt-get install -y \
-    apt install ros-jazzy-vision-msgs
 
 ########################################################
 # 7. Final Configuration

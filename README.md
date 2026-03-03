@@ -49,7 +49,7 @@ docker build -f docker/Dockerfile.policy_py312 -t dex-policy .
 
 ```bash
 cd <path to>/dexterity-interface-rl
-docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/workspace --net=host dex-policy
+docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/workspace --device /dev/bus/usb:/dev/bus/usb --net=host dex-policy
 ```
 
 Compile curobo
@@ -70,7 +70,7 @@ Commit the image from the host (optional)
 ```bash
 docker commit handrl-policy dex-policy:curobo_compiled
 # Then you can directly run the full installed container by
-docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/workspace --net=host dex-policy:v1_with_curobo
+docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/workspace --net=host dex-policy:curobo_compiled
 ```
 
 Run Pre-grasp Sampling Modules

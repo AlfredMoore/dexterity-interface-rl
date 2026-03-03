@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from vision_msgs.msg import Detection3D
+# from vision_msgs.msg import Detection3D
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rclpy.parameter import Parameter
 from rclpy.executors import MultiThreadedExecutor
