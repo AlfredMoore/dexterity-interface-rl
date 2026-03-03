@@ -124,6 +124,10 @@ RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh  
     pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128 && \
     pip install pybind11 lark
 
+# policy node dependencies
+RUN apt-get update && apt-get install -y \
+    apt install ros-jazzy-vision-msgs
+
 ########################################################
 # 7. Final Configuration
 ########################################################
