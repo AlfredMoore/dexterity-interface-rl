@@ -23,3 +23,6 @@ tmp/
 models/
 
 *.DS_Store
+
+curobo/
+curobo-HAND/

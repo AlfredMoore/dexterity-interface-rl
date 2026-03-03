@@ -6,7 +6,7 @@
 # targeting Python 3.11 (pre-built Jazzy apt packages bind to Python 3.12).
 # torch cu128: torch 2.7.0 bundles its own CUDA 12.8 runtime, compatible with nvcc 12.4.
 
-FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04
+FROM nvidia/cuda:12.8.0-cuda-devel-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive
 SHELL ["/bin/bash", "-c"]
 
@@ -179,11 +179,11 @@ RUN python3.11 -m pip install numpy==1.26 cmake && \
  && rm -rf /var/lib/apt/lists/*
 
 # 3. Critical: Environment variables alignment [cite: 20]
-# We point PYTHONPATH explicitly to python3.11 site-packages as seen in Isaac config [cite: 20]
+# We point PYTHONPATH explicitly to python3.12 site-packages as seen in config [cite: 20]
 ENV PATH="/opt/openrobots/bin:${PATH:-}" \
     PKG_CONFIG_PATH="/opt/openrobots/lib/pkgconfig:${PKG_CONFIG_PATH:-}" \
     LD_LIBRARY_PATH="/opt/openrobots/lib:${LD_LIBRARY_PATH:-}" \
-    PYTHONPATH="/opt/openrobots/lib/python3.11/site-packages:${PYTHONPATH:-}" \
+    PYTHONPATH="/opt/openrobots/lib/python3.12/site-packages:${PYTHONPATH:-}" \
     CMAKE_PREFIX_PATH="/opt/openrobots:${CMAKE_PREFIX_PATH:-}"
 
 # 4. Supplemental patch: Isaac version also ensures system libs are copied [cite: 17, 18]

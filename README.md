@@ -4,11 +4,11 @@
 
 ### Driver Container (On driver computer)
 ```bash
-docker build -f Dockerfile.driver -t dex-driver .
+docker build -f docker/Dockerfile.driver -t dex-driver .
 ```
 ```bash
 cd <path to>/dexterity-interface-rl
-docker run --name handrl-driver --rm -it --privileged -v $(pwd)/libs:/workspace/libs -v $(pwd)/app:/workspace/app --net=host dex-driver
+docker run --name handrl-driver --rm -it --privileged -v $(pwd):/workspace --net=host dex-driver
 ```
 
 ROS2 Build
@@ -42,12 +42,51 @@ ros2 run robot_motion_interface_ros test_pre_grasp
 ```
 
 ### Policy Container (On inference computer)
+Build
 ```bash
-docker build -f Dockerfile.policy -t dex-policy .
+docker build -f docker/Dockerfile.policy_py312 -t dex-policy .
 ```
+
 ```bash
 cd <path to>/dexterity-interface-rl
-docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd)/libs:/workspace/libs -v $(pwd)/app:/workspace/app --net=host dex-policy
+docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/workspace --net=host dex-policy
+```
+
+Compile curobo
+```bash
+cd /workspace/libs
+git clone https://github.com/AlfredMoore/curobo-HAND.git curobo
+cd curobo
+pip install -e . --no-build-isolation
+python3 -m pytest .
+```
+
+Import test
+```bash
+python /workspace/init/test_env.py
+```
+
+Commit the image from the host (optional)
+```bash
+docker commit handrl-policy dex-policy:curobo_compiled
+# Then you can directly run the full installed container by
+docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/workspace --net=host dex-policy:v1_with_curobo
+```
+
+Run Pre-grasp Sampling Modules
+```bash
+cd /workspace
+# pinocchio and curobo test
+python -m robot_motion_interface.utils.kinematics
+# pre-grasp SE3 poses sampling
+python -m robot_motion_interface.utils.pose_sampler
+# home to a pre-grasp pose traj generation (this takes a long time to filter 50k joint poses)
+python -m robot_motion_interface.utils.traj_sampler
+```
+
+Attach to Policy Container
+```bash
+docker exec -it handrl-policy bash
 ```
 
 # Dexterity Interface

@@ -4,13 +4,13 @@ pose_sampler.py — Bimanual pre-grasp EE pose sampler.
 Sampling geometry
 -----------------
 Left arm  (left_delto_base_link):
-  Position  – hollow cylinder  r ∈ [0.15, 0.30] m,  z ∈ [0.05, 0.07] m
-  Rotation  – z-axis points radially inward toward the world vertical axis (x=0, y=0),
+  Position  - hollow cylinder  r ∈ [0.15, 0.30] m,  z ∈ [0.05, 0.07] m
+  Rotation  - z-axis points radially inward toward the world vertical axis (x=0, y=0),
                x-axis is horizontal (tangential),  y-axis is downward (≈ vertical)
 
 Right arm (right_delto_base_link):
-  Position  – solid cylinder   r ∈ [0.00, 0.10] m,  z ∈ [0.15, 0.30] m
-  Rotation  – z-axis points from current position toward the world origin
+  Position  - solid cylinder   r ∈ [0.00, 0.10] m,  z ∈ [0.15, 0.30] m
+  Rotation  - z-axis points from current position toward the world origin
 
 Both arms get a small random rotation noise (≤ 15 °) applied on top of the
 analytical frame, then near-duplicate poses are filtered out.  The caller can
@@ -36,7 +36,7 @@ def _add_rotation_noise(rot_matrix: np.ndarray, max_angle_deg: float = 15.0) -> 
     pre-multiplies it onto *rot_matrix*.
 
     Args:
-        rot_matrix: 3×3 orthonormal rotation matrix representing the base
+        rot_matrix: 3x3 orthonormal rotation matrix representing the base
             orientation to perturb.
         max_angle_deg: Maximum perturbation angle in degrees.  The actual angle
             is sampled uniformly from ``[0, max_angle_deg]``.
@@ -572,6 +572,8 @@ if __name__ == "__main__":
         from .kinematics import CuRoboBimanualMotionPlanner, DEFAULT_CUROBO_ROBOT_CFG_PATH
     except ImportError:
         from kinematics import CuRoboBimanualMotionPlanner, DEFAULT_CUROBO_ROBOT_CFG_PATH
+    
+    _LIBS_ROOT = Path(__file__).parents[4]
 
     planner = CuRoboBimanualMotionPlanner(
         robot_cfg_path              = DEFAULT_CUROBO_ROBOT_CFG_PATH,
@@ -597,7 +599,7 @@ if __name__ == "__main__":
         q_tensor = torch.tensor(np.array(q_list), dtype=torch.float32)
         print(f"\n[INFO] Generated Tensor Shape: {q_tensor.shape} (Expected: N x 38)")
 
-        save_dir = Path("models")
+        save_dir = Path(_LIBS_ROOT).parent / "models"
         save_dir.mkdir(parents=True, exist_ok=True)
         save_path = save_dir / "pre_grasp_q_samples.pt"
         
