@@ -14,7 +14,7 @@ realsense:
   # Frame ID for the RGB-D camera (used in RGBDFrame.frame_id)
   frame_id: "realsense_optical_frame"
 
-  rs_fps: 30
+  rs_fps: 60
 
   color_intrinsics:
     width: 640

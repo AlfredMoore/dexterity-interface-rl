@@ -79,6 +79,32 @@ def _apply_sensor_settings(profile: rs.pipeline_profile) -> None:
             if gain is not None and sensor.supports(rs.option.gain):
                 sensor.set_option(rs.option.gain, float(gain))
 
+        sensor.get_stream_profiles()
+
+def sensor_profiles(rs_profile: rs.pipeline_profile):
+    try:
+        device = rs_profile.get_device()
+        sensors = device.query_sensors()
+    except Exception:
+        return
+    
+    for sensor in sensors:
+        print(f"\n[Sensor]: {sensor.get_info(rs.camera_info.name)}")
+        
+        profiles = sensor.get_stream_profiles()
+
+        supported_configs = set()
+        for p in profiles:
+            if p.is_video_stream_profile():
+                v_p = p.as_video_stream_profile()
+
+                supported_configs.add((v_p.width(), v_p.height(), v_p.fps(), v_p.format().name))
+    
+        for w, h, fps, fmt in sorted(list(supported_configs)):
+            print(f"  res: {w:4d}x{h:4d} | FPS: {fps:3d} | fmt: {fmt}")
+
+sensor_profiles(rs_profile)
+
 _apply_sensor_settings(rs_profile)
 print("Sensor settings applied")
 
