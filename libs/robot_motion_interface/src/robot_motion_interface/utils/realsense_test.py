@@ -39,23 +39,23 @@ _infer_rate = config['infer_rate']
 # RealSense
 rs_pipeline = rs.pipeline()
 rs_config = rs.config()
-# self.rs_config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, self._rs_fps)
 rs_config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, _rs_fps)
+# rs_config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, _rs_fps)
 rs_profile = rs_pipeline.start(rs_config)
-# self.rs_align = rs.align(rs.stream.color)  # align depth -> color frame
+# rs_align = rs.align(rs.stream.color)  # align depth -> color frame
 
 rs_device = rs_profile.get_device()
 print(
-    f"RealSense initialized: "
-    f"  device={rs_device.get_info(rs.camera_info.name)}  "
-    f"  serial={rs_device.get_info(rs.camera_info.serial_number)}  "
-    f"  color=640x480@{_rs_fps}fps"
+    f"RealSense initialized:\n"
+    f"  device={rs_device.get_info(rs.camera_info.name)}\n"
+    f"  serial={rs_device.get_info(rs.camera_info.serial_number)}\n"
+    f"  color=640x480@{_rs_fps}fps\n"
         )
 
 try:
     while True:
-        frames = rs.composite_frame(rs.frame())
-        if not rs_pipeline.poll_for_frames(frames):
+        frames =rs_pipeline.poll_for_frames()
+        if not frames:
             continue
         color_frame = frames.get_color_frame()
         if not color_frame:

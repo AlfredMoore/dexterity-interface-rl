@@ -1,5 +1,5 @@
 # TODO: Align with RL HandEnv.yaml
-rs_fps: 120
+rs_fps: 30
 fk_rate: 60
 infer_rate: 30
 

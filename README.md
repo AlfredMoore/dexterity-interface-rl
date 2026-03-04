@@ -49,21 +49,29 @@ docker build -f docker/Dockerfile.policy_py312 -t dex-policy .
 
 ```bash
 cd <path to>/dexterity-interface-rl
-docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/workspace --device /dev/bus/usb:/dev/bus/usb --net=host dex-policy
+
+xhost +local:docker
+docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/workspace --device /dev/bus/usb:/dev/bus/usb --net=host -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix dex-policy
 ```
 
 Compile curobo
 ```bash
-cd /workspace/libs
+cd /workspace/dep
 git clone https://github.com/AlfredMoore/curobo-HAND.git curobo
 cd curobo
 pip install -e . --no-build-isolation
 python3 -m pytest .
+cd /workspace
 ```
 
 Import test
 ```bash
 python /workspace/init/test_env.py
+```
+
+Realsense Test
+```bash
+python -m robot_motion_interface.utils.realsense_test.py
 ```
 
 Commit the image from the host (optional)
