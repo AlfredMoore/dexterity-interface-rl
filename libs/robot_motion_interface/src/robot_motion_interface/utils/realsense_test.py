@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-# from vision_msgs.msg import Detection3D
+from vision_msgs.msg import Detection3D
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rclpy.parameter import Parameter
 from rclpy.executors import MultiThreadedExecutor
@@ -33,16 +33,54 @@ if not os.path.exists(config_path):
 with open(config_path, "r") as f:
     config = yaml.safe_load(f)
 
-_rs_fps = config['rs_fps']
 _infer_rate = config['infer_rate']
+_rs_config = config['realsense']
+_rs_fps = _rs_config['rs_fps']
+_sensor_settings = _rs_config['sensor_settings']
+_c_intrinsics = _rs_config['color_intrinsics']
+_d_intrinsics = _rs_config['depth_intrinsics']
 
 # RealSense
 rs_pipeline = rs.pipeline()
 rs_config = rs.config()
-rs_config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, _rs_fps)
+rs_config.enable_stream(
+    rs.stream.color, 
+    _c_intrinsics['width'], 
+    _c_intrinsics['height'], 
+    rs.format.bgr8, 
+    _rs_fps
+)
 # rs_config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, _rs_fps)
 rs_profile = rs_pipeline.start(rs_config)
 # rs_align = rs.align(rs.stream.color)  # align depth -> color frame
+
+def _apply_sensor_settings(profile: rs.pipeline_profile) -> None:
+    if not _sensor_settings:
+        return
+
+    try:
+        device = profile.get_device()
+        sensors = device.query_sensors()
+    except Exception:
+        return
+
+    auto_exposure = _sensor_settings.get("auto_exposure", False)
+    exposure = _sensor_settings.get("exposure", 350)
+    gain = _sensor_settings.get("gain", 16)
+
+    for sensor in sensors:
+        if auto_exposure is not None and sensor.supports(rs.option.enable_auto_exposure):
+            sensor.set_option(rs.option.enable_auto_exposure, 1.0 if auto_exposure else 0.0)
+
+        # Manual settings only take effect when auto-exposure is disabled
+        if auto_exposure is False:
+            if exposure is not None and sensor.supports(rs.option.exposure):
+                sensor.set_option(rs.option.exposure, float(exposure))
+            if gain is not None and sensor.supports(rs.option.gain):
+                sensor.set_option(rs.option.gain, float(gain))
+
+_apply_sensor_settings(rs_profile)
+print("Sensor settings applied")
 
 rs_device = rs_profile.get_device()
 print(

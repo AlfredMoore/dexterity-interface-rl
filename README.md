@@ -92,10 +92,30 @@ python -m robot_motion_interface.utils.pose_sampler
 python -m robot_motion_interface.utils.traj_sampler
 ```
 
+ROS2 Build
+```bash
+cd /workspace/libs/robot_motion_interface/ros
+colcon build --symlink-install
+source install/setup.bash
+```
+
+Test Nodes
+```bash
+# cv node
+ros2 run robot_motion_interface_ros cv_node
+```
+
+Launch Nodes
+```bash
+```
+
 Attach to Policy Container
 ```bash
 docker exec -it handrl-policy bash
 ```
+
+
+
 
 # Dexterity Interface
 
