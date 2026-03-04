@@ -78,7 +78,8 @@ Commit the image from the host (optional)
 ```bash
 docker commit handrl-policy dex-policy:curobo_compiled
 # Then you can directly run the full installed container by
-docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/workspace --net=host dex-policy:curobo_compiled
+xhost +local:docker
+docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/workspace --device /dev/bus/usb:/dev/bus/usb --net=host -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix dex-policy:curobo_compiled
 ```
 
 Run Pre-grasp Sampling Modules

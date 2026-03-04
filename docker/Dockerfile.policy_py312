@@ -150,7 +150,17 @@ RUN apt update && apt install -y \
     libxcb-render-util0 \
     libxcb-xkb1 \
     libxkbcommon-x11-0
-########################################################
+
+RUN apt update && apt install -y \
+    iputils-ping \
+    net-tools \
+    iproute2 \
+    tcpdump \
+    nmap \
+    netcat-openbsd \
+    ufw
+
+    ########################################################
 # 7. Final Configuration
 ########################################################
 RUN echo "export PATH=/opt/openrobots/bin:\$PATH" >> /root/.bashrc && \
@@ -161,6 +171,8 @@ RUN echo "export PATH=/opt/openrobots/bin:\$PATH" >> /root/.bashrc && \
 
 RUN echo "source /root/miniconda3/etc/profile.d/conda.sh && conda activate policy" >> /root/.bashrc && \
     echo "source /opt/ros/jazzy/setup.bash" >> /root/.bashrc
+
+ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
 WORKDIR /workspace
 CMD ["bash"]
