@@ -29,12 +29,10 @@ import pinocchio as pin     # TODO: install pinocchio
 # Customized Interface
 
 # --- QoS Config: low latency (Best Effort) ---
-HIGH_PERF_QOS = QoSProfile(
-    reliability=ReliabilityPolicy.BEST_EFFORT,
-    durability=DurabilityPolicy.VOLATILE,
-    history=HistoryPolicy.KEEP_LAST,
-    depth=1
-)
+from robot_motion_interface.utils.qos import HIGH_PERF_QOS, HIGH_RELIA_QOS
+JS_QOS = HIGH_PERF_QOS
+BBOX_QOS = HIGH_PERF_QOS
+T_JS_QOS = HIGH_RELIA_QOS
 
 spec = importlib.util.find_spec("robot_motion_interface")
 if spec is None or spec.origin is None:
@@ -113,10 +111,10 @@ class RLPolicyNode(Node):
         self.prev_obs: torch.Tensor = torch.zeros((1, self._obs_unstacked_space), device=self.device).float()   # [env, obs_dim]
 
         # 5. Communication & Timers
-        self.target_pub = self.create_publisher(JointState, '/target_joint_states', HIGH_PERF_QOS)
+        self.target_pub = self.create_publisher(JointState, '/target_joint_states', T_JS_QOS)
         ## Observation mutex group
-        self.create_subscription(JointState, '/joint_states', self._sub_joint_state_cb, HIGH_PERF_QOS, callback_group=self.observation_grp)
-        self.create_subscription(Detection3D, '/object_detection', self._sub_object_detection_cb, HIGH_PERF_QOS, callback_group=self.observation_grp)
+        self.create_subscription(JointState, '/joint_states', self._sub_joint_state_cb, JS_QOS, callback_group=self.observation_grp)
+        self.create_subscription(Detection3D, '/object_detection', self._sub_object_detection_cb, BBOX_QOS, callback_group=self.observation_grp)
         # self.fk_timer = self.create_timer(1.0 / node_config['fk_rate'], self._pinocchio_forward_kinematics, callback_group=self.observation_grp)  # FK update
         
         self.policy_timer = self.create_timer(self.dt, self._policy_update_loop, callback_group=self.inference_grp)

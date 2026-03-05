@@ -19,12 +19,10 @@ from robot_motion_interface.tesollo.tesollo_interface import TesolloInterface
 from robot_motion_interface.bimanual_interface import BimanualInterface
 
 # --- QoS Config: low latency (Best Effort) ---
-HIGH_PERF_QOS = QoSProfile(
-    reliability=ReliabilityPolicy.BEST_EFFORT,
-    durability=DurabilityPolicy.VOLATILE,
-    history=HistoryPolicy.KEEP_LAST,
-    depth=1
-)
+from robot_motion_interface.utils.qos import HIGH_PERF_QOS, HIGH_RELIA_QOS
+JS_QOS = HIGH_PERF_QOS
+BBOX_QOS = HIGH_PERF_QOS
+T_JS_QOS = HIGH_RELIA_QOS
 
 spec = importlib.util.find_spec("robot_motion_interface")
 if spec is None or spec.origin is None:
@@ -101,14 +99,14 @@ class RLDriverNode(Node):
             raise e
 
         # --- 3. Publisher: joint states publisher (1kHz) ---
-        self.state_pub = self.create_publisher(JointState, '/joint_states', HIGH_PERF_QOS)
+        self.state_pub = self.create_publisher(JointState, '/joint_states', JS_QOS)
 
         # --- 4. Subscriber: target joint states subscriber ---
         self.target_sub = self.create_subscription(
             JointState, 
             '/target_joint_states', 
             self.target_callback, 
-            HIGH_PERF_QOS
+            T_JS_QOS
         )
         self.get_logger().info(f"Subscribing to /target_joint_states for target joint poses.")
 

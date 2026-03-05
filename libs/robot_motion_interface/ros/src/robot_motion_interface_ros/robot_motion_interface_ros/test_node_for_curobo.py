@@ -33,12 +33,11 @@ import importlib.util
 from robot_motion_interface.utils.kinematics import CuRoboBimanualMotionPlanner
 
 # --- QoS ---
-HIGH_PERF_QOS = QoSProfile(
-    reliability=ReliabilityPolicy.BEST_EFFORT,
-    durability=DurabilityPolicy.VOLATILE,
-    history=HistoryPolicy.KEEP_LAST,
-    depth=1,
-)
+from robot_motion_interface.utils.qos import HIGH_PERF_QOS, HIGH_RELIA_QOS
+JS_QOS = HIGH_PERF_QOS
+BBOX_QOS = HIGH_PERF_QOS
+T_JS_QOS = HIGH_RELIA_QOS
+
 
 spec = importlib.util.find_spec("robot_motion_interface")
 if spec is None or spec.origin is None:
@@ -130,8 +129,8 @@ class BimanualTrajTestNode(Node):
         )
 
         # ── ROS pub / sub ─────────────────────────────────────────────────────
-        self.target_pub = self.create_publisher(JointState, '/target_joint_states', HIGH_PERF_QOS)
-        self.create_subscription(JointState, '/joint_states', self._js_callback, HIGH_PERF_QOS)
+        self.target_pub = self.create_publisher(JointState, '/target_joint_states', T_JS_QOS)
+        self.create_subscription(JointState, '/joint_states', self._js_callback, JS_QOS)
 
         # Execution timer (always ticking; no-ops when not in EXECUTING state)
         self._exec_timer = self.create_timer(

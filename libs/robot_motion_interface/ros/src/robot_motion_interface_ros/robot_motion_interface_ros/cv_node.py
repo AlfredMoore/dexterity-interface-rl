@@ -16,13 +16,10 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 from rclpy.parameter import Parameter
 
 # --- QoS Config: low latency (Best Effort) ---
-
-HIGH_PERF_QOS = QoSProfile(
-    reliability=ReliabilityPolicy.BEST_EFFORT,
-    durability=DurabilityPolicy.VOLATILE,
-    history=HistoryPolicy.KEEP_LAST,
-    depth=1
-)
+from robot_motion_interface.utils.qos import HIGH_PERF_QOS, HIGH_RELIA_QOS
+JS_QOS = HIGH_PERF_QOS
+BBOX_QOS = HIGH_PERF_QOS
+T_JS_QOS = HIGH_RELIA_QOS
 
 spec = importlib.util.find_spec("robot_motion_interface")
 if spec is None or spec.origin is None:
@@ -102,7 +99,7 @@ class CVPerceptionNode(Node):
         #     config["cv_model_path"], map_location=self.device
         # ).eval()
 
-        self.object_detection_pub = self.create_publisher(Detection3D, '/object_detection', HIGH_PERF_QOS)
+        self.object_detection_pub = self.create_publisher(Detection3D, '/object_detection', BBOX_QOS)
         # Inference timer
         self.create_timer(1.0 / _infer_rate, self._infer_callback)
         self.get_logger().info(

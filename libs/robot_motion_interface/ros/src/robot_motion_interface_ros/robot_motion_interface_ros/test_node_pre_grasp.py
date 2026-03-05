@@ -7,12 +7,10 @@ import yaml
 from pathlib import Path
 import importlib.util
 
-HIGH_PERF_QOS = QoSProfile(
-    reliability=ReliabilityPolicy.BEST_EFFORT,
-    durability=DurabilityPolicy.VOLATILE,
-    history=HistoryPolicy.KEEP_LAST,
-    depth=1,
-)
+from robot_motion_interface.utils.qos import HIGH_PERF_QOS, HIGH_RELIA_QOS
+JS_QOS = HIGH_PERF_QOS
+BBOX_QOS = HIGH_PERF_QOS
+T_JS_QOS = HIGH_RELIA_QOS
 
 spec = importlib.util.find_spec("robot_motion_interface")
 if spec is None or spec.origin is None:
@@ -62,7 +60,7 @@ class PreGraspTestNode(Node):
         self._pause_ticks = int(PAUSE_S / TRAJ_DT)
 
         # ── Publisher + timer ──────────────────────────────────────────────────
-        self._pub   = self.create_publisher(JointState, '/target_joint_states', HIGH_PERF_QOS)
+        self._pub   = self.create_publisher(JointState, '/target_joint_states', T_JS_QOS)
         self._timer = self.create_timer(TRAJ_DT, self._tick)
         self.get_logger().info("Starting: HOME → PRE_GRASP")
 
