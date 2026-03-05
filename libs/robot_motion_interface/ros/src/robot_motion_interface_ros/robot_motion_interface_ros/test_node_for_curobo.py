@@ -77,22 +77,22 @@ class BimanualTrajTestNode(Node):
         super().__init__('bimanual_traj_test_node')
 
         # ── Parameters ────────────────────────────────────────────────────────
-        default_cfg      = str(_RMI_ROOT / 'config' / 'rl_bimanual_driver_config.yaml')
+        default_drive_cfg      = str(_RMI_ROOT / 'config' / 'rl_bimanual_driver_config.yaml')
         default_policy_cfg = str(_RMI_ROOT/'config'/'rl_policy_node_config.yaml')
         default_pregrasp = str(_PROJECT_ROOT / 'models' / 'pre_grasp_q_samples.pt')
-        self.declare_parameter('config_path',    default_cfg)
+        self.declare_parameter('driver_cfg_path', default_drive_cfg)
         self.declare_parameter('policy_cfg_path',    default_policy_cfg)
         self.declare_parameter('pregrasp_path',  default_pregrasp)
-        config_path   = self.get_parameter('config_path').get_parameter_value().string_value
+        driver_cfg_path   = self.get_parameter('driver_cfg_path').get_parameter_value().string_value
         policy_cfg_path = self.get_parameter('policy_cfg_path').get_parameter_value().string_value
         pregrasp_path = self.get_parameter('pregrasp_path').get_parameter_value().string_value
 
-        self.get_logger().info(f"Config:            {config_path}")
+        self.get_logger().info(f"Config:            {driver_cfg_path}")
         self.get_logger().info(f"policy_cfg_path:   {policy_cfg_path}")
         self.get_logger().info(f"Pregrasp:          {pregrasp_path}")
 
-        with open(config_path, 'r') as f:
-            cfg = yaml.safe_load(f)
+        with open(driver_cfg_path, 'r') as f:
+            driver_cfg = yaml.safe_load(f)
         
         with open(policy_cfg_path, 'r') as f:
             policy_cfg = yaml.safe_load(f)
@@ -100,8 +100,8 @@ class BimanualTrajTestNode(Node):
         infer_rate = policy_cfg["infer_rate"]
 
         # ── Joint names (must match driver_node order) ─────────────────────
-        l_names = ['left_' + n for n in cfg['left_panda_joint_names']  + cfg['left_tesollo_joint_names']]
-        r_names = ['right_' + n for n in cfg['right_panda_joint_names'] + cfg['right_tesollo_joint_names']]
+        l_names = ['left_' + n for n in driver_cfg['left_panda_joint_names']  + driver_cfg['left_tesollo_joint_names']]
+        r_names = ['right_' + n for n in driver_cfg['right_panda_joint_names'] + driver_cfg['right_tesollo_joint_names']]
         self.joint_names: list[str] = l_names + r_names   # 38 names
 
         # ── Load pre-grasp configs ──────────────────────────────────────────
@@ -264,13 +264,14 @@ class BimanualTrajTestNode(Node):
         self.get_logger().info("Target is collision-free. Planning trajectory...")
 
         # 2. Plan
-        traj, ok, status = self._planner.plan_to_joint(q_start, q_goal)
+        traj, last_tstep, ok = self._planner.plan_to_joint(q_start, q_goal)
         if not ok:
-            self.get_logger().error(f"cuRobo planning failed: {status}. Aborting.")
+            self.get_logger().error("cuRobo planning failed. Aborting.")
             with self._lock:
                 self._state = _IDLE
             return
 
+        traj = traj[:last_tstep + 1]
         dt = self._planner._interpolation_dt
         self.get_logger().info(
             f"Trajectory ready: {traj.shape[0]} steps "

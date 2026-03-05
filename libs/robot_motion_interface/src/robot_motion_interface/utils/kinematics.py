@@ -240,12 +240,12 @@ class CuRoboBimanualMotionPlanner:
         )
 
         # Joint-space planning (most common)
-        traj, ok, status = planner.plan_to_joint(HOME_Q, PRE_GRASP_Q)
+        traj, last_tstep, ok = planner.plan_to_joint(HOME_Q, PRE_GRASP_Q)
         if ok:
             execute(traj)   # traj: (T, 38) float32, waypoints at 0.02 s
 
         # Cartesian planning
-        traj, ok, status = planner.plan_to_pose(
+        traj, last_tstep, ok = planner.plan_to_pose(
             HOME_Q,
             left_pos=np.array([0.3, 0.3, 0.8]), left_quat=np.array([1, 0, 0, 0]),
             right_pos=np.array([0.3, -0.3, 0.8]), right_quat=np.array([1, 0, 0, 0]),
@@ -421,7 +421,7 @@ class CuRoboBimanualMotionPlanner:
             quaternion=torch.tensor(quat, dtype=torch.float32, device=self._device).unsqueeze(0),
         )
 
-    def _extract_trajectory(self, result) -> tuple[np.ndarray | None, bool, str]:
+    def _extract_trajectory(self, result) -> tuple[np.ndarray | None, int, bool]:
         if result.success.any().item():
             traj = result.interpolated_solution
             if traj is None:
@@ -429,10 +429,11 @@ class CuRoboBimanualMotionPlanner:
             if traj.joint_names is not None:
                 traj = traj.get_ordered_joint_state(self._joint_names)
             pos = traj.position
+            last_tstep = int(result.path_buffer_last_tstep[0].item())
             if pos.dim() == 3:
                 pos = pos[0]  # [T, dof]
-            return pos.cpu().numpy(), True, "success"
-        return None, False, "trajopt_failed"
+            return pos.cpu().numpy(), last_tstep, True
+        return None, 0, False
 
     # ------------------------------------------------------------------
     # IK
@@ -500,7 +501,7 @@ class CuRoboBimanualMotionPlanner:
         left_target_quat: np.ndarray,   # (4,)  w x y z
         right_target_pos: np.ndarray,   # (3,)  xyz in world frame
         right_target_quat: np.ndarray,  # (4,)  w x y z
-    ) -> tuple[np.ndarray | None, bool, str]:
+    ) -> tuple[np.ndarray | None, int, bool]:
         """
         Plan a self-collision-free trajectory to the given bimanual EE poses.
 
@@ -518,14 +519,13 @@ class CuRoboBimanualMotionPlanner:
             trajectory : (T, n_joints) float32 numpy array — waypoints at
                          interpolation_dt second intervals — or None on failure.
             success    : True if a valid trajectory was found.
-            status     : "success" | "ik_failed" | "trajopt_failed".
         """
         q_goal, ik_ok = self.solve_ik(
             left_target_pos, left_target_quat,
             right_target_pos, right_target_quat,
         )
         if not ik_ok:
-            return None, False, "ik_failed"
+            return None, 0, False
         return self.plan_to_joint(q_start, q_goal)
 
     # ------------------------------------------------------------------
@@ -536,7 +536,7 @@ class CuRoboBimanualMotionPlanner:
         self,
         q_start: np.ndarray,    # (n_joints,)
         q_goal: np.ndarray,     # (n_joints,)
-    ) -> tuple[np.ndarray | None, bool, str]:
+    ) -> tuple[np.ndarray | None, int, bool]:
         """
         Plan a self-collision-free trajectory to the given target joint configuration.
 
@@ -551,8 +551,8 @@ class CuRoboBimanualMotionPlanner:
         Returns:
             trajectory : (T, n_joints) float32 numpy array — waypoints at
                          interpolation_dt second intervals — or None on failure.
+            last_tstep : the last valid time step in the returned trajectory (0 if failure).
             success    : True if a valid trajectory was found.
-            status     : "success" | "trajopt_failed".
         """
         goal = Goal(
             goal_state=self._make_joint_state(q_goal),
@@ -758,17 +758,17 @@ if __name__ == "__main__":
 
         print(f"\nPlanning trajectory from HOME_Q to PRE_GRASP_Q...")
         t_start = time.time()
-        traj, ok, status = planner.plan_to_joint(HOME_Q, PRE_GRASP_Q)
+        traj, last_tstep, ok = planner.plan_to_joint(HOME_Q, PRE_GRASP_Q)
         if ok:
             print(
                 f"[OK] Trajectory: {traj.shape[0]} steps x {traj.shape[1]} DoF  "
                 f"(dt={planner._interpolation_dt:.3f}s, "
-                f"~{traj.shape[0] * planner._interpolation_dt:.1f}s total)"
+                f"~{last_tstep * planner._interpolation_dt:.1f}s total)"
             )
             print(f"     Start : {traj[0]}")
-            print(f"     End   : {traj[-1]}")
+            print(f"     End   : {traj[last_tstep]}")
         else:
-            print(f"[FAIL] Planning failed: {status}")
+            print("[FAIL] Planning failed.")
         t_end = time.time()
         print(f"Planning took {(t_end - t_start):.6f} seconds.")
 

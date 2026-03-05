@@ -97,20 +97,22 @@ def main() -> None:
 
     # ── Forward: HOME → PRE_GRASP ─────────────────────────────────────────────
     print("\nPlanning HOME_Q → PRE_GRASP_Q...")
-    traj_fwd, ok_fwd, status_fwd = planner.plan_to_joint(HOME_Q, pre_grasp_q)
+    traj_fwd, last_tstep_fwd, ok_fwd = planner.plan_to_joint(HOME_Q, pre_grasp_q)
     if not ok_fwd:
-        print(f"[FAIL] Forward planning failed: {status_fwd}. Exiting.")
+        print("[FAIL] Forward planning failed. Exiting.")
         return
+    traj_fwd = traj_fwd[:last_tstep_fwd + 1]
     dt = planner._interpolation_dt
     print(f"[OK] Forward: {traj_fwd.shape[0]} steps  "
           f"(dt={dt:.3f}s, ~{traj_fwd.shape[0] * dt:.1f}s total)")
 
     # ── Return: PRE_GRASP → HOME ──────────────────────────────────────────────
     print("\nPlanning PRE_GRASP_Q → HOME_Q...")
-    traj_ret, ok_ret, status_ret = planner.plan_to_joint(pre_grasp_q, HOME_Q)
+    traj_ret, last_tstep_ret, ok_ret = planner.plan_to_joint(pre_grasp_q, HOME_Q)
     if not ok_ret:
-        print(f"[FAIL] Return planning failed: {status_ret}. Exiting.")
+        print("[FAIL] Return planning failed. Exiting.")
         return
+    traj_ret = traj_ret[:last_tstep_ret + 1]
     print(f"[OK] Return:  {traj_ret.shape[0]} steps  "
           f"(dt={dt:.3f}s, ~{traj_ret.shape[0] * dt:.1f}s total)")
 
