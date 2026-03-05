@@ -6,8 +6,9 @@ Workflow
 1. Subscribes to /joint_states from rl_driver_node → q_start.
 2. Loads pre-sampled pre-grasp joint configs from a .pt file.
 3. Keyboard loop lets the user browse and select a target config → q_goal.
-4. On 'g' / Enter: collision-check q_goal, then plan a collision-free
+4. On 'g' / Enter: save target mesh, collision-check q_goal, plan a collision-free
    trajectory with cuRobo, then replay it at the configured dt.
+5. On 'h': plan and execute a return trajectory to HOME_Q.
 
 Keyboard commands (type + Enter)
 ---------------------------------
@@ -15,6 +16,7 @@ Keyboard commands (type + Enter)
   p          select previous config
   <number>   jump to that config index
   g / Enter  plan and execute current selection
+  h          plan and execute return to HOME_Q
   q          quit
 """
 import threading
@@ -59,14 +61,6 @@ DEFAULT_BIMANUAL_URDF_PATH     = str((_ROBOT_DESC / "rl/bimanual_panda_tesollo.u
 DEFAULT_CUROBO_ROBOT_CFG_PATH  = str((_CONFIGS_CUROBO / "robot/bimanual_panda_tesollo.yml").resolve())
 DEFAULT_COLLISION_SPHERES_PATH = str((_CONFIGS_CUROBO / "robot/spheres/bimanual_panda_tesollo_spheres.yml").resolve())
 
-# dim: 7(L_arm) + 12(L_hand) + 7(R_arm) + 12(R_hand) = 38
-HOME_Q = np.array([
-    0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854,
-    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854,
-    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-], dtype=np.float32)
-
 _IDLE      = "IDLE"
 _PLANNING  = "PLANNING"
 _EXECUTING = "EXECUTING"
@@ -93,11 +87,16 @@ class BimanualTrajTestNode(Node):
 
         with open(driver_cfg_path, 'r') as f:
             driver_cfg = yaml.safe_load(f)
-        
+
         with open(policy_cfg_path, 'r') as f:
             policy_cfg = yaml.safe_load(f)
-        
+
         infer_rate = policy_cfg["infer_rate"]
+
+        # ── HOME_Q from driver config (panda + tesollo, both arms) ────────────
+        _panda_home   = np.array(driver_cfg['panda_home_joint_positions'],   dtype=np.float32)
+        _tesollo_home = np.array(driver_cfg['tesollo_home_joint_positions'], dtype=np.float32)
+        self._home_q  = np.concatenate([_panda_home, _tesollo_home, _panda_home, _tesollo_home])
 
         # ── Joint names (must match driver_node order) ─────────────────────
         l_names = ['left_' + n for n in driver_cfg['left_panda_joint_names']  + driver_cfg['left_tesollo_joint_names']]
@@ -154,7 +153,7 @@ class BimanualTrajTestNode(Node):
         self._print_status()
         self.get_logger().info(
             "Ready. Commands (type + Enter):\n"
-            "[n] next  [p] prev  [<number>] jump  [g/Enter] plan+execute  [q] quit"
+            "[n] next  [p] prev  [<number>] jump  [g/Enter] plan+execute  [h] home  [q] quit"
         )
 
     # ── Joint state subscription ───────────────────────────────────────────────
@@ -188,8 +187,11 @@ class BimanualTrajTestNode(Node):
     def _keyboard_loop(self) -> None:
         while rclpy.ok():
             try:
-                prompt = f"[{self._selected_idx}/{self._n_configs - 1}]> \nCommands (type + Enter):\n" \
-            "[n] next  [p] prev  [<number>] jump  [g/Enter] plan+execute  [q] quit\n"
+                prompt = (
+                    f"[{self._selected_idx}/{self._n_configs - 1}]> \n"
+                    "Commands (type + Enter):\n"
+                    "[n] next  [p] prev  [<number>] jump  [g/Enter] plan+execute  [h] home  [q] quit\n"
+                )
                 raw = input(prompt).strip()
             except EOFError:
                 break
@@ -212,6 +214,8 @@ class BimanualTrajTestNode(Node):
                 self._print_status()
             elif raw in ('g', ''):
                 self._trigger_plan()
+            elif raw == 'h':
+                self._trigger_home()
             else:
                 self.get_logger().warn(f"Unknown command: '{raw}'")
             
@@ -250,8 +254,36 @@ class BimanualTrajTestNode(Node):
             target=self._plan_and_execute, args=(q_start, q_goal), daemon=True
         ).start()
 
+    def _trigger_home(self) -> None:
+        with self._lock:
+            if self._state == _EXECUTING:
+                self.get_logger().warn("Already executing — wait for completion.")
+                return
+            if self._state == _PLANNING:
+                self.get_logger().warn("Already planning — please wait.")
+                return
+            q_start = self._q_current
+            self._state = _PLANNING
+
+        if q_start is None:
+            self.get_logger().error("No /joint_states received yet. Cannot plan.")
+            with self._lock:
+                self._state = _IDLE
+            return
+
+        self.get_logger().info("Planning return to HOME_Q...")
+        threading.Thread(
+            target=self._plan_and_execute, args=(q_start, self._home_q.copy()), daemon=True
+        ).start()
+
     def _plan_and_execute(self, q_start: np.ndarray, q_goal: np.ndarray) -> None:
-        # 1. Collision check on target
+        # 1. Save target mesh
+        stl_path = str(_PROJECT_ROOT / 'models' / 'robot_next_q.stl')
+        self.get_logger().info(f"Saving target mesh to {stl_path} ...")
+        self._planner.save_scene_as_mesh(q_goal, stl_path)
+        self.get_logger().info("Mesh saved.")
+
+        # 2. Collision check on target
         self.get_logger().info("Checking target config for collision...")
         self_col = self._planner.self_collision_check(q_goal)
         if self_col:
@@ -263,7 +295,7 @@ class BimanualTrajTestNode(Node):
             return
         self.get_logger().info("Target is collision-free. Planning trajectory...")
 
-        # 2. Plan
+        # 3. Plan
         traj, last_tstep, ok = self._planner.plan_to_joint(q_start, q_goal)
         if not ok:
             self.get_logger().error("cuRobo planning failed. Aborting.")
@@ -278,7 +310,7 @@ class BimanualTrajTestNode(Node):
             f"(dt={dt:.3f}s, ~{traj.shape[0] * dt:.1f}s total). Executing..."
         )
 
-        # 3. Hand off to exec timer
+        # 4. Hand off to exec timer
         with self._lock:
             self._traj       = traj
             self._traj_index = 0
