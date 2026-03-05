@@ -77,10 +77,13 @@ class BimanualTrajTestNode(Node):
 
         # ── Parameters ────────────────────────────────────────────────────────
         default_cfg      = str(_RMI_ROOT / 'config' / 'rl_bimanual_driver_config.yaml')
+        default_policy_cfg = str(_RMI_ROOT/'config'/'rl_bimanual_driver_config.yaml')
         default_pregrasp = str(_PROJECT_ROOT / 'models' / 'pre_grasp_q_samples.pt')
         self.declare_parameter('config_path',    default_cfg)
+        self.declare_parameter('policy_cfg_path',    default_policy_cfg)
         self.declare_parameter('pregrasp_path',  default_pregrasp)
         config_path   = self.get_parameter('config_path').get_parameter_value().string_value
+        policy_cfg_path = self.get_parameter('policy_cfg_path').get_parameter_value().string_value
         pregrasp_path = self.get_parameter('pregrasp_path').get_parameter_value().string_value
 
         self.get_logger().info(f"Config:   {config_path}")
@@ -88,6 +91,11 @@ class BimanualTrajTestNode(Node):
 
         with open(config_path, 'r') as f:
             cfg = yaml.safe_load(f)
+        
+        with open(policy_cfg_path, 'r') as f:
+            policy_cfg = yaml.safe_load(f)
+        
+        infer_rate = policy_cfg["infer_rate"]
 
         # ── Joint names (must match driver_node order) ─────────────────────
         l_names = ['left_' + n for n in cfg['left_panda_joint_names']  + cfg['left_tesollo_joint_names']]
@@ -119,13 +127,13 @@ class BimanualTrajTestNode(Node):
             left_ee_link                = "left_delto_base_link",
             right_ee_link               = "right_delto_base_link",
             device                      = "cuda:0",
-            trajopt_tsteps              = 64,
-            interpolation_steps         = 2000,
+            trajopt_tsteps              = 32,
+            interpolation_steps         = 1000,
             num_ik_seeds                = 50,
             num_trajopt_seeds           = 32,
             grad_trajopt_iters          = 800,
-            interpolation_dt            = 0.02,
-            collision_activation_distance = 0.005,
+            interpolation_dt            = 1.0 / infer_rate,
+            collision_activation_distance = 0.01,
         )
 
         # ── ROS pub / sub ─────────────────────────────────────────────────────
@@ -134,7 +142,7 @@ class BimanualTrajTestNode(Node):
 
         # Execution timer (always ticking; no-ops when not in EXECUTING state)
         self._exec_timer = self.create_timer(
-            self._planner._interpolation_dt, self._exec_callback
+            1.0 / infer_rate, self._exec_callback
         )
 
         # ── Keyboard thread ────────────────────────────────────────────────────
@@ -143,7 +151,7 @@ class BimanualTrajTestNode(Node):
 
         self._print_status()
         self.get_logger().info(
-            "Ready. Commands (type + Enter): "
+            "Ready. Commands (type + Enter):\n"
             "[n] next  [p] prev  [<number>] jump  [g/Enter] plan+execute  [q] quit"
         )
 
@@ -177,7 +185,8 @@ class BimanualTrajTestNode(Node):
     def _keyboard_loop(self) -> None:
         while rclpy.ok():
             try:
-                prompt = f"[{self._selected_idx}/{self._n_configs - 1}]> "
+                prompt = f"[{self._selected_idx}/{self._n_configs - 1}]> \nCommands (type + Enter):\n" \
+            "[n] next  [p] prev  [<number>] jump  [g/Enter] plan+execute  [q] quit"
                 raw = input(prompt).strip()
             except EOFError:
                 break

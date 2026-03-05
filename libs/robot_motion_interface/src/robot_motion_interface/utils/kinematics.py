@@ -22,6 +22,9 @@ from curobo.types.math import Pose
 from curobo.types.state import JointState
 from curobo.types.robot import RobotConfig
 
+from curobo.util.trajectory import InterpolateType
+
+
 
 from curobo.util_file import (
     get_robot_configs_path,
@@ -303,12 +306,16 @@ class CuRoboBimanualMotionPlanner:
             self_collision_check=True,
             self_collision_opt=True,
             traj_tsteps=trajopt_tsteps,
+            interpolation_dt=interpolation_dt,
+            interpolation_type=InterpolateType.QUINTIC,
             interpolation_steps=interpolation_steps,
             num_seeds=num_trajopt_seeds,
+            filter_robot_command=True,
             grad_trajopt_iters=grad_trajopt_iters,
             interpolation_dt=interpolation_dt,
             collision_activation_distance=collision_activation_distance,
             evaluate_interpolated_trajectory=True,
+            optimize_dt=False,
             use_cuda_graph=True,
         )
         self._trajopt = TrajOptSolver(trajopt_config)
