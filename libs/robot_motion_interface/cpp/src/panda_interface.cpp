@@ -49,6 +49,10 @@ Eigen::VectorXd PandaInterface::joint_state() {
 
 
 void PandaInterface::start_loop() {
+    // freeze before starting
+    franka::RobotState initial_state = robot_.readOnce();
+    Eigen::VectorXd q_init = array_to_eigen(initial_state.q);
+    controller_->set_setpoint(q_init);
 
     // Put in own thread
     control_thread_ = std::thread([this]() {

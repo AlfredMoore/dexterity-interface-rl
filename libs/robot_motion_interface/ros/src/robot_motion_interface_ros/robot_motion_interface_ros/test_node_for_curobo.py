@@ -27,6 +27,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 import numpy as np
 import torch
 import yaml
+import time
 from pathlib import Path
 import importlib.util
 
@@ -77,7 +78,7 @@ class BimanualTrajTestNode(Node):
 
         # ── Parameters ────────────────────────────────────────────────────────
         default_cfg      = str(_RMI_ROOT / 'config' / 'rl_bimanual_driver_config.yaml')
-        default_policy_cfg = str(_RMI_ROOT/'config'/'rl_bimanual_driver_config.yaml')
+        default_policy_cfg = str(_RMI_ROOT/'config'/'rl_policy_node_config.yaml')
         default_pregrasp = str(_PROJECT_ROOT / 'models' / 'pre_grasp_q_samples.pt')
         self.declare_parameter('config_path',    default_cfg)
         self.declare_parameter('policy_cfg_path',    default_policy_cfg)
@@ -86,8 +87,9 @@ class BimanualTrajTestNode(Node):
         policy_cfg_path = self.get_parameter('policy_cfg_path').get_parameter_value().string_value
         pregrasp_path = self.get_parameter('pregrasp_path').get_parameter_value().string_value
 
-        self.get_logger().info(f"Config:   {config_path}")
-        self.get_logger().info(f"Pregrasp: {pregrasp_path}")
+        self.get_logger().info(f"Config:            {config_path}")
+        self.get_logger().info(f"policy_cfg_path:   {policy_cfg_path}")
+        self.get_logger().info(f"Pregrasp:          {pregrasp_path}")
 
         with open(config_path, 'r') as f:
             cfg = yaml.safe_load(f)
@@ -174,6 +176,7 @@ class BimanualTrajTestNode(Node):
                 return
             q = self._traj[self._traj_index]
             self._traj_index += 1
+            self.get_logger().info(f"TRAJ IDX: {self._traj_index}")
 
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -186,7 +189,7 @@ class BimanualTrajTestNode(Node):
         while rclpy.ok():
             try:
                 prompt = f"[{self._selected_idx}/{self._n_configs - 1}]> \nCommands (type + Enter):\n" \
-            "[n] next  [p] prev  [<number>] jump  [g/Enter] plan+execute  [q] quit"
+            "[n] next  [p] prev  [<number>] jump  [g/Enter] plan+execute  [q] quit\n"
                 raw = input(prompt).strip()
             except EOFError:
                 break
@@ -211,6 +214,8 @@ class BimanualTrajTestNode(Node):
                 self._trigger_plan()
             else:
                 self.get_logger().warn(f"Unknown command: '{raw}'")
+            
+            time.sleep(0.01)
 
     # ── Helpers ────────────────────────────────────────────────────────────────
     def _print_status(self) -> None:
@@ -218,9 +223,9 @@ class BimanualTrajTestNode(Node):
             idx = self._selected_idx
         q = self._pregrasp_qs[idx]
         self.get_logger().info(
-            f"Selected [{idx}/{self._n_configs - 1}]  "
-            f"left_arm={np.round(q[:7], 3).tolist()}  "
-            f"right_arm={np.round(q[19:26], 3).tolist()}"
+            f"\nSelected [{idx}/{self._n_configs - 1}]  "
+            f"\nleft_arm={[f"{x:.3f}" for x in q[:7]]}  "
+            f"\nright_arm={[f"{x:.3f}" for x in q[19:26]]}"
         )
 
     def _trigger_plan(self) -> None:
