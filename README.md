@@ -112,6 +112,7 @@ Launch Nodes
 ```bash
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 export ROS_STATIC_PEERS='192.168.4.4;remote.com'
+ros2 run robot_motion_interface_ros test_curobo
 ```
 
 Attach to Policy Container

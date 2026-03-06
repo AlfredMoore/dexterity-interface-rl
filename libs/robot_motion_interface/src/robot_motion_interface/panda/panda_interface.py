@@ -13,7 +13,7 @@ class PandaControlMode(Enum):
 class PandaInterface(Interface):
     
     def __init__(self, hostname:str, urdf_path:str, joint_names:list[str], home_joint_positions:np.ndarray,
-                 kp:np.ndarray, kd:np.ndarray, control_mode:PandaControlMode=None):
+                 kp:np.ndarray, kd:np.ndarray, control_mode:PandaControlMode=None, max_joint_delta:float=-1):
         """
         Python wrapper for C++ Panda Interface.
         Args:
@@ -24,11 +24,12 @@ class PandaInterface(Interface):
             kp (np.ndarray): (n_joints) Proportional gains for controllers
             kd (np.ndarray): (n_joints) Derivative gains for controllers
             control_mode (PandaControlMode): Control mode for the robot (e.g., JOINT_TORQUE).
+            max_joint_delta (float): Caps joint error per control step (rad). -1 to disable.
         """
         super().__init__(joint_names)
         self._home_joint_positions = home_joint_positions
         self._control_mode = control_mode
-        self._panda_interface_cpp = PandaInterfacePybind(hostname, urdf_path, self._joint_names, kp, kd)
+        self._panda_interface_cpp = PandaInterfacePybind(hostname, urdf_path, self._joint_names, kp, kd, max_joint_delta)
     
     @classmethod
     def from_yaml(cls, file_path: str):

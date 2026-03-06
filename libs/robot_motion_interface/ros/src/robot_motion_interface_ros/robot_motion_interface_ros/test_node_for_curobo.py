@@ -189,6 +189,13 @@ class BimanualTrajTestNode(Node):
         np.save(str(npy_path), q_goal)
         print(f"[saved] {npy_path}")
 
+        # 5. Export mesh in background (lazy-cached, safe to call repeatedly)
+        mesh_path = str(_PROJECT_ROOT / 'models' / 'scene_goal.stl')
+        def _save_mesh():
+            self._planner.save_scene_as_mesh(q_goal, mesh_path)
+            print(f"[saved] {mesh_path}")
+        threading.Thread(target=_save_mesh, daemon=True).start()
+
         return True
 
     # ── Sequential keyboard loop (run from main thread) ───────────────────────

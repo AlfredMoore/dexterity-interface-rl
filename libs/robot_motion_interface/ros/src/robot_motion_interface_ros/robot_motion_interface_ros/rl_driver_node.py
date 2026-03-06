@@ -48,7 +48,8 @@ class RLDriverNode(Node):
         panda_home_joint_positions = np.array(config["panda_home_joint_positions"], dtype=float)
         panda_kp = np.array(config["panda_kp"], dtype=float)
         panda_kd = np.array(config["panda_kd"], dtype=float)
-        
+        panda_max_joint_delta = float(config.get("panda_max_joint_delta", -1))
+
         tesollo_home_joint_positions = np.array(config["tesollo_home_joint_positions"], dtype=float)
         tesollo_control_loop_frequency = config["tesollo_control_loop_frequency"]
         tesollo_kp = np.array(config["tesollo_kp"], dtype=float)
@@ -69,12 +70,12 @@ class RLDriverNode(Node):
         # --- 2. Initialize Interface ---
         self.get_logger().info(f"Initializing RLDriverNode...")
         try:
-            self._panda_left = PandaInterface(left_panda_hostname, panda_urdf_path, left_panda_joint_names, 
-                panda_home_joint_positions, panda_kp, panda_kd)
-            self._tesollo_left = TesolloInterface(left_tesollo_ip, left_tesollo_port, left_tesollo_joint_names, 
+            self._panda_left = PandaInterface(left_panda_hostname, panda_urdf_path, left_panda_joint_names,
+                panda_home_joint_positions, panda_kp, panda_kd, max_joint_delta=panda_max_joint_delta)
+            self._tesollo_left = TesolloInterface(left_tesollo_ip, left_tesollo_port, left_tesollo_joint_names,
                 tesollo_home_joint_positions, tesollo_kp,tesollo_kd, tesollo_control_loop_frequency)
-            self._panda_right = PandaInterface(right_panda_hostname, panda_urdf_path, right_panda_joint_names, 
-                panda_home_joint_positions, panda_kp, panda_kd)
+            self._panda_right = PandaInterface(right_panda_hostname, panda_urdf_path, right_panda_joint_names,
+                panda_home_joint_positions, panda_kp, panda_kd, max_joint_delta=panda_max_joint_delta)
             self._tesollo_right = TesolloInterface(right_tesollo_ip, right_tesollo_port, right_tesollo_joint_names, 
                 tesollo_home_joint_positions, tesollo_kp,tesollo_kd, tesollo_control_loop_frequency)
             self._n_panda = len(self._panda_left.joint_names())

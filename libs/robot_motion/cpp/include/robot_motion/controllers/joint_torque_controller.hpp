@@ -16,7 +16,7 @@ public:
     * @param kp Proportional gains
     * @param kd Derivative gains
     */
-    JointTorqueController(const RobotProperties& robot_properties, const Eigen::VectorXd& kp, const Eigen::VectorXd& kd, bool gravity_compensation);
+    JointTorqueController(const RobotProperties& robot_properties, const Eigen::VectorXd& kp, const Eigen::VectorXd& kd, bool gravity_compensation, double max_joint_delta=-1);
 
 
 
@@ -34,6 +34,7 @@ public:
 
 private:
     bool gravity_compensation_;
+    double max_joint_delta_;
 };
 
 } 
