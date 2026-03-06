@@ -112,6 +112,11 @@ class BimanualTrajTestNode(Node):
         self.get_logger().info(f"Loaded {self._n_configs} pre-grasp configs.")
 
         # ── State ─────────────────────────────────────────────────────────────
+        # Two separate locks to avoid contention between high-frequency
+        # _js_callback (writes _q_current) and _exec_callback (reads traj state):
+        #   _js_lock  : guards _q_current only
+        #   _lock     : guards execution state (_state, _traj, _traj_index)
+        self._js_lock         = threading.Lock()
         self._lock            = threading.Lock()
         self._state           = _IDLE
         self._q_current: np.ndarray | None = None
@@ -161,7 +166,7 @@ class BimanualTrajTestNode(Node):
     def _js_callback(self, msg: JointState) -> None:
         """Extract current joint positions in self.joint_names order."""
         q = np.array(msg.position, dtype=np.float32)
-        with self._lock:
+        with self._js_lock:
             self._q_current = q
 
     # ── Execution timer callback ───────────────────────────────────────────────
@@ -245,9 +250,11 @@ class BimanualTrajTestNode(Node):
             if self._state == _PLANNING:
                 self.get_logger().warn("Already planning — please wait.")
                 return
-            q_start = self._q_current
-            q_goal  = self._pregrasp_qs[self._selected_idx].copy()
             self._state = _PLANNING
+
+        with self._js_lock:
+            q_start = self._q_current
+        q_goal = self._pregrasp_qs[self._selected_idx].copy()
 
         if q_start is None:
             self.get_logger().error("No /joint_states received yet. Cannot plan.")
@@ -267,8 +274,10 @@ class BimanualTrajTestNode(Node):
             if self._state == _PLANNING:
                 self.get_logger().warn("Already planning — please wait.")
                 return
-            q_start = self._q_current
             self._state = _PLANNING
+
+        with self._js_lock:
+            q_start = self._q_current
 
         if q_start is None:
             self.get_logger().error("No /joint_states received yet. Cannot plan.")
@@ -282,13 +291,7 @@ class BimanualTrajTestNode(Node):
         ).start()
 
     def _plan_and_execute(self, q_start: np.ndarray, q_goal: np.ndarray) -> None:
-        # 1. Save target mesh
-        stl_path = str(_PROJECT_ROOT / 'models' / 'robot_next_q.stl')
-        self.get_logger().info(f"Saving target mesh to {stl_path} ...")
-        self._planner.save_scene_as_mesh(q_goal, stl_path)
-        self.get_logger().info("Mesh saved.")
-
-        # 2. Collision check on target
+        # 1. Collision check on target
         self.get_logger().info("Checking target config for collision...")
         self_col = self._planner.self_collision_check(q_goal)
         if self_col:
@@ -300,7 +303,7 @@ class BimanualTrajTestNode(Node):
             return
         self.get_logger().info("Target is collision-free. Planning trajectory...")
 
-        # 3. Plan
+        # 2. Plan
         traj, last_tstep, ok = self._planner.plan_to_joint(q_start, q_goal)
         if not ok:
             self.get_logger().error("cuRobo planning failed. Aborting.")
@@ -315,13 +318,26 @@ class BimanualTrajTestNode(Node):
             f"(dt={dt:.3f}s, ~{traj.shape[0] * dt:.1f}s total). Executing..."
         )
 
-        
-
-        # 4. Hand off to exec timer
+        # 3. Hand off to exec timer — start execution immediately
         with self._lock:
             self._traj       = traj
             self._traj_index = 0
             self._state      = _EXECUTING
+
+        # 4. Save mesh in background — does not block execution
+        #    Uses the cached _mesh_kin_model so only the first-ever call is slow.
+        stl_path = str(_PROJECT_ROOT / 'models' / 'robot_next_q.stl')
+        threading.Thread(
+            target=self._save_mesh_bg, args=(q_goal, stl_path), daemon=True
+        ).start()
+
+    def _save_mesh_bg(self, q: np.ndarray, stl_path: str) -> None:
+        """Save robot mesh in a background thread without blocking the exec timer."""
+        try:
+            self._planner.save_scene_as_mesh(q, stl_path)
+            self.get_logger().info(f"[mesh] Saved {stl_path}")
+        except Exception as e:
+            self.get_logger().warn(f"[mesh] save_scene_as_mesh failed: {e}")
 
 
 def main(args=None):

@@ -355,6 +355,9 @@ class CuRoboBimanualMotionPlanner:
         # All cuRobo APIs expect joints in this order; we reorder inputs/outputs accordingly.
         self._internal_joint_names: list[str] = list(self._trajopt.rollout_fn.joint_names)
 
+        # Mesh model for save_scene_as_mesh — lazily initialised on first call.
+        self._mesh_kin_model = None
+
         # Collision checker at exact penetration (self_collision_check)
         robot_world_cfg = RobotWorldConfig.load_from_config(
             robot_config=self.robot_cfg,
@@ -381,7 +384,7 @@ class CuRoboBimanualMotionPlanner:
         (e.g. a policy network) are also unaffected; only the pool of already-free
         blocks is returned to the driver.
         """
-        for attr in ("_trajopt", "_ik_solver", "_robot_world", "_robot_world_plan"):
+        for attr in ("_trajopt", "_ik_solver", "_robot_world", "_robot_world_plan", "_mesh_kin_model"):
             try:
                 delattr(self, attr)
             except AttributeError:
@@ -797,12 +800,34 @@ class CuRoboBimanualMotionPlanner:
     # Debug visualisation
     # ------------------------------------------------------------------
 
+    def _get_mesh_kin_model(self):
+        """Return a cached CudaRobotModel with mesh geometry loaded.
+
+        The first call builds and caches the model (expensive: loads all link meshes
+        and compiles CUDA kernels).  Subsequent calls return the cached instance
+        immediately, so save_scene_as_mesh can be called repeatedly without penalty.
+        """
+        if self._mesh_kin_model is not None:
+            return self._mesh_kin_model
+
+        from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModel  # type: ignore[import-untyped]
+
+        robot_cfg_dict = load_yaml(self._robot_cfg_path)
+        robot_cfg_dict["robot_cfg"]["kinematics"]["urdf_path"]                 = self._urdf_path
+        robot_cfg_dict["robot_cfg"]["kinematics"]["collision_spheres"]         = self._spheres_path
+        robot_cfg_dict["robot_cfg"]["kinematics"]["load_link_names_with_mesh"] = True
+        robot_cfg_dict["robot_cfg"]["kinematics"]["load_meshes"]               = True
+
+        mesh_robot_cfg = RobotConfig.from_dict(robot_cfg_dict, self.tensor_args)
+        self._mesh_kin_model = CudaRobotModel(mesh_robot_cfg.kinematics)
+        return self._mesh_kin_model
+
     def save_scene_as_mesh(self, q: np.ndarray, save_path: str) -> None:
         """
         Save the robot at joint configuration q together with world obstacles as an STL.
 
-        Intended for offline debug only (not real-time). Reloads the robot config
-        with mesh geometry enabled, which is separate from the planning model.
+        The underlying CudaRobotModel (with mesh geometry) is built once and cached;
+        repeated calls to this method are fast after the first invocation.
 
         Args:
             q         : (n_joints,) joint configuration in BIMANUAL_JOINT_NAMES order.
@@ -812,21 +837,9 @@ class CuRoboBimanualMotionPlanner:
             planner.save_scene_as_mesh(PRE_GRASP_Q, "/tmp/debug_scene.stl")
             # Then open with MeshLab / Blender / RViz
         """
-        from curobo.cuda_robot_model.cuda_robot_model import CudaRobotModel  # type: ignore[import-untyped]
-
-        # Reload robot config with link mesh geometry enabled.
-        # The planning model skips this to save GPU memory.
-        robot_cfg_dict = load_yaml(self._robot_cfg_path)
-        robot_cfg_dict["robot_cfg"]["kinematics"]["urdf_path"]                = self._urdf_path
-        robot_cfg_dict["robot_cfg"]["kinematics"]["collision_spheres"]        = self._spheres_path
-        robot_cfg_dict["robot_cfg"]["kinematics"]["load_link_names_with_mesh"] = True
-        robot_cfg_dict["robot_cfg"]["kinematics"]["load_meshes"]              = True
-
-        mesh_robot_cfg = RobotConfig.from_dict(robot_cfg_dict, self.tensor_args)
-        kin_model      = CudaRobotModel(mesh_robot_cfg.kinematics)
+        kin_model = self._get_mesh_kin_model()
 
         # Build a named JointState and reorder to the model's internal joint ordering.
-        # kin_model.joint_names == self._internal_joint_names (same config, same URDF traversal).
         js = JointState.from_position(
             torch.tensor(q, dtype=torch.float32, device=self._device).unsqueeze(0),
             joint_names=self._joint_names,
