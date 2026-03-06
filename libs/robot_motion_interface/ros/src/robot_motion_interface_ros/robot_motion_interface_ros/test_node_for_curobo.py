@@ -7,11 +7,15 @@ Workflow
 2. Loads pre-sampled pre-grasp joint configs from a .pt file.
 3. Keyboard loop lets the user browse and select a target config → q_goal.
 4. On 'g' / Enter: collision-check q_goal, plan a collision-free trajectory
-   with cuRobo, execute it, then save the target mesh.
+   with cuRobo, execute it at a fixed rate, then save the goal joint state.
 5. On 'h': plan and execute a return trajectory to HOME_Q.
 
-The executor spins in a background thread; the main thread runs a sequential
-keyboard loop.  Keyboard input is only accepted after execution is complete.
+The executor spins in a background thread (handles /joint_states subscription).
+The main thread runs a sequential keyboard loop; input is accepted only after
+the current plan+execute cycle is fully complete.
+
+Trajectory execution uses a plain time-compensated loop in the main thread —
+no ROS timer, no state machine — so waypoints are sent at a precise, steady rate.
 
 Keyboard commands (type + Enter)
 ---------------------------------
@@ -26,7 +30,7 @@ import threading
 
 import rclpy
 from rclpy.node import Node
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.executors import SingleThreadedExecutor
 from sensor_msgs.msg import JointState
 import numpy as np
 import torch
@@ -58,9 +62,6 @@ DEFAULT_BIMANUAL_URDF_PATH     = str((_ROBOT_DESC / "rl/bimanual_panda_tesollo.u
 DEFAULT_CUROBO_ROBOT_CFG_PATH  = str((_CONFIGS_CUROBO / "robot/bimanual_panda_tesollo.yml").resolve())
 DEFAULT_COLLISION_SPHERES_PATH = str((_CONFIGS_CUROBO / "robot/spheres/bimanual_panda_tesollo_spheres.yml").resolve())
 
-_IDLE      = "IDLE"
-_EXECUTING = "EXECUTING"
-
 
 class BimanualTrajTestNode(Node):
     def __init__(self):
@@ -86,7 +87,7 @@ class BimanualTrajTestNode(Node):
         with open(policy_cfg_path, 'r') as f:
             policy_cfg = yaml.safe_load(f)
 
-        infer_rate = policy_cfg["infer_rate"]
+        self._infer_rate: float = float(policy_cfg["infer_rate"])
 
         # ── HOME_Q ────────────────────────────────────────────────────────────
         _panda_home   = np.array(driver_cfg['panda_home_joint_positions'],   dtype=np.float32)
@@ -106,15 +107,9 @@ class BimanualTrajTestNode(Node):
             raise RuntimeError(f"No pre-grasp configs found in {pregrasp_path}")
         self.get_logger().info(f"Loaded {self._n_configs} pre-grasp configs.")
 
-        # ── Execution state ───────────────────────────────────────────────────
-        # _lock    : guards _state / _traj / _traj_index (exec timer thread)
-        # _js_lock : guards _q_current only (high-freq js callback thread)
-        self._lock            = threading.Lock()
-        self._js_lock         = threading.Lock()
-        self._state           = _IDLE
+        # _js_lock guards _q_current (written by background js callback thread)
+        self._js_lock             = threading.Lock()
         self._q_current: np.ndarray | None = None
-        self._traj: np.ndarray | None = None
-        self._traj_index      = 0
 
         # ── cuRobo planner ────────────────────────────────────────────────────
         self.get_logger().info("Initializing cuRobo (warmup may take ~30 s)...")
@@ -131,7 +126,7 @@ class BimanualTrajTestNode(Node):
             num_ik_seeds                = 50,
             num_trajopt_seeds           = 32,
             grad_trajopt_iters          = 800,
-            interpolation_dt            = 1.0 / infer_rate,
+            interpolation_dt            = 1.0 / self._infer_rate,
             collision_activation_distance = 0.01,
         )
 
@@ -139,45 +134,21 @@ class BimanualTrajTestNode(Node):
         self.target_pub = self.create_publisher(JointState, '/target_joint_states', T_JS_QOS)
         self.create_subscription(JointState, '/joint_states', self._js_callback, JS_QOS)
 
-        # Execution timer — fires at infer_rate; no-ops when IDLE
-        self._exec_timer = self.create_timer(1.0 / infer_rate, self._exec_callback)
-
-    # ── Callbacks (run in executor background thread) ─────────────────────────
+    # ── Callback (runs in executor background thread) ─────────────────────────
 
     def _js_callback(self, msg: JointState) -> None:
         q = np.array(msg.position, dtype=np.float32)
         with self._js_lock:
             self._q_current = q
 
-    def _exec_callback(self) -> None:
-        with self._lock:
-            if self._state != _EXECUTING or self._traj is None:
-                return
-            if self._traj_index >= len(self._traj):
-                self._traj   = None
-                self._state  = _IDLE
-                done = True
-            else:
-                q = self._traj[self._traj_index]
-                self._traj_index += 1
-                done = False
-
-        if done:
-            self.get_logger().info("Trajectory complete.")
-            return
-
-        msg = JointState()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name         = self.joint_names
-        msg.position     = q.tolist()
-        self.target_pub.publish(msg)
-
     # ── Sequential plan-and-execute (called from main thread) ────────────────
 
     def _plan_and_execute(self, q_start: np.ndarray, q_goal: np.ndarray) -> bool:
         """
-        Collision-check, plan, and block until execution completes.
-        Returns True on success, False if collision or planning failed.
+        Collision-check, plan, execute at a steady rate, save goal joint state.
+        Execution uses a time-compensated loop directly in the calling thread —
+        no ROS timer — to avoid scheduler-induced bursty behaviour.
+        Returns True on success, False on collision or planning failure.
         """
         # 1. Collision check
         print("Checking target config for self-collision...")
@@ -186,7 +157,7 @@ class BimanualTrajTestNode(Node):
             return False
         print("Collision-free. Planning trajectory...")
 
-        # 2. Plan (blocks; executor thread keeps running _exec_callback / _js_callback)
+        # 2. Plan
         traj, last_tstep, ok = self._planner.plan_to_joint(q_start, q_goal)
         if not ok:
             print("[ERROR] cuRobo planning failed. Aborting.")
@@ -194,27 +165,29 @@ class BimanualTrajTestNode(Node):
 
         traj = traj[:last_tstep + 1]
         dt   = self._planner._interpolation_dt
-        print(f"Trajectory ready: {traj.shape[0]} steps  "
-              f"(dt={dt:.3f}s, ~{traj.shape[0] * dt:.1f}s total). Executing...")
+        T    = traj.shape[0]
+        print(f"Trajectory ready: {T} steps  "
+              f"(dt={dt:.3f}s, ~{T * dt:.1f}s total). Executing...")
 
-        # 3. Hand off to exec timer
-        with self._lock:
-            self._traj       = traj
-            self._traj_index = 0
-            self._state      = _EXECUTING
+        # 3. Execute — time-compensated loop, one waypoint per dt seconds.
+        #    Using absolute deadlines so jitter in publish/sleep does not accumulate.
+        msg = JointState()
+        msg.name = self.joint_names
+        deadline = time.perf_counter()
+        for q in traj:
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.position     = q.tolist()
+            self.target_pub.publish(msg)
 
-        # 4. Block until execution finishes (exec timer sets state back to IDLE)
-        while True:
-            with self._lock:
-                if self._state == _IDLE:
-                    break
-            time.sleep(0.02)
+            deadline += dt
+            sleep_s = deadline - time.perf_counter()
+            if sleep_s > 0:
+                time.sleep(sleep_s)
 
-        # 5. Save mesh after execution (sequential, no extra thread needed)
-        stl_path = str(_PROJECT_ROOT / 'models' / 'robot_next_q.stl')
-        print(f"Saving mesh to {stl_path} ...")
-        self._planner.save_scene_as_mesh(q_goal, stl_path)
-        print(f"[mesh] Saved.")
+        # 4. Save goal joint state
+        npy_path = _PROJECT_ROOT / 'models' / 'robot_next_q.npy'
+        np.save(str(npy_path), q_goal)
+        print(f"[saved] {npy_path}")
 
         return True
 
@@ -222,9 +195,8 @@ class BimanualTrajTestNode(Node):
 
     def run(self) -> None:
         """
-        Sequential keyboard loop.  Input is accepted only after the current
-        plan+execute cycle is fully complete.  Call from the main thread while
-        the executor spins in a background thread.
+        Sequential keyboard loop.  Call from the main thread while the executor
+        spins in a background thread.
         """
         selected_idx = 0
         N = self._n_configs
@@ -295,8 +267,8 @@ def main(args=None):
     rclpy.init(args=args)
     node = BimanualTrajTestNode()
 
-    # Executor spins in background — handles _js_callback and _exec_callback
-    executor = MultiThreadedExecutor()
+    # Executor spins in background — handles /joint_states subscription only
+    executor = SingleThreadedExecutor()
     executor.add_node(node)
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
