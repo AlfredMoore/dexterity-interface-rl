@@ -170,13 +170,17 @@ class BimanualTrajTestNode(Node):
             if self._state != _EXECUTING or self._traj is None:
                 return
             if self._traj_index >= len(self._traj):
-                self.get_logger().info("Trajectory complete. Back to IDLE.")
                 self._traj  = None
                 self._state = _IDLE
-                return
-            q = self._traj[self._traj_index]
-            self._traj_index += 1
-            self.get_logger().info(f"TRAJ IDX: {self._traj_index}")
+                done = True
+            else:
+                q = self._traj[self._traj_index]
+                self._traj_index += 1
+                done = False
+
+        if done:
+            self.get_logger().info("Trajectory complete. Back to IDLE.")
+            return
 
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
