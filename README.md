@@ -20,6 +20,8 @@ source install/setup.bash
 
 ROS2 Run Driver Node
 ```bash
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export ROS_STATIC_PEERS='192.168.4.9;remote.com'
 ros2 run robot_motion_interface_ros rl_driver
 ```
 
@@ -108,6 +110,8 @@ ros2 run robot_motion_interface_ros cv_node
 
 Launch Nodes
 ```bash
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export ROS_STATIC_PEERS='192.168.4.4;remote.com'
 ```
 
 Attach to Policy Container
