@@ -128,6 +128,7 @@ class BimanualTrajTestNode(Node):
             left_ee_link                = "left_delto_base_link",
             right_ee_link               = "right_delto_base_link",
             device                      = "cuda:0",
+            trajopt_dt                  = 0.15,
             trajopt_tsteps              = 32,
             interpolation_steps         = 1000,
             num_ik_seeds                = 50,
