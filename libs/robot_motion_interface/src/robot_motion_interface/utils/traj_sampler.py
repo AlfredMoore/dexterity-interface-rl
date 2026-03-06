@@ -127,6 +127,23 @@ def main() -> None:
     print(f"\n[SAVED] {fwd_path}  shape={traj_fwd.shape}")
     print(f"[SAVED] {ret_path}  shape={traj_ret.shape}")
 
+    # ── Mesh export — pre-grasp config at selected index ─────────────────────
+    mesh_path = str(_MODELS_DIR / f"scene_pregrasp_{idx}.stl")
+    print(f"\nExporting pre-grasp mesh for index {idx}...")
+    planner.save_scene_as_mesh(pre_grasp_q, mesh_path)
+    print(f"[SAVED] {mesh_path}")
+
+    # ── Collision-check benchmark on forward trajectory ───────────────────────
+    print(f"\nBenchmarking sequential collision checks on forward trajectory ({traj_fwd.shape[0]} steps)...")
+    planner.benchmark_traj_collision_check(traj_fwd, verbose=False)
+
+    print(f"\nBenchmarking with planner activation distance ({planner._collision_activation_distance} m)...")
+    planner.benchmark_traj_collision_check(
+        traj_fwd,
+        activation_distance=planner._collision_activation_distance,
+        verbose=False,
+    )
+
 
 if __name__ == "__main__":
     main()

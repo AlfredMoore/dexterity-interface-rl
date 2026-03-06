@@ -310,6 +310,8 @@ class BimanualTrajTestNode(Node):
             f"(dt={dt:.3f}s, ~{traj.shape[0] * dt:.1f}s total). Executing..."
         )
 
+        
+
         # 4. Hand off to exec timer
         with self._lock:
             self._traj       = traj

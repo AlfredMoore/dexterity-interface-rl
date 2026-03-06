@@ -267,6 +267,7 @@ class CuRoboBimanualMotionPlanner:
         right_ee_link: str = "right_delto_base_link",
         joint_names: list[str] | None = None,
         device: str = "cuda:0",
+        trajopt_dt: float = 0.15,
         trajopt_tsteps: int = 34,
         interpolation_steps: int = 2000,
         num_ik_seeds: int = 30,
@@ -305,6 +306,7 @@ class CuRoboBimanualMotionPlanner:
             tensor_args=self.tensor_args,
             self_collision_check=True,
             self_collision_opt=True,
+            trajopt_dt=trajopt_dt,
             traj_tsteps=trajopt_tsteps,
             interpolation_dt=interpolation_dt,
             interpolation_type=InterpolateType.KUNZ_STILMAN_OPTIMAL,
@@ -629,6 +631,97 @@ class CuRoboBimanualMotionPlanner:
         print(f"{tag}{suffix}  (activation_distance={self._collision_activation_distance}m)")
         return valid
 
+    def benchmark_traj_collision_check(
+        self,
+        traj: np.ndarray,
+        activation_distance: float | None = None,
+        verbose: bool = False,
+    ) -> dict:
+        """
+        Run sequential (one-by-one) self-collision checks on every waypoint of a
+        trajectory to measure the achievable real-time collision-check frequency.
+
+        Each waypoint is checked independently in a serial loop — no batching —
+        to mimic the condition in a live control loop where only the current
+        configuration is tested.
+
+        Args:
+            traj               : (T, n_joints) float32 array of joint configurations
+                                 in self._joint_names order (e.g. output of plan_to_joint).
+            activation_distance: sphere-sphere activation margin (metres) used for
+                                 checking.  None (default) → 0.0 (actual penetration).
+                                 Pass self._collision_activation_distance to use the
+                                 planner's own margin.
+            verbose            : If True, print per-waypoint result.
+
+        Returns:
+            A dict with keys:
+                n_steps         : int    — number of waypoints checked.
+                n_collisions    : int    — number of waypoints in collision.
+                collision_mask  : list[bool] — per-waypoint collision flag.
+                total_time_s    : float  — wall-clock seconds for the full loop.
+                mean_time_ms    : float  — mean time per check in milliseconds.
+                check_freq_hz   : float  — 1 / mean_time_ms * 1000 (estimated Hz).
+        """
+        if activation_distance is None:
+            robot_world = self._robot_world           # activation = 0
+        else:
+            # Build a temporary checker at the requested distance.
+            cfg = RobotWorldConfig.load_from_config(
+                robot_config=self.robot_cfg,
+                world_model=None,
+                self_collision_activation_distance=activation_distance,
+            )
+            robot_world = RobotWorld(cfg)
+
+        T = traj.shape[0]
+        collision_mask: list[bool] = []
+
+        t_loop_start = time.time()
+        for i in range(T):
+            q = traj[i]
+            q_t = self._make_joint_state(q).position
+            if q_t.dim() == 1:
+                q_t = q_t.unsqueeze(0)
+
+            t0 = time.perf_counter()
+            kin_state = robot_world.get_kinematics(q_t)
+            d_self = robot_world.get_self_collision(
+                kin_state.link_spheres_tensor.unsqueeze(1)
+            )
+            torch.cuda.synchronize()          # ensure GPU work is done before timing
+            t1 = time.perf_counter()
+
+            in_collision = bool((d_self > 0.0).any().item())
+            collision_mask.append(in_collision)
+
+            if verbose:
+                status = "COLLISION" if in_collision else "ok"
+                print(f"  step {i:4d}/{T}  {status}  ({(t1-t0)*1000:.3f} ms)")
+
+        t_loop_end = time.time()
+        total_time_s = t_loop_end - t_loop_start
+        mean_time_ms = total_time_s / T * 1000.0
+        check_freq_hz = 1000.0 / mean_time_ms if mean_time_ms > 0 else float("inf")
+        n_collisions = sum(collision_mask)
+
+        print(
+            f"[collision benchmark] {T} waypoints | "
+            f"{n_collisions} collisions | "
+            f"total {total_time_s*1000:.1f} ms | "
+            f"mean {mean_time_ms:.3f} ms/step | "
+            f"~{check_freq_hz:.1f} Hz"
+        )
+
+        return {
+            "n_steps":        T,
+            "n_collisions":   n_collisions,
+            "collision_mask": collision_mask,
+            "total_time_s":   total_time_s,
+            "mean_time_ms":   mean_time_ms,
+            "check_freq_hz":  check_freq_hz,
+        }
+
     # ------------------------------------------------------------------
     # Debug visualisation
     # ------------------------------------------------------------------
@@ -700,6 +793,7 @@ if __name__ == "__main__":
         0.0, 0.0, 0.7853981633974483, 0.5235987755982988,
     ], dtype=np.float32)
 
+    INFER_RATE = 30
 
     def test_curobo():
         
@@ -718,7 +812,7 @@ if __name__ == "__main__":
             num_ik_seeds                = 50,
             num_trajopt_seeds           = 32,
             grad_trajopt_iters          = 800,
-            interpolation_dt            = 0.02,
+            interpolation_dt            = 1 / INFER_RATE,
             collision_activation_distance = 0.005,
         )
 
