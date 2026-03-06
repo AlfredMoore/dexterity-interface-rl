@@ -639,11 +639,22 @@ class CuRoboBimanualMotionPlanner:
     ) -> dict:
         """
         Run sequential (one-by-one) self-collision checks on every waypoint of a
-        trajectory to measure the achievable real-time collision-check frequency.
+        trajectory to measure the achievable real-time collision-check frequency,
+        together with GPU memory and utilisation statistics.
 
         Each waypoint is checked independently in a serial loop — no batching —
         to mimic the condition in a live control loop where only the current
         configuration is tested.
+
+        GPU monitoring notes
+        --------------------
+        - Memory (allocated / reserved) is read from PyTorch's CUDA allocator and
+          reflects the full process, so other models (CV, policy) sharing the same
+          GPU context will be included in the numbers.
+        - Compute utilisation % is sampled via pynvml (nvidia-ml-py3) once per step
+          immediately after cuda synchronisation.  Install with:
+              pip install nvidia-ml-py3
+          If pynvml is not available, utilisation is reported as None.
 
         Args:
             traj               : (T, n_joints) float32 array of joint configurations
@@ -652,17 +663,31 @@ class CuRoboBimanualMotionPlanner:
                                  checking.  None (default) → 0.0 (actual penetration).
                                  Pass self._collision_activation_distance to use the
                                  planner's own margin.
-            verbose            : If True, print per-waypoint result.
+            verbose            : If True, print per-waypoint result including GPU stats.
 
         Returns:
             A dict with keys:
-                n_steps         : int    — number of waypoints checked.
-                n_collisions    : int    — number of waypoints in collision.
-                collision_mask  : list[bool] — per-waypoint collision flag.
-                total_time_s    : float  — wall-clock seconds for the full loop.
-                mean_time_ms    : float  — mean time per check in milliseconds.
-                check_freq_hz   : float  — 1 / mean_time_ms * 1000 (estimated Hz).
+                n_steps            : int        — number of waypoints checked.
+                n_collisions       : int        — number of waypoints in collision.
+                collision_mask     : list[bool] — per-waypoint collision flag.
+                total_time_s       : float      — wall-clock seconds for the full loop.
+                mean_time_ms       : float      — mean time per check in milliseconds.
+                check_freq_hz      : float      — estimated sustainable Hz.
+                gpu_mem_alloc_mb   : dict       — mean/max allocated VRAM (MiB).
+                gpu_mem_reserved_mb: dict       — mean/max reserved  VRAM (MiB).
+                gpu_util_pct       : dict | None— mean/max GPU compute utilisation (%),
+                                                  or None if pynvml is unavailable.
         """
+        # ── pynvml setup (optional) ───────────────────────────────────────────
+        _nvml_handle = None
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            _gpu_idx = torch.cuda.current_device()
+            _nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(_gpu_idx)
+        except Exception:
+            pynvml = None  # type: ignore[assignment]
+
         if activation_distance is None:
             robot_world = self._robot_world           # activation = 0
         else:
@@ -676,6 +701,9 @@ class CuRoboBimanualMotionPlanner:
 
         T = traj.shape[0]
         collision_mask: list[bool] = []
+        mem_alloc_mb:   list[float] = []
+        mem_reserved_mb: list[float] = []
+        util_pct:        list[float] = []
 
         t_loop_start = time.time()
         for i in range(T):
@@ -689,37 +717,80 @@ class CuRoboBimanualMotionPlanner:
             d_self = robot_world.get_self_collision(
                 kin_state.link_spheres_tensor.unsqueeze(1)
             )
-            torch.cuda.synchronize()          # ensure GPU work is done before timing
+            torch.cuda.synchronize()   # wait for GPU before sampling stats + timing
             t1 = time.perf_counter()
+
+            # GPU memory (process-wide, includes CV/policy models on same context)
+            alloc_mb = torch.cuda.memory_allocated() / 1024 ** 2
+            resv_mb  = torch.cuda.memory_reserved()  / 1024 ** 2
+            mem_alloc_mb.append(alloc_mb)
+            mem_reserved_mb.append(resv_mb)
+
+            # GPU compute utilisation via pynvml
+            if _nvml_handle is not None:
+                try:
+                    rates = pynvml.nvmlDeviceGetUtilizationRates(_nvml_handle)
+                    util_pct.append(float(rates.gpu))
+                except Exception:
+                    pass
 
             in_collision = bool((d_self > 0.0).any().item())
             collision_mask.append(in_collision)
 
             if verbose:
                 status = "COLLISION" if in_collision else "ok"
-                print(f"  step {i:4d}/{T}  {status}  ({(t1-t0)*1000:.3f} ms)")
+                util_str = f"  util={util_pct[-1]:.0f}%" if util_pct else ""
+                print(
+                    f"  step {i:4d}/{T}  {status}"
+                    f"  ({(t1-t0)*1000:.3f} ms)"
+                    f"  alloc={alloc_mb:.0f} MiB  resv={resv_mb:.0f} MiB"
+                    f"{util_str}"
+                )
 
         t_loop_end = time.time()
-        total_time_s = t_loop_end - t_loop_start
-        mean_time_ms = total_time_s / T * 1000.0
+        total_time_s  = t_loop_end - t_loop_start
+        mean_time_ms  = total_time_s / T * 1000.0
         check_freq_hz = 1000.0 / mean_time_ms if mean_time_ms > 0 else float("inf")
-        n_collisions = sum(collision_mask)
+        n_collisions  = sum(collision_mask)
 
+        gpu_mem_alloc   = {"mean": float(np.mean(mem_alloc_mb)),   "max": float(np.max(mem_alloc_mb))}
+        gpu_mem_reserved = {"mean": float(np.mean(mem_reserved_mb)), "max": float(np.max(mem_reserved_mb))}
+        gpu_util = (
+            {"mean": float(np.mean(util_pct)), "max": float(np.max(util_pct))}
+            if util_pct else None
+        )
+
+        util_summary = (
+            f"  gpu_util mean={gpu_util['mean']:.1f}% max={gpu_util['max']:.0f}%"
+            if gpu_util else "  gpu_util=N/A (pynvml not installed)"
+        )
         print(
             f"[collision benchmark] {T} waypoints | "
             f"{n_collisions} collisions | "
             f"total {total_time_s*1000:.1f} ms | "
             f"mean {mean_time_ms:.3f} ms/step | "
-            f"~{check_freq_hz:.1f} Hz"
+            f"~{check_freq_hz:.1f} Hz\n"
+            f"  gpu_mem_alloc   mean={gpu_mem_alloc['mean']:.1f} MiB  max={gpu_mem_alloc['max']:.1f} MiB\n"
+            f"  gpu_mem_reserved mean={gpu_mem_reserved['mean']:.1f} MiB  max={gpu_mem_reserved['max']:.1f} MiB\n"
+            f"{util_summary}"
         )
 
+        if _nvml_handle is not None:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+
         return {
-            "n_steps":        T,
-            "n_collisions":   n_collisions,
-            "collision_mask": collision_mask,
-            "total_time_s":   total_time_s,
-            "mean_time_ms":   mean_time_ms,
-            "check_freq_hz":  check_freq_hz,
+            "n_steps":             T,
+            "n_collisions":        n_collisions,
+            "collision_mask":      collision_mask,
+            "total_time_s":        total_time_s,
+            "mean_time_ms":        mean_time_ms,
+            "check_freq_hz":       check_freq_hz,
+            "gpu_mem_alloc_mb":    gpu_mem_alloc,
+            "gpu_mem_reserved_mb": gpu_mem_reserved,
+            "gpu_util_pct":        gpu_util,
         }
 
     # ------------------------------------------------------------------
