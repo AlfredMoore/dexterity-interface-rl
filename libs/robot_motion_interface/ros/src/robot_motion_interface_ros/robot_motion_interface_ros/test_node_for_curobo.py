@@ -121,13 +121,13 @@ class BimanualTrajTestNode(Node):
             right_ee_link               = "right_delto_base_link",
             device                      = "cuda:0",
             trajopt_dt                  = 0.15,
-            trajopt_tsteps              = 32,
+            trajopt_tsteps              = 64,
             interpolation_steps         = 1000,
             num_ik_seeds                = 50,
             num_trajopt_seeds           = 32,
             grad_trajopt_iters          = 800,
             interpolation_dt            = 1.0 / self._infer_rate,
-            collision_activation_distance = 0.01,
+            collision_activation_distance = 0.05,
         )
 
         # ── ROS pub / sub ─────────────────────────────────────────────────────

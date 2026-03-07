@@ -36,7 +36,7 @@ robot_cfg:
     ]
 
     # collision_spheres: 'spheres/bimanual_panda_tesollo.yml'
-    collision_sphere_buffer: 0.004
+    collision_sphere_buffer: 0.01
 
     use_global_cumul: True
 
@@ -246,3 +246,21 @@ robot_cfg:
       # From franka.yml
       max_jerk: 500.0
       max_acceleration: 15.0
+
+      # Per-joint velocity limits (rad/s), matching joint_names order above.
+      # Panda: joints 1-4 = 2.175, joints 5-7 = 2.610 (from URDF).
+      # Tesollo fingers: 5.0 (from URDF), applied to all 12 joints per arm.
+      max_velocity: [
+        # Left arm
+        2.175, 2.175, 2.175, 2.175, 2.610, 2.610, 2.610,
+        # Left gripper (F1M1-F1M4, F2M1-F2M4, F3M1-F3M4)
+        5.0, 5.0, 5.0, 5.0,
+        5.0, 5.0, 5.0, 5.0,
+        5.0, 5.0, 5.0, 5.0,
+        # Right arm
+        2.175, 2.175, 2.175, 2.175, 2.610, 2.610, 2.610,
+        # Right gripper (F1M1-F1M4, F2M1-F2M4, F3M1-F3M4)
+        5.0, 5.0, 5.0, 5.0,
+        5.0, 5.0, 5.0, 5.0,
+        5.0, 5.0, 5.0, 5.0,
+      ]
