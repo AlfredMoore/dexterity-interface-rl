@@ -247,20 +247,10 @@ robot_cfg:
       max_jerk: 500.0
       max_acceleration: 15.0
 
-      # Per-joint velocity limits (rad/s), matching joint_names order above.
-      # Panda: joints 1-4 = 2.175, joints 5-7 = 2.610 (from URDF).
-      # Tesollo fingers: 5.0 (from URDF), applied to all 12 joints per arm.
-      max_velocity: [
-        # Left arm
-        2.175, 2.175, 2.175, 2.175, 2.610, 2.610, 2.610,
-        # Left gripper (F1M1-F1M4, F2M1-F2M4, F3M1-F3M4)
-        5.0, 5.0, 5.0, 5.0,
-        5.0, 5.0, 5.0, 5.0,
-        5.0, 5.0, 5.0, 5.0,
-        # Right arm
-        2.175, 2.175, 2.175, 2.175, 2.610, 2.610, 2.610,
-        # Right gripper (F1M1-F1M4, F2M1-F2M4, F3M1-F3M4)
-        5.0, 5.0, 5.0, 5.0,
-        5.0, 5.0, 5.0, 5.0,
-        5.0, 5.0, 5.0, 5.0,
-      ]
+      # Velocity/acceleration/jerk scaling applied on top of URDF limits.
+      # velocity_scale=1.0 means URDF limits are used as-is.
+      # Reduce velocity_scale (e.g. 0.5) to slow trajectories and give the
+      # PD controller more margin to track without triggering cartesian_reflex.
+      velocity_scale: 1.0
+      acceleration_scale: 1.0
+      jerk_scale: 1.0
