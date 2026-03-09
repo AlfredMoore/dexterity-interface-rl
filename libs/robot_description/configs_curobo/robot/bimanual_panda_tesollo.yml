@@ -245,7 +245,7 @@ robot_cfg:
 
       # From franka.yml
       max_jerk: 500.0
-      max_acceleration: 15.0
+      max_acceleration: 7.5
 
       # Velocity/acceleration/jerk scaling applied on top of URDF limits.
       # velocity_scale=1.0 means URDF limits are used as-is.
