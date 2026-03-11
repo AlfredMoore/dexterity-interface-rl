@@ -186,7 +186,10 @@ class CVPerceptionNode(Node):
             return
 
         try:
+            t0 = time.time()
             metric_depth = self.pda.infer(color, depth)
+            t_inf = time.time() - t0
+            self.get_logger().info(f"PromptDA inference time: {t_inf:.3f}s")
             # metric_depth: [H', W'] float32 tensor in metres, on GPU
 
             # TODO: use metric_depth for object pose estimation and publish Detection3D
@@ -208,7 +211,8 @@ class CVPerceptionNode(Node):
                             1.0, (255, 255, 255), 1, cv2.LINE_AA)  # white text
                 return img
 
-            color_vis  = _label(color.copy(), "RGB")
+            color_rgb  = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
+            color_vis  = _label(color_rgb, "RGB")
             raw_vis    = _label(_to_colormap(depth.astype(np.float32) * self._depth_scale), "Raw Depth")
             metric_vis = _label(_to_colormap(metric_depth.squeeze().cpu().numpy()), "Metric Depth")
             preview = np.concatenate([color_vis, raw_vis, metric_vis], axis=1)
