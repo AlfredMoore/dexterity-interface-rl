@@ -27,7 +27,7 @@ if spec is None or spec.origin is None:
     raise RuntimeError("Cannot locate robot_motion_interface")
 RMI_ROOT     = Path(spec.origin).parent.parent.parent   # libs/robot_motion_interface/
 PROJECT_ROOT = RMI_ROOT.parent.parent                   # dexterity-interface-rl/
-
+MODEL_ROOT = PROJECT_ROOT / "models"
 
 DEFAULT_CONFIG_PATH = RMI_ROOT / "config" / "rl_policy_node_config.yaml"
 
@@ -98,14 +98,14 @@ class CVPerceptionNode(Node):
         self._capture_thread.start()
 
         # CV Model ##############################################
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        pda_ckpt = config.get("promptda_ckpt_path", "")
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        pda_ckpt = str((MODEL_ROOT / config["promptda_ckpt"]).resolve())
         pda_encoder = config.get("promptda_encoder", "vits")
         self.get_logger().info(f"Loading PromptDA ({pda_encoder}) from {pda_ckpt} ...")
         self.pda = PromptDAInference(
             ckpt_path=pda_ckpt,
             encoder=pda_encoder,
-            device=device,
+            device=self.device,
             depth_scale=self._depth_scale,
         )
         self.get_logger().info("PromptDA loaded.")
@@ -215,7 +215,7 @@ class CVPerceptionNode(Node):
         self.rs_pipeline.stop()
 
     
-    def build_rs_depth_filters():
+    def build_rs_depth_filters(self):
         """
         Build the recommended pyrealsense2 post-processing filter chain for PromptDA.
 
@@ -240,7 +240,7 @@ class CVPerceptionNode(Node):
         return [decimation, hole_filling]
 
 
-    def apply_depth_filters(depth_frame, filters: list):
+    def apply_depth_filters(self, depth_frame, filters: list):
         """Apply a list of rs2 filter objects to a depth frame."""
         for f in filters:
             depth_frame = f.process(depth_frame)
