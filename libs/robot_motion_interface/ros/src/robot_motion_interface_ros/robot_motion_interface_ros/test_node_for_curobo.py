@@ -189,12 +189,18 @@ class BimanualTrajTestNode(Node):
         np.save(str(npy_path), q_goal)
         print(f"[saved] {npy_path}")
 
-        # 5. Export mesh in background (lazy-cached, safe to call repeatedly)
-        mesh_path = str(_PROJECT_ROOT / 'models' / 'scene_goal.stl')
-        def _save_mesh():
-            self._planner.save_scene_as_mesh(q_goal, mesh_path)
-            print(f"[saved] {mesh_path}")
-        threading.Thread(target=_save_mesh, daemon=True).start()
+        # 5. Post-execution deviation report
+        time.sleep(0.2)   # brief settle time for /joint_states to update
+        with self._js_lock:
+            q_actual = self._q_current
+        if q_actual is not None:
+            err = q_actual - q_goal
+            print("\n── Execution result ──────────────────────────────────")
+            print(f"  max |error|  = {np.max(np.abs(err)):.4f} rad")
+            print(f"  rms error    = {np.sqrt(np.mean(err**2)):.4f} rad")
+            print(f"  left_arm  Δq = {[f'{x:+.4f}' for x in err[:7]]}")
+            print(f"  right_arm Δq = {[f'{x:+.4f}' for x in err[19:26]]}")
+            print("──────────────────────────────────────────────────────\n")
 
         return True
 
@@ -238,6 +244,13 @@ class BimanualTrajTestNode(Node):
             elif raw.isdigit():
                 selected_idx = int(raw) % N
                 self._print_status(selected_idx)
+                q_preview = self._pregrasp_qs[selected_idx].copy()
+                mesh_path = str(_PROJECT_ROOT / 'models' / f'scene_preview_{selected_idx}.stl')
+                print(f"Generating STL for config [{selected_idx}] ...")
+                def _save_preview(q=q_preview, path=mesh_path):
+                    self._planner.save_scene_as_mesh(q, path)
+                    print(f"[saved] {path}")
+                threading.Thread(target=_save_preview, daemon=True).start()
 
             elif raw in ('g', ''):
                 with self._js_lock:
