@@ -202,7 +202,7 @@ class CVPerceptionNode(Node):
                 return cv2.applyColorMap((u8 * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
 
             raw_vis    = _to_colormap(depth.astype(np.float32) * self._depth_scale)
-            metric_vis = _to_colormap(metric_depth.cpu().numpy())
+            metric_vis = _to_colormap(metric_depth.squeeze().cpu().numpy())
             preview = np.concatenate([color, raw_vis, metric_vis], axis=1)
             cv2.imshow('RGB | Raw Depth | Metric Depth', preview)
             cv2.waitKey(1)
