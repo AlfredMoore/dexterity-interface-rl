@@ -190,7 +190,22 @@ class CVPerceptionNode(Node):
             # metric_depth: [H', W'] float32 tensor in metres, on GPU
 
             # TODO: use metric_depth for object pose estimation and publish Detection3D
-            # depth_np = metric_depth.cpu().numpy()
+
+            # ── Preview ───────────────────────────────────────────────────────
+            orig_h, orig_w = color.shape[:2]
+
+            def _to_colormap(depth_f32: np.ndarray) -> np.ndarray:
+                """float32 depth → BGR uint8 colormap, resized to (orig_w, orig_h)."""
+                d = cv2.resize(depth_f32, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+                lo, hi = np.percentile(d[d > 0], (2, 98)) if np.any(d > 0) else (0, 1)
+                u8 = np.clip((d - lo) / (hi - lo + 1e-6), 0, 1)
+                return cv2.applyColorMap((u8 * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+
+            raw_vis    = _to_colormap(depth.astype(np.float32) * self._depth_scale)
+            metric_vis = _to_colormap(metric_depth.cpu().numpy())
+            preview = np.concatenate([color, raw_vis, metric_vis], axis=1)
+            cv2.imshow('RGB | Raw Depth | Metric Depth', preview)
+            cv2.waitKey(1)
 
         except Exception as e:
             self.get_logger().warn(f"CV Error: {e}")
