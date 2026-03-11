@@ -201,9 +201,17 @@ class CVPerceptionNode(Node):
                 u8 = np.clip((d - lo) / (hi - lo + 1e-6), 0, 1)
                 return cv2.applyColorMap((u8 * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
 
-            raw_vis    = _to_colormap(depth.astype(np.float32) * self._depth_scale)
-            metric_vis = _to_colormap(metric_depth.squeeze().cpu().numpy())
-            preview = np.concatenate([color, raw_vis, metric_vis], axis=1)
+            def _label(img: np.ndarray, text: str) -> np.ndarray:
+                cv2.putText(img, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                            1.0, (0, 0, 0), 3, cv2.LINE_AA)   # black outline
+                cv2.putText(img, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                            1.0, (255, 255, 255), 1, cv2.LINE_AA)  # white text
+                return img
+
+            color_vis  = _label(color.copy(), "RGB")
+            raw_vis    = _label(_to_colormap(depth.astype(np.float32) * self._depth_scale), "Raw Depth")
+            metric_vis = _label(_to_colormap(metric_depth.squeeze().cpu().numpy()), "Metric Depth")
+            preview = np.concatenate([color_vis, raw_vis, metric_vis], axis=1)
             cv2.imshow('RGB | Raw Depth | Metric Depth', preview)
             cv2.waitKey(1)
 
