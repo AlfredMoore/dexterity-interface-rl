@@ -17,6 +17,7 @@ from rclpy.parameter import Parameter
 
 # --- QoS Config: low latency (Best Effort) ---
 from robot_motion_interface.utils.qos import HIGH_PERF_QOS, HIGH_RELIA_QOS
+from robot_motion_interface.utils.promptda_utils import PromptDAInference
 JS_QOS = HIGH_PERF_QOS
 BBOX_QOS = HIGH_PERF_QOS
 T_JS_QOS = HIGH_RELIA_QOS
@@ -26,6 +27,7 @@ if spec is None or spec.origin is None:
     raise RuntimeError("Cannot locate robot_motion_interface")
 RMI_ROOT     = Path(spec.origin).parent.parent.parent   # libs/robot_motion_interface/
 PROJECT_ROOT = RMI_ROOT.parent.parent                   # dexterity-interface-rl/
+
 
 DEFAULT_CONFIG_PATH = RMI_ROOT / "config" / "rl_policy_node_config.yaml"
 
@@ -53,38 +55,41 @@ class CVPerceptionNode(Node):
         self.rs_pipeline = rs.pipeline()
         self.rs_config = rs.config()
         self.rs_config.enable_stream(
-            rs.stream.color, 
-            _c_intrinsics['width'], 
-            _c_intrinsics['height'], 
-            rs.format.bgr8, 
+            rs.stream.color,
+            _c_intrinsics['width'],
+            _c_intrinsics['height'],
+            rs.format.bgr8,
             _rs_fps
         )
-        # self.rs_config.enable_stream(
-        #     rs.stream.depth, 
-        #     _d_intrinsics['width'], 
-        #     _d_intrinsics['height'], 
-        #     rs.format.z16, 
-        #     _rs_fps
-        # )
+        self.rs_config.enable_stream(
+            rs.stream.depth,
+            _d_intrinsics['width'],
+            _d_intrinsics['height'],
+            rs.format.z16,
+            _rs_fps
+        )
         self.rs_profile = self.rs_pipeline.start(self.rs_config)
-        # self.rs_align = rs.align(rs.stream.color)  # align depth -> color frame
+        self.rs_align = rs.align(rs.stream.color)  # align depth -> color frame
         self._apply_sensor_settings(_sensor_settings)
-        # try:
-        #     depth_sensor = self.rs_profile.get_device().first_depth_sensor()
-        #     self._depth_scale = float(depth_sensor.get_depth_scale())
-        # except Exception:
-        #     self._depth_scale = 1.0
+        try:
+            depth_sensor = self.rs_profile.get_device().first_depth_sensor()
+            self._depth_scale = float(depth_sensor.get_depth_scale())
+        except Exception:
+            self._depth_scale = 0.001
+        self._depth_filters = self.build_rs_depth_filters()
 
         rs_device = self.rs_profile.get_device()
         self.get_logger().info(
             f"RealSense initialized: "
             f"  device={rs_device.get_info(rs.camera_info.name)}  "
             f"  serial={rs_device.get_info(rs.camera_info.serial_number)}  "
-            f"  color={_c_intrinsics['width']}x{_c_intrinsics['height']}@{_rs_fps}fps"
-            # f"  depth={_d_intrinsics['width']}x{_d_intrinsics['height']}@{_rs_fps}fps"
+            f"  color={_c_intrinsics['width']}x{_c_intrinsics['height']}@{_rs_fps}fps  "
+            f"  depth={_d_intrinsics['width']}x{_d_intrinsics['height']}@{_rs_fps}fps  "
+            f"  depth_scale={self._depth_scale}"
         )
-        # Image capture thread
+        # Image capture thread — stores (color_bgr, depth_u16) atomically
         self._latest_color: np.ndarray | None = None
+        self._latest_depth: np.ndarray | None = None
         self._img_lock = threading.Lock()
         self._capture_running = True
         self._capture_thread = threading.Thread(
@@ -93,11 +98,17 @@ class CVPerceptionNode(Node):
         self._capture_thread.start()
 
         # CV Model ##############################################
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # TODO: cv model is not ready
-        # self.cv_model = torch.jit.load(
-        #     config["cv_model_path"], map_location=self.device
-        # ).eval()
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        pda_ckpt = config.get("promptda_ckpt_path", "")
+        pda_encoder = config.get("promptda_encoder", "vits")
+        self.get_logger().info(f"Loading PromptDA ({pda_encoder}) from {pda_ckpt} ...")
+        self.pda = PromptDAInference(
+            ckpt_path=pda_ckpt,
+            encoder=pda_encoder,
+            device=device,
+            depth_scale=self._depth_scale,
+        )
+        self.get_logger().info("PromptDA loaded.")
 
         self.object_detection_pub = self.create_publisher(Detection3D, '/object_detection', BBOX_QOS)
         # Inference timer
@@ -143,25 +154,25 @@ class CVPerceptionNode(Node):
             except Exception:
                 continue
 
-            # if self.rs_align is not None:
-            #     try:
-            #         frames = self.rs_align.process(frames)
-            #     except Exception:
-            #         continue
+            try:
+                frames = self.rs_align.process(frames)
+            except Exception:
+                continue
 
             color_frame = frames.get_color_frame()
-            if not color_frame:
+            depth_frame = frames.get_depth_frame()
+            if not color_frame or not depth_frame:
                 continue
-            # depth_frame = frames.get_depth_frame()
-            # if not depth_frame:
-            #     continue
 
-            color = np.asanyarray(color_frame.get_data())   # rgb8
-            # depth_raw = np.asanyarray(depth_frame.get_data()).astype(np.float32)
-            # depth = depth_raw * self._depth_scale  # meters
+            # Apply decimation + hole_filling filters
+            depth_frame = self.apply_depth_filters(depth_frame, self._depth_filters)
+
+            color = np.asanyarray(color_frame.get_data())        # HxWx3 uint8 BGR
+            depth = np.asanyarray(depth_frame.get_data())        # HxW uint16 (raw units)
 
             with self._img_lock:
                 self._latest_color = color
+                self._latest_depth = depth
             time.sleep(0.001)
             
 
@@ -170,35 +181,55 @@ class CVPerceptionNode(Node):
     def _infer_callback(self) -> None:
         with self._img_lock:
             color = self._latest_color
-        if color is None:
+            depth = self._latest_depth
+        if color is None or depth is None:
             return
 
-        # For debugging
-        cv2.imshow('preview', color)
-        cv2.waitKey(1)
-        return  # TODO: cv model is not ready
-
         try:
-            img_tensor = torch.from_numpy(img).to(self.device).permute(2, 0, 1).float() / 255.0
-            with torch.inference_mode():
-                # TODO: we need object pose and size
-                pose_tensor = self.cv_model(img_tensor.unsqueeze(0))
-                pose_data = pose_tensor.squeeze().cpu().numpy()
+            metric_depth = self.pda.infer(color, depth)
+            # metric_depth: [H', W'] float32 tensor in metres, on GPU
 
-            msg = Detection3D()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.header.frame_id = "camera_color_optical_frame"
-            msg.bbox.center.position.x, msg.bbox.center.position.y, msg.bbox.center.position.z = pose_data[:3]
-            msg.bbox.size.x = float(pose_data[7])  # width
-            msg.bbox.size.y = float(pose_data[8])  # height
-            msg.bbox.size.z = ...  # TODO: fixed depth size for simplicity
-            self.object_detection_pub.publish(msg)
+            # TODO: use metric_depth for object pose estimation and publish Detection3D
+            # depth_np = metric_depth.cpu().numpy()
+
         except Exception as e:
             self.get_logger().warn(f"CV Error: {e}")
 
     def __del__(self):
         self._capture_running = False
         self.rs_pipeline.stop()
+
+    
+    def build_rs_depth_filters():
+        """
+        Build the recommended pyrealsense2 post-processing filter chain for PromptDA.
+
+        Applied filters (in order):
+        1. decimation  - halve resolution (640→320); PromptDA only needs low-res prompt depth.
+        2. hole_filling - fill zero/invalid pixels so min/max normalisation is not skewed.
+
+        Excluded:
+        - spatial_filter:  extra CPU cost for marginal benefit
+        - temporal_filter: introduces 1-2 frame latency
+
+        Returns:
+            list of rs2 filter objects; apply sequentially to a depth frame.
+        """
+
+        decimation = rs.decimation_filter()
+        decimation.set_option(rs.option.filter_magnitude, 2)  # 640x480 → 320x240
+
+        hole_filling = rs.hole_filling_filter()
+        hole_filling.set_option(rs.option.holes_fill, 2)      # fill with far neighbour
+
+        return [decimation, hole_filling]
+
+
+    def apply_depth_filters(depth_frame, filters: list):
+        """Apply a list of rs2 filter objects to a depth frame."""
+        for f in filters:
+            depth_frame = f.process(depth_frame)
+        return depth_frame
 
 
 def main(args=None):

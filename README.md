@@ -66,6 +66,16 @@ python3 -m pytest .
 cd /workspace
 ```
 
+Prompt depth anything
+```bash
+cd /workspace/dep
+git clone https://github.com/AlfredMoore/PromptDA-HAND.git
+cd PromptDA-HAND
+pip install -r requirements.txt
+pip install -e .
+cd /workspace
+```
+
 Import test
 ```bash
 python /workspace/init/test_env.py
