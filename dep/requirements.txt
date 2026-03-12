@@ -1,0 +1,55 @@
+# --- Core Frameworks (Pinned to prevent overwriting) ---
+# Pre-installed versions are locked to ensure compatibility with CuRobo & SAM3
+torch==2.7.0
+torchvision
+torchaudio
+
+# --- Base Dependencies ---
+# Unified version to satisfy both SAM3 and CuRobo requirements
+numpy==1.26
+scipy
+matplotlib
+tqdm
+einops
+Pillow>=10.1.0
+imageio>=2.33.1
+imageio-ffmpeg
+
+# --- Deep Learning Components ---
+# These may trigger dependency resolution; torch==2.7.0 lock will prevent downgrades
+lightning
+xformers
+transformers
+torchmetrics
+fvcore
+
+# --- Robotics & Geometry Processing ---
+# Essential for CuRobo's motion planning and SAM3's spatial operations
+trimesh
+open3d
+networkx
+numpy-quaternion
+yourdfpy>=0.0.53
+warp-lang>=0.9.0
+scikit-image
+scikit-learn
+h5py
+pycocotools
+lark
+pyrealsense2
+opencv-python>=4.8.0
+
+# --- SAM3 Specific Dependencies ---
+timm>=1.0.17
+ftfy==6.1.1
+regex
+iopath>=0.1.10
+typing_extensions
+huggingface_hub
+
+# --- Utilities & Debugging ---
+ipdb
+termcolor
+tyro
+importlib_resources
+pyyaml

@@ -56,6 +56,13 @@ xhost +local:docker
 docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/workspace --device /dev/bus/usb:/dev/bus/usb --net=host -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix dex-policy
 ```
 
+Dependencies
+```bash
+cd /workspace/dep
+pip install -r requirements.txt
+cd /workspace
+```
+
 Compile curobo
 ```bash
 cd /workspace/dep
@@ -71,7 +78,15 @@ Prompt depth anything
 cd /workspace/dep
 git clone https://github.com/AlfredMoore/PromptDA-HAND.git
 cd PromptDA-HAND
-pip install -r requirements.txt
+pip install -e .
+cd /workspace
+```
+
+Segment Anything 3
+```bash
+cd /workspace/dep
+git clone https://github.com/AlfredMoore/sam3-HAND.git
+cd sam3-HAND
 pip install -e .
 cd /workspace
 ```
