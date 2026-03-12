@@ -18,6 +18,7 @@ from rclpy.parameter import Parameter
 # --- QoS Config: low latency (Best Effort) ---
 from robot_motion_interface.utils.qos import HIGH_PERF_QOS, HIGH_RELIA_QOS
 from robot_motion_interface.utils.promptda_utils import PromptDAInference
+from robot_motion_interface.utils.sam3_utils import SAM3Inference, CONCEPT_LEFT_ARM, CONCEPT_RIGHT_ARM, CONCEPT_CUP
 JS_QOS = HIGH_PERF_QOS
 BBOX_QOS = HIGH_PERF_QOS
 T_JS_QOS = HIGH_RELIA_QOS
@@ -110,6 +111,18 @@ class CVPerceptionNode(Node):
         )
         self.get_logger().info("PromptDA loaded.")
 
+        # SAM 3 #################################################
+        sam3_ckpt = str((MODEL_ROOT / config["sam3_ckpt"]).resolve())
+        self.get_logger().info(f"Loading SAM 3 from {sam3_ckpt} ...")
+        self.sam3 = SAM3Inference(
+            ckpt_path=sam3_ckpt,
+            device=self.device,
+            compile=True,
+            # Concepts: "left robot arm"=1, "right robot arm"=2, "cup"=3
+            # Override via concept_map= if needed; defaults are project-specific
+        )
+        self.get_logger().info("SAM 3 loaded.")
+
         self.object_detection_pub = self.create_publisher(Detection3D, '/object_detection', BBOX_QOS)
         # Inference timer
         self.create_timer(1.0 / _infer_rate, self._infer_callback)
@@ -194,6 +207,23 @@ class CVPerceptionNode(Node):
 
             # TODO: use metric_depth for object pose estimation and publish Detection3D
 
+            # ── SAM 3 segmentation ────────────────────────────────────────────
+            # Runs text-prompted detection for all 3 concepts in one forward pass.
+            # results: dict[obj_id -> {"concept", "masks", "boxes", "scores"}]
+            #   obj_id 1 = left robot arm
+            #   obj_id 2 = right robot arm
+            #   obj_id 3 = cup
+            t_sam = time.time()
+            sam3_results = self.sam3.infer(color)
+            self.get_logger().info(
+                f"SAM 3 inference time: {time.time() - t_sam:.3f}s  "
+                f"left_arm={'det' if sam3_results[CONCEPT_LEFT_ARM]['masks'] is not None else 'none'}  "
+                f"right_arm={'det' if sam3_results[CONCEPT_RIGHT_ARM]['masks'] is not None else 'none'}  "
+                f"cup={'det' if sam3_results[CONCEPT_CUP]['masks'] is not None else 'none'}"
+            )
+            # TODO: use sam3_results[CONCEPT_*]["masks"][0] and ["boxes"][0]
+            #       for downstream 3-D pose estimation with metric_depth
+
             # ── Preview ───────────────────────────────────────────────────────
             orig_h, orig_w = color.shape[:2]
 
@@ -215,8 +245,49 @@ class CVPerceptionNode(Node):
             color_vis  = _label(color_rgb, "RGB")
             raw_vis    = _label(_to_colormap(depth.astype(np.float32) * self._depth_scale), "Raw Depth")
             metric_vis = _label(_to_colormap(metric_depth.squeeze().cpu().numpy()), "Metric Depth")
-            preview = np.concatenate([color_vis, raw_vis, metric_vis], axis=1)
-            cv2.imshow('RGB | Raw Depth | Metric Depth', preview)
+            row1 = np.concatenate([color_vis, raw_vis, metric_vis], axis=1)
+
+            # ── Row 2: SAM 3 mask overlay — one panel per concept ─────────────
+            # Colors are in RGB order (color_rgb is already RGB)
+            _SAM3_COLORS = {
+                CONCEPT_LEFT_ARM:  (0,   220, 255),   # cyan
+                CONCEPT_RIGHT_ARM: (50,  255,  50),   # green
+                CONCEPT_CUP:       (255, 160,  20),   # orange
+            }
+            _SAM3_LABELS = {
+                CONCEPT_LEFT_ARM:  "Left Arm",
+                CONCEPT_RIGHT_ARM: "Right Arm",
+                CONCEPT_CUP:       "Cup",
+            }
+
+            def _draw_sam3_concept(result: dict, rgb_color: tuple, label: str) -> np.ndarray:
+                """Overlay mask + boxes for one SAM3 concept onto the color frame."""
+                vis = color_rgb.copy()
+                masks = result["masks"]   # (N, 1, H, W) bool or None
+                boxes = result["boxes"]   # (N, 4) float32 [x0,y0,x1,y1] or None
+                if masks is not None:
+                    combined = masks[:, 0, :, :].any(axis=0)  # (H, W) bool
+                    overlay = vis.copy()
+                    overlay[combined] = rgb_color
+                    cv2.addWeighted(overlay, 0.45, vis, 0.55, 0, vis)
+                    if boxes is not None:
+                        for box in boxes:
+                            x0, y0, x1, y1 = box.astype(int)
+                            cv2.rectangle(vis, (x0, y0), (x1, y1), rgb_color, 2)
+                return _label(vis, label)
+
+            sam3_panels = [
+                _draw_sam3_concept(
+                    sam3_results[obj_id],
+                    _SAM3_COLORS[obj_id],
+                    _SAM3_LABELS[obj_id],
+                )
+                for obj_id in (CONCEPT_LEFT_ARM, CONCEPT_RIGHT_ARM, CONCEPT_CUP)
+            ]
+            row2 = np.concatenate(sam3_panels, axis=1)
+
+            preview = np.concatenate([row1, row2], axis=0)
+            cv2.imshow('RGB | Raw Depth | Metric Depth  /  SAM3: Left Arm | Right Arm | Cup', preview)
             cv2.waitKey(1)
 
         except Exception as e:
