@@ -1,6 +1,11 @@
 import torch
 import sys
 import os
+from pathlib import Path
+
+# Resolve project root relative to this file (init/test_env.py -> repo root)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MODEL_ROOT   = PROJECT_ROOT / "models"
 
 def test_cuda_torch():
     print("--- 1. PyTorch & CUDA Check ---")
@@ -81,17 +86,103 @@ def test_curobo():
     print("")
     return True
 
+def test_promptda():
+    print("--- 4. PromptDA Metric Depth Check ---")
+    try:
+        import numpy as np
+        from robot_motion_interface.utils.promptda_utils import PromptDAInference
+        print("PromptDAInference Import: SUCCESS")
+    except Exception as e:
+        print(f"PromptDAInference Import FAILED: {e}")
+        return False
+
+    ckpt = MODEL_ROOT / "pda-s-trans-model.ckpt"
+    if not ckpt.exists():
+        print(f"SKIP: checkpoint not found at {ckpt}")
+        print("")
+        return True   # not a code failure, just missing model file
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        pda = PromptDAInference(ckpt_path=str(ckpt), encoder="vits", device=device)
+        print(f"PromptDA loaded on {device}")
+
+        # Synthetic 640x480 color + depth frame
+        bgr   = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
+        depth = np.random.randint(500, 5000, (480, 640), dtype=np.uint16)
+
+        out = pda.infer(bgr, depth)
+        print(f"PromptDA output shape: {tuple(out.shape)}  dtype: {out.dtype}")
+        assert out.ndim == 2, f"Expected 2-D output, got shape {out.shape}"
+        print("PromptDA Inference Test: SUCCESS")
+    except Exception as e:
+        print(f"PromptDA Functional Test FAILED: {e}")
+        return False
+    print("")
+    return True
+
+
+def test_sam3():
+    print("--- 5. SAM 3 Semantic Segmentation Check ---")
+    try:
+        import numpy as np
+        from robot_motion_interface.utils.sam3_utils import (
+            SAM3Inference, CONCEPT_LEFT_ARM, CONCEPT_RIGHT_ARM, CONCEPT_CUP
+        )
+        print("SAM3Inference Import: SUCCESS")
+    except Exception as e:
+        print(f"SAM3Inference Import FAILED: {e}")
+        return False
+
+    ckpt = MODEL_ROOT / "sam3.pt"
+    if not ckpt.exists():
+        print(f"SKIP: checkpoint not found at {ckpt}")
+        print("")
+        return True   # not a code failure, just missing model file
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        # compile=False avoids torch.compile warm-up delay during testing
+        sam3 = SAM3Inference(ckpt_path=str(ckpt), device=device, compile=False)
+        print(f"SAM 3 loaded on {device}")
+
+        # Synthetic 640x480 BGR frame
+        bgr = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
+
+        results = sam3.infer(bgr)
+
+        # Verify all 3 concept entries are present
+        assert set(results.keys()) == {CONCEPT_LEFT_ARM, CONCEPT_RIGHT_ARM, CONCEPT_CUP}, \
+            f"Unexpected result keys: {results.keys()}"
+        for obj_id, name in [(CONCEPT_LEFT_ARM, "left_arm"),
+                              (CONCEPT_RIGHT_ARM, "right_arm"),
+                              (CONCEPT_CUP, "cup")]:
+            r = results[obj_id]
+            masks_info = f"shape={r['masks'].shape}" if r["masks"] is not None else "no det"
+            print(f"  {name}: {masks_info}  scores={r['scores']}")
+
+        print("SAM 3 Inference Test: SUCCESS")
+    except Exception as e:
+        print(f"SAM 3 Functional Test FAILED: {e}")
+        return False
+    print("")
+    return True
+
+
 if __name__ == "__main__":
     print("==========================================")
-    print("   Robotics Environment Health Check v2   ")
+    print("   Robotics Environment Health Check v3   ")
     print("==========================================\n")
-    
-    torch_ok = test_cuda_torch()
-    pin_ok = test_pinocchio()
-    curobo_ok = test_curobo()
-    
-    if torch_ok and pin_ok and curobo_ok:
-        print("🎉 ALL CLEAR: Torch, Pinocchio, and cuRobo are ready for RTX 4090!")
+
+    torch_ok   = test_cuda_torch()
+    pin_ok     = test_pinocchio()
+    curobo_ok  = test_curobo()
+    pda_ok     = test_promptda()
+    sam3_ok    = test_sam3()
+
+    all_ok = torch_ok and pin_ok and curobo_ok and pda_ok and sam3_ok
+    if all_ok:
+        print("ALL CLEAR: Torch, Pinocchio, cuRobo, PromptDA, and SAM 3 are ready!")
     else:
-        print("❌ FAILED: One or more components are missing or misconfigured.")
+        print("FAILED: One or more components are missing or misconfigured.")
         sys.exit(1)

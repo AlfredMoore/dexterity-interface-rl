@@ -78,7 +78,7 @@ Prompt depth anything
 cd /workspace/dep
 git clone https://github.com/AlfredMoore/PromptDA-HAND.git
 cd PromptDA-HAND
-pip install -e .
+pip install .
 cd /workspace
 ```
 
@@ -87,7 +87,7 @@ Segment Anything 3
 cd /workspace/dep
 git clone https://github.com/AlfredMoore/sam3-HAND.git
 cd sam3-HAND
-pip install -e .
+pip install .
 cd /workspace
 ```
 
@@ -103,10 +103,10 @@ python -m robot_motion_interface.utils.realsense_test.py
 
 Commit the image from the host (optional)
 ```bash
-docker commit handrl-policy dex-policy:curobo_compiled
+docker commit handrl-policy dex-policy:compiled
 # Then you can directly run the full installed container by
 xhost +local:docker
-docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/workspace --device /dev/bus/usb:/dev/bus/usb --net=host -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix dex-policy:curobo_compiled
+docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/workspace --device /dev/bus/usb:/dev/bus/usb --net=host -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix dex-policy:compiled
 ```
 
 Run Pre-grasp Sampling Modules

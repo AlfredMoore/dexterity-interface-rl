@@ -138,3 +138,114 @@ class SAM3Inference:
             }
 
         return results
+
+
+# ── Benchmark entry point ──────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+    import time
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(description="Benchmark SAM3Inference throughput")
+    parser.add_argument("--ckpt",    type=str, default=None,
+                        help="Path to sam3.pt  (default: auto-detect from models/)")
+    parser.add_argument("--device",  type=str, default="cuda",
+                        help="torch device  (default: cuda)")
+    parser.add_argument("--compile", action="store_true",
+                        help="Enable torch.compile (adds warm-up overhead)")
+    parser.add_argument("--width",   type=int, default=640,
+                        help="Synthetic frame width  (default: 640)")
+    parser.add_argument("--height",  type=int, default=480,
+                        help="Synthetic frame height  (default: 480)")
+    parser.add_argument("--warmup",  type=int, default=3,
+                        help="Number of warm-up frames before timing  (default: 3)")
+    parser.add_argument("--iters",   type=int, default=20,
+                        help="Number of timed iterations  (default: 20)")
+    args = parser.parse_args()
+
+    # --- Resolve checkpoint path ---
+    if args.ckpt is not None:
+        ckpt_path = args.ckpt
+    else:
+        # Walk up from this file to the repo root and look for models/sam3.pt
+        _repo_root = Path(__file__).resolve().parents[6]  # libs/rmi/src/rmi/utils -> repo root
+        ckpt_path  = str(_repo_root / "models" / "sam3.pt")
+
+    # --- GPU info ---
+    if torch.cuda.is_available():
+        _props = torch.cuda.get_device_properties(0)
+        gpu_info = (
+            f"{torch.cuda.get_device_name(0)}  "
+            f"({_props.total_memory // (1024**2)} MiB)  "
+            f"sm_{_props.major}{_props.minor}  "
+            f"CUDA {torch.version.cuda}"
+        )
+    else:
+        gpu_info = "N/A (CPU only)"
+
+    print("=" * 55)
+    print("  SAM3 Inference Frequency Benchmark")
+    print("=" * 55)
+    print(f"  GPU        : {gpu_info}")
+    print(f"  checkpoint : {ckpt_path}")
+    print(f"  device     : {args.device}")
+    print(f"  compile    : {args.compile}")
+    print(f"  frame size : {args.width}x{args.height}")
+    print(f"  warm-up    : {args.warmup}  |  timed iters: {args.iters}")
+    print("=" * 55)
+
+    # --- Build model ---
+    t_load = time.time()
+    sam3 = SAM3Inference(
+        ckpt_path=ckpt_path,
+        device=args.device,
+        compile=args.compile,
+    )
+    print(f"Model loaded in {time.time() - t_load:.2f}s\n")
+
+    # Shared synthetic BGR frame (constant across iterations to isolate GPU time)
+    rng   = np.random.default_rng(42)
+    frame = rng.integers(0, 256, (args.height, args.width, 3), dtype=np.uint8)
+
+    # --- Warm-up ---
+    print(f"Running {args.warmup} warm-up frame(s) ...")
+    for _ in range(args.warmup):
+        sam3.infer(frame)
+    if args.device == "cuda":
+        torch.cuda.synchronize()
+    print("Warm-up done.\n")
+
+    # --- Timed benchmark ---
+    latencies = []
+    for i in range(args.iters):
+        if args.device == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        results = sam3.infer(frame)
+        if args.device == "cuda":
+            torch.cuda.synchronize()
+        latencies.append(time.perf_counter() - t0)
+
+        det_summary = "  ".join(
+            f"{results[oid]['concept'].split()[0]}="
+            f"{'det' if results[oid]['masks'] is not None else 'none'}"
+            for oid in (CONCEPT_LEFT_ARM, CONCEPT_RIGHT_ARM, CONCEPT_CUP)
+        )
+        print(f"  iter {i+1:>3d}: {latencies[-1]*1000:>7.2f} ms  [{det_summary}]")
+
+    latencies_ms = [l * 1000 for l in latencies]
+    mean_ms  = sum(latencies_ms) / len(latencies_ms)
+    min_ms   = min(latencies_ms)
+    max_ms   = max(latencies_ms)
+    # std
+    var      = sum((x - mean_ms) ** 2 for x in latencies_ms) / len(latencies_ms)
+    std_ms   = var ** 0.5
+
+    print()
+    print("=" * 55)
+    print(f"  mean  : {mean_ms:>7.2f} ms   ({1000/mean_ms:>5.1f} Hz)")
+    print(f"  min   : {min_ms:>7.2f} ms")
+    print(f"  max   : {max_ms:>7.2f} ms")
+    print(f"  std   : {std_ms:>7.2f} ms")
+    print("=" * 55)

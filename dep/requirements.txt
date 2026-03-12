@@ -46,6 +46,7 @@ regex
 iopath>=0.1.10
 typing_extensions
 huggingface_hub
+decord
 
 # --- Utilities & Debugging ---
 ipdb
