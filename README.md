@@ -76,18 +76,27 @@ cd /workspace
 Prompt depth anything
 ```bash
 cd /workspace/dep
-git clone https://github.com/AlfredMoore/PromptDA-HAND.git
-cd PromptDA-HAND
-pip install .
+git clone https://github.com/DepthAnything/PromptDA.git # 9161547
+# This repo is not ready for `pip install -e .`
+export PYTHONPATH=/workspace/dep/PromptDA:$PYTHONPATH
 cd /workspace
 ```
 
-Segment Anything 3
+Segment Anything 2
 ```bash
 cd /workspace/dep
-git clone https://github.com/AlfredMoore/sam3-HAND.git
+git clone https://github.com/facebookresearch/sam2.git  # 2b90b9f
+cd sam2
+pip install -e .
+cd /workspace
+```
+
+Efficient SAM 3 (including Segment Anything 3)
+```bash
+cd /workspace/dep
+git clone https://github.com/SimonZeng7108/efficientsam3.git -b sam3_litetext   # bef17f5
 cd sam3-HAND
-pip install .
+pip install --force-reinstall --no-deps --no-build-isolation -e .
 cd /workspace
 ```
 

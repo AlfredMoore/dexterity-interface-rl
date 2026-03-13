@@ -1,12 +1,12 @@
 # --- Core Frameworks (Pinned to prevent overwriting) ---
 # Pre-installed versions are locked to ensure compatibility with CuRobo & SAM3
 torch==2.7.0
-torchvision
-torchaudio
+torchvision==0.22.0
+torchaudio==2.7.0
 
 # --- Base Dependencies ---
 # Unified version to satisfy both SAM3 and CuRobo requirements
-numpy==1.26
+numpy==1.26.4
 scipy
 matplotlib
 tqdm
@@ -37,7 +37,10 @@ h5py
 pycocotools
 lark
 pyrealsense2
-opencv-python>=4.8.0
+opencv-python>=4.9.0.80
+
+# --- SAM2 Specific Dependencies ---
+hydra-core>=1.3.2
 
 # --- SAM3 Specific Dependencies ---
 timm>=1.0.17
@@ -52,6 +55,6 @@ psutil
 # --- Utilities & Debugging ---
 ipdb
 termcolor
-tyro
+tyro==0.9.2
 importlib_resources
 pyyaml

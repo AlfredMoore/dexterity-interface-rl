@@ -5,19 +5,19 @@ Three modes are supported (controlled by the `mode` argument):
 
   "sam3"      -- Original SAM3 (ViT-H vision + CLIP text, 848 M params).
                  Requires: dep/sam3-HAND installed.
-                 Checkpoint: sam3.pt
+                 Checkpoint: models/sam3/sam3.pt
 
                  Benchmark:
                    python -m robot_motion_interface.utils.sam3_utils \\
-                     --mode sam3 --ckpt /path/to/models/sam3.pt
+                     --mode sam3 --ckpt models/sam3/sam3.pt
 
   "litetext"  -- SAM3-LiteText: keeps ViT-H vision encoder but replaces
                  the 353 M-param CLIP text encoder with a MobileCLIP variant
-                 (42–124 M params, 88 % smaller).  Accuracy/mask quality is
+                 (42-124 M params, 88 % smaller).  Accuracy/mask quality is
                  essentially identical to "sam3"; only text-side latency drops.
                  Requires: dep/efficientsam3 installed (must be on sys.path).
 
-                 Available checkpoints (place in models/):
+                 Available checkpoints (place in models/sam3/):
                    SAM3-LiteText-S0-16  →  efficient_sam3_image_encoder_mobileclip_s0_ctx16.pt
                    SAM3-LiteText-S1-16  →  efficient_sam3_image_encoder_mobileclip_s1_ctx16.pt
                    SAM3-LiteText-L-16   →  efficient_sam3_image_encoder_mobileclip2_l_ctx16.pt
@@ -26,38 +26,39 @@ Three modes are supported (controlled by the `mode` argument):
                    # S0-16 (42 M text params — lightest)
                    python -m robot_motion_interface.utils.sam3_utils \\
                      --mode litetext \\
-                     --ckpt models/efficient_sam3_image_encoder_mobileclip_s0_ctx16.pt \\
+                     --ckpt models/sam3/efficient_sam3_image_encoder_mobileclip_s0_ctx16.pt \\
                      --text_encoder_type MobileCLIP-S0 \\
                      --text_encoder_context_length 16
 
                    # S1-16 (64 M text params)
                    python -m robot_motion_interface.utils.sam3_utils \\
                      --mode litetext \\
-                     --ckpt models/efficient_sam3_image_encoder_mobileclip_s1_ctx16.pt \\
+                     --ckpt models/sam3/efficient_sam3_image_encoder_mobileclip_s1_ctx16.pt \\
                      --text_encoder_type MobileCLIP-S1 \\
                      --text_encoder_context_length 16
 
                    # L-16 (124 M text params — most accurate text)
                    python -m robot_motion_interface.utils.sam3_utils \\
                      --mode litetext \\
-                     --ckpt models/efficient_sam3_image_encoder_mobileclip2_l_ctx16.pt \\
+                     --ckpt models/sam3/efficient_sam3_image_encoder_mobileclip2_l_ctx16.pt \\
                      --text_encoder_type MobileCLIP2-L \\
                      --text_encoder_context_length 16
 
-  "efficient" -- EfficientSAM3: replaces both vision encoder (0.68–22 M params)
+  "efficient" -- EfficientSAM3: replaces both vision encoder (0.68-22 M params)
                  and optionally the text encoder with lightweight student models.
                  Fastest option; some accuracy trade-off vs "sam3".
                  Requires: dep/efficientsam3 installed.
-                 Checkpoint examples (Stage-1, fine-tuned variants recommended):
+                 Checkpoint examples (place in models/sam3/, fine-tuned variants recommended):
                    efficient_sam3_tinyvit_m_ft.pt      (backbone_type=tinyvit,      model_name=11m)
                    efficient_sam3_tinyvit_l_ft.pt      (backbone_type=tinyvit,      model_name=21m)
+                   efficient_sam3_efficientvit_s.pt    (backbone_type=efficientvit, model_name=b0)
                    efficient_sam3_efficientvit_m_ft.pt (backbone_type=efficientvit, model_name=b1)
                    efficient_sam3_repvit_m_ft.pt       (backbone_type=repvit,       model_name=m1.1)
 
                  Benchmark:
                    python -m robot_motion_interface.utils.sam3_utils \\
                      --mode efficient \\
-                     --ckpt models/efficient_sam3_tinyvit_m_ft.pt \\
+                     --ckpt models/sam3/efficient_sam3_tinyvit_m_ft.pt \\
                      --backbone_type tinyvit --model_name 11m
 """
 
@@ -141,11 +142,11 @@ class SAM3Inference:
 
     Usage:
         # Original SAM3 (default)
-        sam3 = SAM3Inference(ckpt_path="models/sam3.pt")
+        sam3 = SAM3Inference(ckpt_path="models/sam3/sam3.pt")
 
         # SAM3-LiteText (MobileCLIP-S0 text encoder, context length 16)
         sam3 = SAM3Inference(
-            ckpt_path="models/efficient_sam3_image_encoder_mobileclip_s0_ctx16.pt",
+            ckpt_path="models/sam3/efficient_sam3_image_encoder_mobileclip_s0_ctx16.pt",
             mode="litetext",
             text_encoder_type="MobileCLIP-S0",
             text_encoder_context_length=16,
@@ -153,7 +154,7 @@ class SAM3Inference:
 
         # EfficientSAM3 (TinyViT-11M vision encoder, fine-tuned)
         sam3 = SAM3Inference(
-            ckpt_path="models/efficient_sam3_tinyvit_m_ft.pt",
+            ckpt_path="models/sam3/efficient_sam3_tinyvit_m_ft.pt",
             mode="efficient",
             backbone_type="tinyvit",
             model_name="11m",
@@ -219,6 +220,8 @@ class SAM3Inference:
         self.device = device
         self.concept_map = concept_map if concept_map is not None else self.DEFAULT_CONCEPT_MAP
 
+        from sam3.model.sam3_image_processor import Sam3Processor
+
         model = _build_model(
             mode=mode,
             ckpt_path=ckpt_path,
@@ -248,12 +251,12 @@ class SAM3Inference:
 
         Returns:
             dict keyed by object_id (int), each value is a dict with:
-                "concept": str                  -- the text prompt used
-                "masks":   (N, 1, H, W) bool    -- per-detection binary masks (None if no detections)
-                "boxes":   (N, 4)       float32 -- pixel-space [x0, y0, x1, y1] (None if no detections)
-                "scores":  (N,)         float32 -- confidence scores (None if no detections)
+                "concept": str                       -- the text prompt used
+                "masks":   (N, 1, H, W) bool tensor  -- per-detection binary masks (None if no detections)
+                "boxes":   (N, 4)       float32 tensor -- pixel-space [x0, y0, x1, y1] (None if no detections)
+                "scores":  (N,)         float32 tensor -- confidence scores (None if no detections)
         """
-        # BGR numpy -> PIL RGB (Sam3Processor expects PIL Image or tensor)
+        # BGR numpy -> PIL RGB (Sam3Processor expects PIL Image)
         pil_img = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
         # Encode visual features once for all concepts
@@ -263,9 +266,6 @@ class SAM3Inference:
         for concept, obj_id in self.concept_map.items():
             # Shallow-copy the state so that each concept's text features
             # do not bleed into the next concept's grounding pass.
-            # backbone_out is also shallow-copied: set_text_prompt only adds
-            # new language keys (language_features, language_mask, language_embeds)
-            # without modifying the shared vision tensors.
             state = dict(base_state)
             state["backbone_out"] = dict(base_state["backbone_out"])
 
@@ -275,12 +275,11 @@ class SAM3Inference:
             boxes  = state.get("boxes")   # (N, 4) float tensor or absent
             scores = state.get("scores")  # (N,) float tensor or absent
 
-            # Convert to numpy for downstream consumers; None if no detections
             results[obj_id] = {
                 "concept": concept,
-                "masks":   masks.cpu().numpy()  if masks  is not None and masks.numel()  > 0 else None,
-                "boxes":   boxes.cpu().numpy()  if boxes  is not None and boxes.numel()  > 0 else None,
-                "scores":  scores.cpu().numpy() if scores is not None and scores.numel() > 0 else None,
+                "masks":   masks  if masks  is not None and masks.numel()  > 0 else None,
+                "boxes":   boxes  if boxes  is not None and boxes.numel()  > 0 else None,
+                "scores":  scores if scores is not None and scores.numel() > 0 else None,
             }
 
         return results
@@ -333,8 +332,8 @@ if __name__ == "__main__":
     if args.ckpt is not None:
         ckpt_path = args.ckpt
     else:
-        _repo_root = Path(__file__).resolve().parents[6]
-        ckpt_path  = str(_repo_root / "models" / _DEFAULT_CKPT[args.mode])
+        _repo_root = Path(__file__).resolve().parents[5]
+        ckpt_path  = str(_repo_root / "models" / "sam3" / _DEFAULT_CKPT[args.mode])
 
     # --- GPU info ---
     if torch.cuda.is_available():
