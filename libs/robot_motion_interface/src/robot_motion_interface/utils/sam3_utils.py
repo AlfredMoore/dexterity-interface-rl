@@ -8,8 +8,10 @@ Three modes are supported (controlled by the `mode` argument):
                  Checkpoint: models/sam3/sam3.pt
 
                  Benchmark:
-                   python -m robot_motion_interface.utils.sam3_utils \\
-                     --mode sam3 --ckpt models/sam3/sam3.pt
+                   python -m robot_motion_interface.utils.sam3_utils \
+                    --frames_dir models/data_examples/hand_setup_frames \
+                    --mode sam3 --ckpt models/sam3/sam3.pt \
+                    --compile
 
   "litetext"  -- SAM3-LiteText: keeps ViT-H vision encoder but replaces
                  the 353 M-param CLIP text encoder with a MobileCLIP variant
@@ -24,24 +26,24 @@ Three modes are supported (controlled by the `mode` argument):
 
                  Benchmark commands:
                    # S0-16 (42 M text params — lightest)
-                   python -m robot_motion_interface.utils.sam3_utils \\
-                     --mode litetext \\
-                     --ckpt models/sam3/efficient_sam3_image_encoder_mobileclip_s0_ctx16.pt \\
-                     --text_encoder_type MobileCLIP-S0 \\
+                   python -m robot_motion_interface.utils.sam3_utils \
+                     --mode litetext \
+                     --ckpt models/sam3/efficient_sam3_image_encoder_mobileclip_s0_ctx16.pt \
+                     --text_encoder_type MobileCLIP-S0 \
                      --text_encoder_context_length 16
 
                    # S1-16 (64 M text params)
-                   python -m robot_motion_interface.utils.sam3_utils \\
-                     --mode litetext \\
-                     --ckpt models/sam3/efficient_sam3_image_encoder_mobileclip_s1_ctx16.pt \\
-                     --text_encoder_type MobileCLIP-S1 \\
+                   python -m robot_motion_interface.utils.sam3_utils \
+                     --mode litetext \
+                     --ckpt models/sam3/efficient_sam3_image_encoder_mobileclip_s1_ctx16.pt \
+                     --text_encoder_type MobileCLIP-S1 \
                      --text_encoder_context_length 16
 
                    # L-16 (124 M text params — most accurate text)
-                   python -m robot_motion_interface.utils.sam3_utils \\
-                     --mode litetext \\
-                     --ckpt models/sam3/efficient_sam3_image_encoder_mobileclip2_l_ctx16.pt \\
-                     --text_encoder_type MobileCLIP2-L \\
+                   python -m robot_motion_interface.utils.sam3_utils \
+                     --mode litetext \
+                     --ckpt models/sam3/efficient_sam3_image_encoder_mobileclip2_l_ctx16.pt \
+                     --text_encoder_type MobileCLIP2-L \
                      --text_encoder_context_length 16
 
   "efficient" -- EfficientSAM3: replaces both vision encoder (0.68-22 M params)
@@ -56,23 +58,24 @@ Three modes are supported (controlled by the `mode` argument):
                    efficient_sam3_repvit_m_ft.pt       (backbone_type=repvit,       model_name=m1.1)
 
                  Benchmark:
-                   python -m robot_motion_interface.utils.sam3_utils \\
-                     --mode efficient \\
-                     --ckpt models/sam3/efficient_sam3_tinyvit_m_ft.pt \\
+                   python -m robot_motion_interface.utils.sam3_utils \
+                     --mode efficient \
+                     --ckpt models/sam3/efficient_sam3_tinyvit_m_ft.pt \
                      --backbone_type tinyvit --model_name 11m
 """
 
 import cv2
 import numpy as np
 import torch
+from torchvision.ops import nms as tv_nms
 from PIL import Image
 from typing import Dict, Literal, Optional
+from sam3.model.sam3_image_processor import Sam3Processor
 
 
 # Object IDs assigned to each semantic concept (fixed at init, used downstream)
-CONCEPT_LEFT_ARM  = 1
-CONCEPT_RIGHT_ARM = 2
-CONCEPT_CUP       = 3
+CONCEPT_ARM = 1   # single prompt, up to 2 instances (both arms)
+CONCEPT_CUP = 3
 
 # Supported mode strings
 _MODES = ("sam3", "litetext", "efficient")
@@ -169,9 +172,8 @@ class SAM3Inference:
 
     # Default concept map for this project: text_prompt -> object_id
     DEFAULT_CONCEPT_MAP: Dict[str, int] = {
-        "left robot arm":  CONCEPT_LEFT_ARM,
-        "right robot arm": CONCEPT_RIGHT_ARM,
-        "cup":             CONCEPT_CUP,
+        "robot arm": CONCEPT_ARM,   # returns up to N instances; top-2 = both arms
+        "cup":       CONCEPT_CUP,
     }
 
     def __init__(
@@ -182,6 +184,8 @@ class SAM3Inference:
         compile: bool = True,
         concept_map: Optional[Dict[str, int]] = None,
         confidence_threshold: float = 0.5,
+        max_instances_per_concept: Optional[Dict[int, int]] = None,
+        nms_iou_threshold: float = 0.5,
         # ── EfficientSAM3 "efficient" mode ──────────────────────────────
         backbone_type: str = "tinyvit",
         model_name: str = "11m",
@@ -219,8 +223,12 @@ class SAM3Inference:
 
         self.device = device
         self.concept_map = concept_map if concept_map is not None else self.DEFAULT_CONCEPT_MAP
-
-        from sam3.model.sam3_image_processor import Sam3Processor
+        # Default: arm concept allows 2 instances, everything else 1
+        self.max_instances: Dict[int, int] = (
+            max_instances_per_concept if max_instances_per_concept is not None
+            else {CONCEPT_ARM: 2, CONCEPT_CUP: 1}
+        )
+        self.nms_iou_threshold = nms_iou_threshold
 
         model = _build_model(
             mode=mode,
@@ -268,12 +276,21 @@ class SAM3Inference:
             # do not bleed into the next concept's grounding pass.
             state = dict(base_state)
             state["backbone_out"] = dict(base_state["backbone_out"])
-
             state = self.processor.set_text_prompt(prompt=concept, state=state)
-
             masks  = state.get("masks")   # (N, 1, H, W) bool tensor or absent
             boxes  = state.get("boxes")   # (N, 4) float tensor or absent
             scores = state.get("scores")  # (N,) float tensor or absent
+
+            if boxes is not None and boxes.numel() > 0:
+                keep = tv_nms(boxes.float(), scores.float(), self.nms_iou_threshold)
+                boxes  = boxes[keep]
+                scores = scores[keep]
+                masks  = masks[keep] if masks is not None else None
+
+                top_k = self.max_instances.get(obj_id, 1)
+                boxes  = boxes[:top_k]
+                scores = scores[:top_k]
+                masks  = masks[:top_k] if masks is not None else None
 
             results[obj_id] = {
                 "concept": concept,
@@ -287,63 +304,120 @@ class SAM3Inference:
 
 # ── Benchmark entry point ──────────────────────────────────────────────────────
 
+# Colours (BGR) per concept object ID for visualisation
+_VIS_COLORS = {
+    CONCEPT_ARM: (0,  80, 255),   # orange-red (all arm instances)
+    CONCEPT_CUP: (0, 200,   0),   # green
+}
+# Per-instance color offsets for multiple arm detections (instance 0, 1, ...)
+_ARM_INSTANCE_COLORS = [
+    (0,  80, 255),   # instance 0 — orange-red
+    (255, 80,  0),   # instance 1 — blue
+]
+
+
+def _draw_results(frame: np.ndarray, results: Dict[int, dict]) -> np.ndarray:
+    """Draw masks + boxes + labels from sam3.infer() onto a BGR frame copy."""
+    vis = frame.copy()
+    overlay = vis.copy()
+    h, w = vis.shape[:2]
+
+    for obj_id, res in results.items():
+        label = res["concept"]
+        n = len(res["masks"]) if res["masks"] is not None else 0
+
+        for idx in range(n):
+            # Per-instance colour (ARM cycles through _ARM_INSTANCE_COLORS, others use _VIS_COLORS)
+            if obj_id == CONCEPT_ARM:
+                color = _ARM_INSTANCE_COLORS[idx % len(_ARM_INSTANCE_COLORS)]
+            else:
+                color = _VIS_COLORS.get(obj_id, (200, 200, 200))
+
+            # Mask overlay
+            mask = res["masks"][idx, 0].cpu().numpy()   # (H, W) bool
+            mask_resized = cv2.resize(
+                mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST
+            ).astype(bool)
+            overlay[mask_resized] = color
+
+            # Bounding box + label
+            if res["boxes"] is not None:
+                box   = res["boxes"][idx].cpu().numpy().astype(int)
+                score = float(res["scores"][idx].cpu()) if res["scores"] is not None else 0.0
+                x1, y1, x2, y2 = box
+                cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(vis, f"{label}#{idx} {score:.2f}", (x1, y1 - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+
+    # Blend mask overlay
+    cv2.addWeighted(overlay, 0.35, vis, 0.65, 0, vis)
+    return vis
+
+
 if __name__ == "__main__":
     import argparse
     import time
     from pathlib import Path
 
-    # Default checkpoint filenames per mode (relative to models/)
+    # Default checkpoint filenames per mode (relative to models/sam3/)
     _DEFAULT_CKPT = {
         "sam3":      "sam3.pt",
         "litetext":  "efficient_sam3_image_encoder_mobileclip_s0_ctx16.pt",
         "efficient": "efficient_sam3_tinyvit_m_ft.pt",
     }
 
+    _REPO_ROOT = Path(__file__).resolve().parents[5]
+
     parser = argparse.ArgumentParser(description="Benchmark SAM3/EfficientSAM3 throughput")
     parser.add_argument("--ckpt",    type=str, default=None,
-                        help="Path to checkpoint (default: auto-detect from models/)")
-    parser.add_argument("--mode",    type=str, default="sam3",
-                        choices=list(_MODES),
-                        help="Model mode: sam3 | litetext | efficient  (default: sam3)")
-    parser.add_argument("--device",  type=str, default="cuda",
-                        help="torch device  (default: cuda)")
-    parser.add_argument("--compile", action="store_true",
-                        help="Enable torch.compile (adds warm-up overhead)")
-    parser.add_argument("--width",   type=int, default=640,
-                        help="Synthetic frame width  (default: 640)")
-    parser.add_argument("--height",  type=int, default=480,
-                        help="Synthetic frame height  (default: 480)")
-    parser.add_argument("--warmup",  type=int, default=1,
-                        help="Number of warm-up frames before timing  (default: 1)")
+                        help="Path to checkpoint (default: auto-detect from models/sam3/)")
+    parser.add_argument("--mode",    type=str, default="sam3", choices=list(_MODES))
+    parser.add_argument("--device",  type=str, default="cuda")
+    parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--width",   type=int, default=640)
+    parser.add_argument("--height",  type=int, default=480)
+    parser.add_argument("--warmup",  type=int, default=1)
     parser.add_argument("--iters",   type=int, default=20,
-                        help="Number of timed iterations  (default: 20)")
+                        help="Timed iterations (single-image / synthetic mode only)")
+    parser.add_argument("--frames_dir", type=str, default=None,
+                        help="Folder of frames to run sequentially (jpg/png, sorted by name).")
+    parser.add_argument("--out_dir",    type=str, default=None,
+                        help="Save annotated frames here (only with --frames_dir).")
+    parser.add_argument("--video_fps",  type=float, default=30.0,
+                        help="Playback fps of the output video (default: 30).")
     # EfficientSAM3-specific
-    parser.add_argument("--backbone_type", type=str, default="tinyvit",
-                        help="[mode=efficient] backbone: tinyvit | efficientvit | repvit")
-    parser.add_argument("--model_name",    type=str, default="11m",
-                        help="[mode=efficient] model variant e.g. 11m / b1 / m1.1")
-    parser.add_argument("--text_encoder_type", type=str, default=None,
-                        help="[mode=litetext/efficient] MobileCLIP-S0 | MobileCLIP-S1 | MobileCLIP2-L")
-    parser.add_argument("--text_encoder_context_length", type=int, default=16,
-                        help="[mode=litetext] token context length: 16 | 32 | 77  (default: 16)")
+    parser.add_argument("--backbone_type",              type=str, default="tinyvit")
+    parser.add_argument("--model_name",                 type=str, default="11m")
+    parser.add_argument("--text_encoder_type",          type=str, default=None)
+    parser.add_argument("--text_encoder_context_length",type=int, default=16)
     args = parser.parse_args()
 
-    # --- Resolve checkpoint path ---
-    if args.ckpt is not None:
-        ckpt_path = args.ckpt
-    else:
-        _repo_root = Path(__file__).resolve().parents[5]
-        ckpt_path  = str(_repo_root / "models" / "sam3" / _DEFAULT_CKPT[args.mode])
+    # ── Resolve checkpoint path ────────────────────────────────────────────────
+    ckpt_path = args.ckpt or str(_REPO_ROOT / "models" / "sam3" / _DEFAULT_CKPT[args.mode])
 
-    # --- GPU info ---
+    # ── Frame list ─────────────────────────────────────────────────────────────
+    if args.frames_dir is not None:
+        frames_dir  = Path(args.frames_dir)
+        frame_paths = sorted(p for p in frames_dir.iterdir()
+                             if p.suffix.lower() in (".jpg", ".jpeg", ".png"))
+        if not frame_paths:
+            raise FileNotFoundError(f"No jpg/png frames in: {frames_dir}")
+        out_dir = Path(args.out_dir) if args.out_dir else \
+                  frames_dir.parent / (frames_dir.name + "_annotated")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        mode = "folder"
+    else:
+        rng         = np.random.default_rng(42)
+        _synth      = rng.integers(0, 256, (args.height, args.width, 3), dtype=np.uint8)
+        frame_paths = [None] * args.iters   # sentinel: use synthetic frame
+        mode        = "synthetic"
+
+    # ── GPU info ───────────────────────────────────────────────────────────────
     if torch.cuda.is_available():
         _props = torch.cuda.get_device_properties(0)
-        gpu_info = (
-            f"{torch.cuda.get_device_name(0)}  "
-            f"({_props.total_memory // (1024**2)} MiB)  "
-            f"sm_{_props.major}{_props.minor}  "
-            f"CUDA {torch.version.cuda}"
-        )
+        gpu_info = (f"{torch.cuda.get_device_name(0)}  "
+                    f"({_props.total_memory // (1024**2)} MiB)  "
+                    f"sm_{_props.major}{_props.minor}  CUDA {torch.version.cuda}")
     else:
         gpu_info = "N/A (CPU only)"
 
@@ -353,18 +427,19 @@ if __name__ == "__main__":
     print(f"  GPU              : {gpu_info}")
     print(f"  mode             : {args.mode}")
     print(f"  checkpoint       : {ckpt_path}")
-    print(f"  device           : {args.device}")
-    print(f"  compile          : {args.compile}")
+    print(f"  device           : {args.device}  compile={args.compile}")
     if args.mode == "efficient":
-        print(f"  backbone_type    : {args.backbone_type}")
-        print(f"  model_name       : {args.model_name}")
+        print(f"  backbone         : {args.backbone_type}/{args.model_name}")
     if args.mode in ("litetext", "efficient") and args.text_encoder_type:
         print(f"  text_encoder     : {args.text_encoder_type}  ctx={args.text_encoder_context_length}")
     print(f"  frame size       : {args.width}x{args.height}")
-    print(f"  warm-up          : {args.warmup}  |  timed iters: {args.iters}")
+    if mode == "folder":
+        print(f"  frames_dir       : {args.frames_dir}  ({len(frame_paths)} frames)")
+        print(f"  out_dir          : {out_dir}")
+    print(f"  warm-up          : {args.warmup}")
     print("=" * 60)
 
-    # --- Build model ---
+    # ── Build model ────────────────────────────────────────────────────────────
     t_load = time.time()
     sam3 = SAM3Inference(
         ckpt_path=ckpt_path,
@@ -378,47 +453,72 @@ if __name__ == "__main__":
     )
     print(f"Model loaded in {time.time() - t_load:.2f}s\n")
 
-    # Shared synthetic BGR frame (constant across iterations to isolate GPU time)
-    rng   = np.random.default_rng(42)
-    frame = rng.integers(0, 256, (args.height, args.width, 3), dtype=np.uint8)
-
-    # --- Warm-up (not timed) ---
+    # ── Warm-up ────────────────────────────────────────────────────────────────
+    warmup_frame = (cv2.imread(str(frame_paths[0])) if mode == "folder"
+                    else _synth)
+    warmup_frame = cv2.resize(warmup_frame, (args.width, args.height))
     print(f"Running {args.warmup} warm-up frame(s) ...")
     for _ in range(args.warmup):
-        sam3.infer(frame)
+        sam3.infer(warmup_frame)
     if args.device == "cuda":
         torch.cuda.synchronize()
     print("Warm-up done.\n")
 
-    # --- Timed benchmark ---
+    # ── Timed inference ────────────────────────────────────────────────────────
     latencies = []
-    for i in range(args.iters):
+    for i, fpath in enumerate(frame_paths):
+        frame = (cv2.imread(str(fpath)) if fpath is not None else _synth)
+        frame = cv2.resize(frame, (args.width, args.height))
+
         if args.device == "cuda":
             torch.cuda.synchronize()
         t0 = time.perf_counter()
         results = sam3.infer(frame)
         if args.device == "cuda":
             torch.cuda.synchronize()
-        latencies.append(time.perf_counter() - t0)
+        ms = (time.perf_counter() - t0) * 1000
+        latencies.append(ms)
 
         det_summary = "  ".join(
             f"{results[oid]['concept'].split()[0]}="
-            f"{'det' if results[oid]['masks'] is not None else 'none'}"
-            for oid in (CONCEPT_LEFT_ARM, CONCEPT_RIGHT_ARM, CONCEPT_CUP)
+            f"{len(results[oid]['masks']) if results[oid]['masks'] is not None else 0}det"
+            for oid in (CONCEPT_ARM, CONCEPT_CUP)
         )
-        print(f"  iter {i+1:>3d}: {latencies[-1]*1000:>7.2f} ms  [{det_summary}]")
+        label = "frame" if mode == "folder" else "iter"
+        print(f"  {label} {i+1:>4d}/{len(frame_paths)}: {ms:>7.2f} ms  [{det_summary}]")
 
-    latencies_ms = [l * 1000 for l in latencies]
+        if mode == "folder":
+            vis = _draw_results(frame, results)
+            cv2.imwrite(str(out_dir / fpath.name), vis)
+
+    latencies_ms = latencies
     mean_ms = sum(latencies_ms) / len(latencies_ms)
     min_ms  = min(latencies_ms)
     max_ms  = max(latencies_ms)
-    var     = sum((x - mean_ms) ** 2 for x in latencies_ms) / len(latencies_ms)
-    std_ms  = var ** 0.5
+    std_ms  = (sum((x - mean_ms) ** 2 for x in latencies_ms) / len(latencies_ms)) ** 0.5
 
     print()
     print("=" * 60)
+    print(f"  frames     : {len(latencies_ms)}")
     print(f"  mean  : {mean_ms:>7.2f} ms   ({1000/mean_ms:>5.1f} Hz)")
     print(f"  min   : {min_ms:>7.2f} ms")
     print(f"  max   : {max_ms:>7.2f} ms")
     print(f"  std   : {std_ms:>7.2f} ms")
     print("=" * 60)
+
+    if mode == "folder":
+        video_path = out_dir.parent / (out_dir.name + ".mp4")
+        video_fps  = args.video_fps
+        sample_bgr = cv2.imread(str(sorted(out_dir.iterdir())[0]))
+        h_v, w_v   = sample_bgr.shape[:2]
+        writer = cv2.VideoWriter(
+            str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), video_fps, (w_v, h_v)
+        )
+        for p in sorted(out_dir.iterdir()):
+            if p.suffix.lower() in (".jpg", ".jpeg", ".png"):
+                f = cv2.imread(str(p))
+                if f is not None:
+                    writer.write(f)
+        writer.release()
+        print(f"\n  annotated frames → {out_dir}")
+        print(f"  video saved      → {video_path}  ({video_fps:.1f} fps)")

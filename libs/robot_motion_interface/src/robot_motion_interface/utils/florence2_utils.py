@@ -36,10 +36,10 @@ Run:
     python -m robot_motion_interface.utils.florence2_utils \
         --frames_dir models/data_examples/hand_setup_frames \
         --task PHRASE_GROUND \
-        --text_input "left robot arm. right robot arm. water cup." \
-        --model_dir dep/Florence-2-base-ft \
-        --num_beams 3 \
-        --max_new_tokens 1024
+        --text_input "robot arm. water cup." \
+        --model_dir dep/Florence-2-base \
+        --num_beams 1 \
+        --max_new_tokens 256
         
 
 Test:
@@ -233,6 +233,8 @@ if __name__ == "__main__":
                         help="Folder of frames to run sequentially (jpg/png, sorted by name).")
     parser.add_argument("--out_dir",        type=str,  default=None,
                         help="Save annotated frames here (only with --frames_dir).")
+    parser.add_argument("--video_fps",      type=float, default=30.0,
+                        help="Playback fps of the output video (default: 30).")
     args = parser.parse_args()
 
     model_dir  = args.model_dir if args.model_dir is not None else str(_MODEL_DIR)
@@ -354,3 +356,22 @@ if __name__ == "__main__":
         print(f"\n  annotated image saved → {_OUT_PATH}")
     else:
         print(f"\n  annotated frames saved → {out_dir}")
+
+        # Write video with same name as out_dir
+        video_path = out_dir.parent / (out_dir.name + ".mp4")
+        video_fps  = args.video_fps
+        sample_frame = cv2.imread(str(sorted(out_dir.iterdir())[0]))
+        h_v, w_v = sample_frame.shape[:2]
+        writer = cv2.VideoWriter(
+            str(video_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            video_fps,
+            (w_v, h_v),
+        )
+        for p in sorted(out_dir.iterdir()):
+            if p.suffix.lower() in (".jpg", ".jpeg", ".png"):
+                f = cv2.imread(str(p))
+                if f is not None:
+                    writer.write(f)
+        writer.release()
+        print(f"  video saved            → {video_path}  ({video_fps:.1f} fps)")

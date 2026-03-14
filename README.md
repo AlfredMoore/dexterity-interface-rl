@@ -95,7 +95,7 @@ Efficient SAM 3 (including Segment Anything 3)
 ```bash
 cd /workspace/dep
 git clone https://github.com/SimonZeng7108/efficientsam3.git -b sam3_litetext   # bef17f5
-cd sam3-HAND
+cd efficientsam3
 pip install --force-reinstall --no-deps --no-build-isolation -e .
 cd /workspace
 ```
