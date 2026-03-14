@@ -2,14 +2,14 @@
 PromptDA inference wrapper for RealSense input.
 Encapsulates model loading, preprocessing, and inference.
 
-Available checkpoints (all use encoder=vits, place in models/promptDA/):
+Available checkpoints (all use encoder=vits, place in models/promptda/):
   PromptDA-s-transparent.ckpt  -- vits, fine-tuned for transparent objects (default)
   PromptDA-s.ckpt              -- vits, general
   PromptDA-l.ckpt              -- vitl, general (larger, more accurate)
 
 Benchmark:
-  python -m robot_motion_interface.utils.promptda_utils
-  python -m robot_motion_interface.utils.promptda_utils --encoder vitl --ckpt models/promptDA/PromptDA-l.ckpt
+  python -m robot_motion_interface.utils.promptda_utils --encoder vits --ckpt models/promptda/PromptDA-s-transparent.ckpt
+  python -m robot_motion_interface.utils.promptda_utils --encoder vitl --ckpt models/promptda/PromptDA-l.ckpt
 """
 
 import cv2
@@ -107,7 +107,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Benchmark PromptDA throughput")
     parser.add_argument("--ckpt",    type=str, default=None,
-                        help="Checkpoint path (default: models/promptDA/PromptDA-s-transparent.ckpt)")
+                        help="Checkpoint path (default: models/promptda/PromptDA-s-transparent.ckpt)")
     parser.add_argument("--encoder", type=str, default="vits", choices=["vits", "vitl"])
     parser.add_argument("--device",  type=str, default="cuda")
     parser.add_argument("--width",   type=int, default=640)
@@ -116,7 +116,7 @@ if __name__ == "__main__":
     parser.add_argument("--iters",   type=int, default=20)
     args = parser.parse_args()
 
-    ckpt_path = args.ckpt if args.ckpt is not None else str(_MODELS / "PromptDA-s-transparent.ckpt")
+    ckpt_path = args.ckpt if args.ckpt is not None else str(_MODELS / "promptda/PromptDA-s-transparent.ckpt")
     if not Path(ckpt_path).is_absolute():
         ckpt_path = str(_REPO_ROOT / ckpt_path)
 

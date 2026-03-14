@@ -19,10 +19,36 @@ Flow:
             obj["concept"], obj["instance_idx"]
 
 Benchmark:
+    # sam2.1_hiera_small fps: 51.2hz / 59.2hz(--compile)
     python -m robot_motion_interface.utils.sam2_w_prompt \
-        --sam3_ckpt models/sam3/efficient_sam3_image_encoder_mobileclip_s0_ctx16.pt \
+        --sam3_ckpt models/sam3/sam3.pt \
         --sam2_ckpt models/sam2/sam2.1_hiera_small.pt \
-        --frames_dir models/data_examples/hand_setup_frames
+        --frames_dir models/data_examples/hand_setup_frames \
+        --compile
+    
+    # sam2.1_hiera_b+(better segmentation) fps: 41.9hz / 42.0hz(--compile)
+    python -m robot_motion_interface.utils.sam2_w_prompt \
+        --sam3_ckpt models/sam3/sam3.pt \
+        --sam2_ckpt models/sam2/sam2.1_hiera_base_plus.pt \
+        --sam2_cfg configs/sam2.1/sam2.1_hiera_b+.yaml \
+        --frames_dir models/data_examples/hand_setup_frames \
+        --compile
+    
+    # with hands 
+    # sam2.1_hiera_small.pt fps:40.4hz / 41.8hz(--compile)
+    python -m robot_motion_interface.utils.sam2_w_prompt \
+        --sam3_ckpt models/sam3/sam3.pt \
+        --sam2_ckpt models/sam2/sam2.1_hiera_small.pt \
+        --frames_dir models/data_examples/hand_setup_frames \
+        --hand --compile
+    
+    # sam2.1_hiera_b+ fps: 33.6hz / 37.1hz(--compile)
+    python -m robot_motion_interface.utils.sam2_w_prompt \
+        --sam3_ckpt models/sam3/sam3.pt \
+        --sam2_ckpt models/sam2/sam2.1_hiera_base_plus.pt \
+        --sam2_cfg configs/sam2.1/sam2.1_hiera_b+.yaml \
+        --frames_dir models/data_examples/hand_setup_frames \
+        --hand --compile
 """
 
 from __future__ import annotations
@@ -31,10 +57,20 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from typing import Optional
+from typing import Dict, Optional
 
 from robot_motion_interface.utils.sam3_utils import SAM3Inference
 from robot_motion_interface.utils.sam2_utils import SAM2Inference
+
+
+def bgr2rgb(frame: np.ndarray) -> np.ndarray:
+    """Convert BGR (OpenCV / RealSense) to RGB."""
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+
+def rgb2bgr(frame: np.ndarray) -> np.ndarray:
+    """Convert RGB to BGR (for cv2.imwrite / OpenCV display)."""
+    return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
 
 def _sam3_mask_to_logits(mask: torch.Tensor, h4: int, w4: int) -> np.ndarray:
@@ -80,31 +116,34 @@ class SAM2WithPrompt:
         sam2_ckpt: str,
         sam2_cfg: str,
         sam3_ckpt: str,
-        concept_map: Optional[dict] = None,
+        concept_map: dict,
+        max_instances_per_concept: dict,
         device: str = "cuda",
         compile: bool = True,
     ):
         """
         Args:
-            sam2_ckpt:   Path to SAM2 checkpoint.
-            sam2_cfg:    SAM2 Hydra config name, e.g. "configs/sam2.1/sam2.1_hiera_s.yaml".
-            sam3_ckpt:   Path to SAM3 checkpoint (sam3.pt).
-            concept_map: {text_prompt: object_id} dict.
-                         Defaults to SAM3Inference.DEFAULT_CONCEPT_MAP
-                         ({"robot arm": 1, "cup": 3}).
-            device:      torch device string ("cuda" or "cpu").
-            compile:     Apply torch.compile to both models (CUDA only).
+            sam2_ckpt:                  Path to SAM2 checkpoint.
+            sam2_cfg:                   SAM2 Hydra config name, e.g. "configs/sam2.1/sam2.1_hiera_s.yaml".
+            sam3_ckpt:                  Path to SAM3 checkpoint (sam3.pt).
+            use_hand:                   Include TEXT_HAND in detection. Ignored when concept_map is
+                                        provided explicitly.
+            concept_map:                {text_prompt: object_id}. Overrides use_hand when provided.
+            max_instances_per_concept:  {object_id: max_count}. Defaults to 1 per concept if not set.
+                                        E.g. {CONCEPT_ARM: 2, CONCEPT_HAND: 2} for bimanual tracking.
+            device:                     torch device string ("cuda" or "cpu").
+            compile:                    Apply torch.compile to SAM2 (CUDA only).
         """
         self.device = device
         self._objects: list[dict] = []
-        self._first_frame = False
 
         self.sam3 = SAM3Inference(
             ckpt_path=sam3_ckpt,
+            concept_map=concept_map,
             mode="sam3",
             device=device,
             compile=False,
-            concept_map=concept_map,
+            max_instances_per_concept=max_instances_per_concept,
         )
         self.sam2 = SAM2Inference(
             ckpt_path=sam2_ckpt,
@@ -125,12 +164,12 @@ class SAM2WithPrompt:
         SAM3 is NOT released here — init_prompt() still needs it.
 
         Args:
-            frame: (H, W, 3) uint8 BGR frame (any representative frame).
+            frame: (H, W, 3) uint8 BGR frame.
             n:     Number of warmup iterations (default 3).
         """
         h, w = frame.shape[:2]
         dummy_box = np.array([w // 4, h // 4, 3 * w // 4, 3 * h // 4], dtype=np.float32)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb = bgr2rgb(frame)
 
         print(f"  Warming up SAM2 ({n} iters) ...")
         for _ in range(n):
@@ -158,7 +197,7 @@ class SAM2WithPrompt:
         SAM3 is offloaded to CPU after this call to free VRAM.
 
         Args:
-            frame: (H, W, 3) uint8 BGR initialisation frame.
+            frame: (H, W, 3) uint8 BGR frame.
 
         Returns:
             List of object dicts (same format as sam2_infer).
@@ -168,7 +207,7 @@ class SAM2WithPrompt:
         h4, w4 = h // 4, w // 4
 
         self._objects.clear()
-        sam3_results = self.sam3.infer(frame)
+        sam3_results = self.sam3.infer(frame)  # SAM3 expects BGR
 
         for obj_id, result in sam3_results.items():
             concept = result["concept"]
@@ -191,8 +230,8 @@ class SAM2WithPrompt:
                     sam3_logits = _sam3_mask_to_logits(masks[i], h4, w4)
                 instances.append((box, score, sam3_logits))
 
-            if concept == "robot arm":
-                # Sort by box x-center: instance_idx 0 = left arm, 1 = right arm
+            if self.sam3.max_instances.get(obj_id, 1) > 1:
+                # Sort by box x-center: instance_idx 0 = left, 1 = right
                 instances.sort(key=lambda t: (t[0][0] + t[0][2]) / 2)
 
             for i, (box, score, sam3_logits) in enumerate(instances):
@@ -200,13 +239,14 @@ class SAM2WithPrompt:
                     "concept":      concept,
                     "obj_id":       obj_id,
                     "instance_idx": i,
-                    "box":          box,
-                    "sam3_logits":  sam3_logits,  # (1, h4, w4) float32
+                    "box":          box,         # SAM3 init box (kept for reference)
+                    "sam3_logits":  sam3_logits, # (1, h4, w4) float32
+                    "_track_box":   box.copy(),  # box prompt updated each frame from mask
                     "prev_logits":  None,
                     "mask":         None,
                     "score":        float(score),
                 })
-                side = f" ({'left' if i == 0 else 'right'})" if concept == "robot arm" else ""
+                side = f" ({'left' if i == 0 else 'right'})" if self.sam3.max_instances.get(obj_id, 1) > 1 else ""
                 print(f"  [init_prompt] {concept}#{i}{side}  box={box.astype(int)}  score={score:.3f}")
 
         # Offload SAM3 to CPU — VRAM freed
@@ -215,7 +255,6 @@ class SAM2WithPrompt:
             torch.cuda.empty_cache()
         print("  SAM3 offloaded to CPU.")
 
-        self._first_frame = True
         return list(self._objects)
 
     # ── Per-frame SAM2 tracking ─────────────────────────────────────────────
@@ -223,7 +262,7 @@ class SAM2WithPrompt:
     @torch.inference_mode()
     def sam2_infer(self, frame: np.ndarray) -> list[dict]:
         """
-        Track all objects in one BGR frame using SAM2 only.
+        Track all objects in one RGB frame using SAM2 only.
 
         First call after init_prompt(): SAM2 is prompted with box (from SAM3).
         All subsequent calls: only prev_logits are used (self-tracking).
@@ -242,20 +281,15 @@ class SAM2WithPrompt:
         if not self._objects:
             return []
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
         with torch.autocast(self.sam2.device.type, dtype=torch.bfloat16):
-            self.sam2.predictor.set_image(rgb)
+            self.sam2.predictor.set_image(bgr2rgb(frame))  # SAM2 expects RGB
 
             for obj in self._objects:
-                if self._first_frame:
-                    # First frame: use SAM3 box as prompt, SAM3 logits are skipped
-                    # (box alone gives SAM2 a clean init; SAM3 mask quality is uneven)
-                    box_arg        = obj["box"]
-                    mask_input_arg = None
-                else:
-                    box_arg        = None
-                    mask_input_arg = obj["prev_logits"]  # (1, h4, w4)
+                # Box prompt: SAM3 box on first frame, then derived from prev mask.
+                # Providing a box every frame gives SAM2 a spatial anchor and
+                # prevents the mask from drifting when using mask_input only.
+                box_arg        = obj["_track_box"]   # None on very first call
+                mask_input_arg = obj["prev_logits"]  # None on very first call
 
                 if box_arg is None and mask_input_arg is None:
                     continue
@@ -268,11 +302,18 @@ class SAM2WithPrompt:
                     multimask_output=False,
                     return_logits=True,
                 )
-                obj["mask"]        = masks[0]     # (H, W) bool
+                obj["mask"]        = masks[0] > 0.0  # binarize full-res logits
                 obj["score"]       = float(scores[0])
-                obj["prev_logits"] = logits[[0]]  # (1, h4, w4) float32
+                obj["prev_logits"] = logits[[0]]     # (1, h4, w4) float32
 
-        self._first_frame = False
+                # Update tracking box for next frame from current mask
+                if obj["mask"].any():
+                    ys, xs = np.where(obj["mask"])
+                    obj["_track_box"] = np.array(
+                        [xs.min(), ys.min(), xs.max(), ys.max()], dtype=np.float32
+                    )
+                # If mask is empty, keep previous _track_box so SAM2 still has an anchor
+
         return list(self._objects)
 
 
@@ -287,24 +328,32 @@ _PALETTE = [
 ]
 
 
-def draw_results(bgr: np.ndarray, objects: list[dict]) -> np.ndarray:
-    """Overlay masks and bounding boxes on a BGR frame."""
-    vis = bgr.copy()
+def draw_results(frame: np.ndarray, objects: list[dict]) -> np.ndarray:
+    """Overlay masks and bounding boxes on a frame.
+
+    Box is derived from the current SAM2 mask, not the SAM3 init box.
+    Skips objects whose mask is None or empty.
+    """
+    vis = frame.copy()
     for i, obj in enumerate(objects):
-        color = _PALETTE[i % len(_PALETTE)]
         mask = obj.get("mask")
-        if mask is not None:
-            colored = np.zeros_like(vis)
-            colored[:, :] = color
-            vis = np.where(mask[:, :, None],
-                           (vis * 0.55 + colored * 0.45).astype(np.uint8), vis)
-        box = obj.get("box")
-        if box is not None:
-            x1, y1, x2, y2 = box.astype(int)
-            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-            label = f"{obj['concept']}#{obj['instance_idx']} {obj['score']:.2f}"
-            cv2.putText(vis, label, (x1, y1 - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+        if mask is None or not mask.any():
+            continue
+        color = _PALETTE[i % len(_PALETTE)]
+
+        # Mask overlay
+        colored = np.zeros_like(vis)
+        colored[:, :] = color
+        vis = np.where(mask[:, :, None],
+                       (vis * 0.55 + colored * 0.45).astype(np.uint8), vis)
+
+        # Bounding box derived from current mask
+        ys, xs = np.where(mask)
+        x1, y1, x2, y2 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+        label = f"{obj['concept']}#{obj['instance_idx']} {obj['score']:.2f}"
+        cv2.putText(vis, label, (x1, max(y1 - 6, 0)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
     return vis
 
 
@@ -327,6 +376,8 @@ if __name__ == "__main__":
                         default="configs/sam2.1/sam2.1_hiera_s.yaml")
     parser.add_argument("--device",    default="cuda")
     parser.add_argument("--compile",   action="store_true")
+    parser.add_argument("--hand",      action="store_true",
+                        help="Also track 'robot hand' (left + right). Default: arm + cup only.")
     parser.add_argument("--warmup",    type=int, default=3)
     parser.add_argument("--frames_dir",default=None)
     parser.add_argument("--out_dir",   default=None)
@@ -334,6 +385,36 @@ if __name__ == "__main__":
     parser.add_argument("--width",     type=int,   default=640)
     parser.add_argument("--height",    type=int,   default=480)
     args = parser.parse_args()
+    
+    
+    # Text prompts sent to SAM3. Change these strings to adjust detection vocabulary.
+    TEXT_ARM  = "robot arm"
+    TEXT_HAND = "robot hand"
+    TEXT_OBJ  = "box"
+
+    CONCEPT_ARM  = 1   # single prompt, up to 2 instances (both arms)
+    CONCEPT_HAND = 2   # single prompt, up to 2 instances (both hands)
+    CONCEPT_OBJ  = 3
+
+    # Default concept map: text prompt → SAM3 object ID.
+    if args.hand:
+        DEFAULT_CONCEPT_MAP: Dict[str, int] = {
+            TEXT_ARM:  CONCEPT_ARM,
+            TEXT_HAND: CONCEPT_HAND,
+            TEXT_OBJ:  CONCEPT_OBJ,
+        }
+    else:
+        DEFAULT_CONCEPT_MAP: Dict[str, int] = {
+            TEXT_ARM:  CONCEPT_ARM,
+            TEXT_OBJ:  CONCEPT_OBJ,
+        }
+
+    # Default max instances per concept ID (bimanual = 2, objects = 1).
+    DEFAULT_MAX_INSTANCES: Dict[int, int] = {
+        CONCEPT_ARM:  2,
+        CONCEPT_HAND: 2,
+        CONCEPT_OBJ:  1,
+    }
 
     def _resolve(p: str) -> str:
         path = Path(p)
@@ -379,6 +460,8 @@ if __name__ == "__main__":
         sam2_ckpt=_resolve(args.sam2_ckpt),
         sam2_cfg=args.sam2_cfg,
         sam3_ckpt=_resolve(args.sam3_ckpt),
+        concept_map=DEFAULT_CONCEPT_MAP,
+        max_instances_per_concept=DEFAULT_MAX_INSTANCES,
         device=args.device,
         compile=args.compile,
     )
@@ -401,7 +484,7 @@ if __name__ == "__main__":
     if not init_objects:
         raise RuntimeError(
             "SAM3 found no objects. Check that --frames_dir points to frames "
-            "containing the target concepts (robot arm, cup)."
+            f"containing the target concepts ({TEXT_ARM}, {TEXT_OBJ})."
         )
     print(f"Tracking {len(init_objects)} object(s): "
           f"{[(o['concept'], o['instance_idx']) for o in init_objects]}\n")

@@ -64,6 +64,7 @@ Three modes are supported (controlled by the `mode` argument):
                      --backbone_type tinyvit --model_name 11m
 """
 
+import time
 import cv2
 import numpy as np
 import torch
@@ -74,11 +75,26 @@ from sam3.model.sam3_image_processor import Sam3Processor
 
 
 # Object IDs assigned to each semantic concept (fixed at init, used downstream)
-CONCEPT_ARM = 1   # single prompt, up to 2 instances (both arms)
-CONCEPT_CUP = 3
+CONCEPT_ARM  = 1   # single prompt, up to 2 instances (both arms)
+CONCEPT_HAND = 2   # single prompt, up to 2 instances (both hands)
+CONCEPT_CUP  = 3
 
 # Supported mode strings
 _MODES = ("sam3", "litetext", "efficient")
+
+# Default concept map used by the benchmark (callers may pass their own)
+DEFAULT_CONCEPT_MAP: Dict[str, int] = {
+    "robot arm":  CONCEPT_ARM,
+    "robot hand": CONCEPT_HAND,
+    "cup":        CONCEPT_CUP,
+}
+
+# Default max instances per concept ID for the benchmark
+DEFAULT_MAX_INSTANCES: Dict[int, int] = {
+    CONCEPT_ARM:  2,
+    CONCEPT_HAND: 2,
+    CONCEPT_CUP:  1,
+}
 
 
 def _build_model(
@@ -171,18 +187,14 @@ class SAM3Inference:
     """
 
     # Default concept map for this project: text_prompt -> object_id
-    DEFAULT_CONCEPT_MAP: Dict[str, int] = {
-        "robot arm": CONCEPT_ARM,   # returns up to N instances; top-2 = both arms
-        "cup":       CONCEPT_CUP,
-    }
 
     def __init__(
         self,
         ckpt_path: str,
+        concept_map: Dict[str, int],
         mode: str = "sam3",
         device: str = "cuda",
         compile: bool = True,
-        concept_map: Optional[Dict[str, int]] = None,
         confidence_threshold: float = 0.5,
         max_instances_per_concept: Optional[Dict[int, int]] = None,
         nms_iou_threshold: float = 0.5,
@@ -196,12 +208,13 @@ class SAM3Inference:
         """
         Args:
             ckpt_path:                  Path to the checkpoint (.pt / .pth) file.
+            concept_map:                Required. Maps text prompt → integer object_id.
+                                        E.g. {"robot arm": 1, "cup": 3}.
+                                        All detection results are keyed by object_id.
             mode:                       One of "sam3" | "litetext" | "efficient".
             device:                     torch device string ("cuda" or "cpu").
             compile:                    Apply torch.compile for faster per-frame
                                         inference (CUDA only; first call triggers warm-up).
-            concept_map:                Optional override for {text_prompt: object_id}.
-                                        Defaults to DEFAULT_CONCEPT_MAP.
             confidence_threshold:       Detection score threshold; lower → more recalls.
 
             backbone_type:              [mode="efficient" only]
@@ -222,12 +235,9 @@ class SAM3Inference:
             raise ValueError(f"mode must be one of {_MODES}, got '{mode}'")
 
         self.device = device
-        self.concept_map = concept_map if concept_map is not None else self.DEFAULT_CONCEPT_MAP
-        # Default: arm concept allows 2 instances, everything else 1
-        self.max_instances: Dict[int, int] = (
-            max_instances_per_concept if max_instances_per_concept is not None
-            else {CONCEPT_ARM: 2, CONCEPT_CUP: 1}
-        )
+        self.concept_map = concept_map
+        # max_instances: fallback to 1 per concept if not specified
+        self.max_instances: Dict[int, int] = max_instances_per_concept or {}
         self.nms_iou_threshold = nms_iou_threshold
 
         model = _build_model(
@@ -304,15 +314,14 @@ class SAM3Inference:
 
 # ── Benchmark entry point ──────────────────────────────────────────────────────
 
-# Colours (BGR) per concept object ID for visualisation
-_VIS_COLORS = {
-    CONCEPT_ARM: (0,  80, 255),   # orange-red (all arm instances)
-    CONCEPT_CUP: (0, 200,   0),   # green
-}
-# Per-instance color offsets for multiple arm detections (instance 0, 1, ...)
-_ARM_INSTANCE_COLORS = [
-    (0,  80, 255),   # instance 0 — orange-red
-    (255, 80,  0),   # instance 1 — blue
+# Generic colour palette (BGR) — cycles across (obj_id, instance_idx) pairs
+_VIS_PALETTE = [
+    (0,   80, 255),   # orange-red
+    (255,  80,   0),  # blue
+    (0,  200,   0),   # green
+    (200,   0, 200),  # purple
+    (0,  200, 200),   # yellow
+    (200, 200,   0),  # cyan
 ]
 
 
@@ -322,16 +331,14 @@ def _draw_results(frame: np.ndarray, results: Dict[int, dict]) -> np.ndarray:
     overlay = vis.copy()
     h, w = vis.shape[:2]
 
-    for obj_id, res in results.items():
+    color_idx = 0
+    for _, res in results.items():
         label = res["concept"]
         n = len(res["masks"]) if res["masks"] is not None else 0
 
         for idx in range(n):
-            # Per-instance colour (ARM cycles through _ARM_INSTANCE_COLORS, others use _VIS_COLORS)
-            if obj_id == CONCEPT_ARM:
-                color = _ARM_INSTANCE_COLORS[idx % len(_ARM_INSTANCE_COLORS)]
-            else:
-                color = _VIS_COLORS.get(obj_id, (200, 200, 200))
+            color = _VIS_PALETTE[color_idx % len(_VIS_PALETTE)]
+            color_idx += 1
 
             # Mask overlay
             mask = res["masks"][idx, 0].cpu().numpy()   # (H, W) bool
@@ -443,9 +450,11 @@ if __name__ == "__main__":
     t_load = time.time()
     sam3 = SAM3Inference(
         ckpt_path=ckpt_path,
+        concept_map=DEFAULT_CONCEPT_MAP,
         mode=args.mode,
         device=args.device,
         compile=args.compile,
+        max_instances_per_concept=DEFAULT_MAX_INSTANCES,
         backbone_type=args.backbone_type,
         model_name=args.model_name,
         text_encoder_type=args.text_encoder_type,
@@ -480,9 +489,9 @@ if __name__ == "__main__":
         latencies.append(ms)
 
         det_summary = "  ".join(
-            f"{results[oid]['concept'].split()[0]}="
-            f"{len(results[oid]['masks']) if results[oid]['masks'] is not None else 0}det"
-            for oid in (CONCEPT_ARM, CONCEPT_CUP)
+            f"{res['concept'].split()[0]}="
+            f"{len(res['masks']) if res['masks'] is not None else 0}det"
+            for res in results.values()
         )
         label = "frame" if mode == "folder" else "iter"
         print(f"  {label} {i+1:>4d}/{len(frame_paths)}: {ms:>7.2f} ms  [{det_summary}]")
