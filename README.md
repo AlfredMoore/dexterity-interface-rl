@@ -151,7 +151,7 @@ ros2 run robot_motion_interface_ros test_curobo
 
 Attach to Policy Container
 ```bash
-docker exec -it handrl-policy bash
+docker exec -it -e DISPLAY=$DISPLAY handrl-policy bash
 ```
 
 
