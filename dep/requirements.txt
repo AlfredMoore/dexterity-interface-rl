@@ -19,7 +19,7 @@ imageio-ffmpeg
 # These may trigger dependency resolution; torch==2.7.0 lock will prevent downgrades
 lightning
 xformers
-transformers
+transformers==4.49.0
 torchmetrics
 fvcore
 
