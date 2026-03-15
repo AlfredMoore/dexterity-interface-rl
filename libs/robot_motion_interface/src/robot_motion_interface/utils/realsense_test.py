@@ -44,15 +44,34 @@ _d_intrinsics = _rs_config['depth_intrinsics']
 rs_pipeline = rs.pipeline()
 rs_config = rs.config()
 rs_config.enable_stream(
-    rs.stream.color, 
-    _c_intrinsics['width'], 
-    _c_intrinsics['height'], 
-    rs.format.bgr8, 
-    _rs_fps
+    rs.stream.color,
+    _c_intrinsics['width'],
+    _c_intrinsics['height'],
+    rs.format.bgr8,
+    _rs_fps,
 )
-# rs_config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, _rs_fps)
+rs_config.enable_stream(
+    rs.stream.depth,
+    _d_intrinsics['width'],
+    _d_intrinsics['height'],
+    rs.format.z16,
+    _rs_fps,
+)
 rs_profile = rs_pipeline.start(rs_config)
-# rs_align = rs.align(rs.stream.color)  # align depth -> color frame
+rs_align = rs.align(rs.stream.color)
+
+decimation = rs.decimation_filter()
+decimation.set_option(rs.option.filter_magnitude, 2)  # 640x480 → 320x240
+
+hole_filling = rs.hole_filling_filter()
+hole_filling.set_option(rs.option.holes_fill, 2)      # fill with far neighbour
+
+def reset_camera():
+    ctx = rs.context()
+    devices = ctx.query_devices()
+    for dev in devices:
+        print(f"restarting: {dev.get_info(rs.camera_info.name)}")
+        dev.hardware_reset()
 
 def _apply_sensor_settings(profile: rs.pipeline_profile) -> None:
     if not _sensor_settings:
@@ -108,24 +127,57 @@ sensor_profiles(rs_profile)
 _apply_sensor_settings(rs_profile)
 print("Sensor settings applied")
 
+try:
+    _depth_scale = float(rs_profile.get_device().first_depth_sensor().get_depth_scale())
+except Exception:
+    _depth_scale = 0.001
+
 rs_device = rs_profile.get_device()
 print(
     f"RealSense initialized:\n"
     f"  device={rs_device.get_info(rs.camera_info.name)}\n"
     f"  serial={rs_device.get_info(rs.camera_info.serial_number)}\n"
-    f"  color=640x480@{_rs_fps}fps\n"
-        )
+    f"  color={_c_intrinsics['width']}x{_c_intrinsics['height']}@{_rs_fps}fps\n"
+    f"  depth={_d_intrinsics['width']}x{_d_intrinsics['height']}@{_rs_fps}fps\n"
+    f"  depth_scale={_depth_scale}\n"
+)
+
+
+def _depth_to_colormap(depth_u16: np.ndarray) -> np.ndarray:
+    depth_m = depth_u16.astype(np.float32) * _depth_scale
+    valid = depth_m > 0
+    lo, hi = (np.percentile(depth_m[valid], (2, 98)) if valid.any() else (0.0, 1.0))
+    norm = np.clip((depth_m - lo) / (hi - lo + 1e-6), 0, 1)
+    return cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+
 
 try:
     while True:
-        frames =rs_pipeline.poll_for_frames()
-        if not frames:
+        try:
+            frames = rs_pipeline.wait_for_frames(timeout_ms=2000)
+            if not frames:
+                time.sleep(0.001)
+                continue
+        except RuntimeError:
+            reset_camera()
+            print("[warn] wait_for_frames timed out, resetting camera and retrying...")
+            time.sleep(1)
             continue
-        color_frame = frames.get_color_frame()
-        if not color_frame:
+
+        frames = decimation.process(frames).as_frameset()
+        frames = hole_filling.process(frames).as_frameset()
+
+        aligned_frames = rs_align.process(frames)
+        color_frame = aligned_frames.get_color_frame()
+        depth_frame = aligned_frames.get_depth_frame()
+        if not color_frame or not depth_frame:
             continue
-        img = np.asanyarray(color_frame.get_data())
-        cv2.imshow('preview', img)
+        color = np.array(color_frame.get_data())
+        depth = np.array(depth_frame.get_data())
+        depth_vis = _depth_to_colormap(depth)
+        h, w = color.shape[:2]
+        if depth_vis.shape[:2] != (h, w): depth_vis = cv2.resize(depth_vis, (w, h), interpolation=cv2.INTER_NEAREST)
+        cv2.imshow('preview', np.concatenate([color, depth_vis], axis=1))
         if cv2.waitKey(1) == ord('q'):
             break
         time.sleep(0.001)

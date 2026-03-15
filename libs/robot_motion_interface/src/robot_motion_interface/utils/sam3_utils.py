@@ -77,7 +77,7 @@ from sam3.model.sam3_image_processor import Sam3Processor
 # Object IDs assigned to each semantic concept (fixed at init, used downstream)
 CONCEPT_ARM  = 1   # single prompt, up to 2 instances (both arms)
 CONCEPT_HAND = 2   # single prompt, up to 2 instances (both hands)
-CONCEPT_CUP  = 3
+CONCEPT_OBJ  = 3
 
 # Supported mode strings
 _MODES = ("sam3", "litetext", "efficient")
@@ -85,15 +85,15 @@ _MODES = ("sam3", "litetext", "efficient")
 # Default concept map used by the benchmark (callers may pass their own)
 DEFAULT_CONCEPT_MAP: Dict[str, int] = {
     "robot arm":  CONCEPT_ARM,
-    "robot hand": CONCEPT_HAND,
-    "cup":        CONCEPT_CUP,
+    # "robot hand": CONCEPT_HAND,
+    "cup":        CONCEPT_OBJ,
 }
 
 # Default max instances per concept ID for the benchmark
 DEFAULT_MAX_INSTANCES: Dict[int, int] = {
     CONCEPT_ARM:  2,
     CONCEPT_HAND: 2,
-    CONCEPT_CUP:  1,
+    CONCEPT_OBJ:  1,
 }
 
 
@@ -312,6 +312,31 @@ class SAM3Inference:
         return results
 
 
+    def merge_masks(self, results: Dict[int, dict], obj_ids: Optional[list] = None) -> Dict[int, Optional[torch.Tensor]]:
+        """
+        Merge all per-instance masks for each concept into a single binary mask.
+
+        Args:
+            results:  Output of SAM3Inference.infer() — dict[obj_id -> {masks, ...}].
+            obj_ids:  List of obj_ids to process. None = all obj_ids in results.
+
+        Returns:
+            dict[obj_id -> merged_mask] where merged_mask is:
+                (1, H, W) bool tensor  — union of all instance masks for that concept.
+                None                   — if the concept had no detections.
+        """
+        ids = obj_ids if obj_ids is not None else list(results.keys())
+        merged: Dict[int, Optional[torch.Tensor]] = {}
+        for oid in ids:
+            res = results.get(oid)
+            if res is None or res["masks"] is None:
+                merged[oid] = None
+                continue
+            # masks: (N, 1, H, W) bool — reduce across instance dim
+            merged[oid] = res["masks"].any(dim=0, keepdim=False)  # (1, H, W) bool
+        return merged
+
+
 # ── Benchmark entry point ──────────────────────────────────────────────────────
 
 # Generic colour palette (BGR) — cycles across (obj_id, instance_idx) pairs
@@ -402,15 +427,19 @@ if __name__ == "__main__":
     # ── Resolve checkpoint path ────────────────────────────────────────────────
     ckpt_path = args.ckpt or str(_REPO_ROOT / "models" / "sam3" / _DEFAULT_CKPT[args.mode])
 
+    def _resolve(p: str) -> Path:
+        path = Path(p)
+        return _REPO_ROOT / path if not path.is_absolute() else path
+
     # ── Frame list ─────────────────────────────────────────────────────────────
     if args.frames_dir is not None:
-        frames_dir  = Path(args.frames_dir)
+        frames_dir  = _resolve(args.frames_dir)
         frame_paths = sorted(p for p in frames_dir.iterdir()
                              if p.suffix.lower() in (".jpg", ".jpeg", ".png"))
         if not frame_paths:
             raise FileNotFoundError(f"No jpg/png frames in: {frames_dir}")
-        out_dir = Path(args.out_dir) if args.out_dir else \
-                  frames_dir.parent / (frames_dir.name + "_annotated")
+        out_dir = _resolve(args.out_dir) if args.out_dir else \
+                  frames_dir.parent / (frames_dir.name + "_sam3")
         out_dir.mkdir(parents=True, exist_ok=True)
         mode = "folder"
     else:
@@ -489,7 +518,7 @@ if __name__ == "__main__":
         latencies.append(ms)
 
         det_summary = "  ".join(
-            f"{res['concept'].split()[0]}="
+            f"{res['concept']}="
             f"{len(res['masks']) if res['masks'] is not None else 0}det"
             for res in results.values()
         )
@@ -497,7 +526,20 @@ if __name__ == "__main__":
         print(f"  {label} {i+1:>4d}/{len(frame_paths)}: {ms:>7.2f} ms  [{det_summary}]")
 
         if mode == "folder":
+            merged = sam3.merge_masks(results, obj_ids=[CONCEPT_ARM])
+            arm_mask = merged[CONCEPT_ARM]  # (1, H, W) bool or None
             vis = _draw_results(frame, results)
+            if arm_mask is not None:
+                # Draw merged arm mask as a filled green overlay
+                arm_np = arm_mask[0].cpu().numpy()  # (H, W) bool
+                arm_np = cv2.resize(arm_np.astype(np.uint8),
+                                    (frame.shape[1], frame.shape[0]),
+                                    interpolation=cv2.INTER_NEAREST).astype(bool)
+                overlay = vis.copy()
+                overlay[arm_np] = (0, 255, 0)
+                cv2.addWeighted(overlay, 0.4, vis, 0.6, 0, vis)
+                cv2.putText(vis, "arm(merged)", (8, vis.shape[0] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
             cv2.imwrite(str(out_dir / fpath.name), vis)
 
     latencies_ms = latencies

@@ -49,6 +49,15 @@ Benchmark:
         --sam2_cfg configs/sam2.1/sam2.1_hiera_b+.yaml \
         --frames_dir models/data_examples/hand_setup_frames \
         --hand --compile
+        
+    # real data
+    python -m robot_motion_interface.utils.sam2_w_prompt \
+        --sam3_ckpt models/sam3/sam3.pt \
+        --sam2_ckpt models/sam2/sam2.1_hiera_base_plus.pt \
+        --sam2_cfg configs/sam2.1/sam2.1_hiera_b+.yaml \
+        --frames_dir models/data_examples/realsense/rs_record_20260314_223830/color \
+        --video_fps 60 \
+        --compile
 """
 
 from __future__ import annotations
@@ -59,9 +68,34 @@ import torch
 import torch.nn.functional as F
 from typing import Dict, Optional
 
-from robot_motion_interface.utils.sam3_utils import SAM3Inference
+from robot_motion_interface.utils.sam3_utils import SAM3Inference, CONCEPT_ARM as _SAM3_CONCEPT_ARM
 from robot_motion_interface.utils.sam2_utils import SAM2Inference
 
+
+# Text prompts sent to SAM3. Change these strings to adjust detection vocabulary.
+TEXT_ARM  = "robot arm"
+TEXT_HAND = "robot hand"
+TEXT_OBJ  = "box"
+
+CONCEPT_ARM  = 1   # single prompt, up to 2 instances (both arms)
+CONCEPT_HAND = 2   # single prompt, up to 2 instances (both hands)
+CONCEPT_OBJ  = 3
+
+# Default concept map: text prompt → SAM3 object ID.
+
+DEFAULT_CONCEPT_MAP: Dict[str, int] = {
+    TEXT_ARM:  CONCEPT_ARM,
+    # TEXT_HAND: CONCEPT_HAND,
+    TEXT_OBJ:  CONCEPT_OBJ,
+}
+
+
+# Default max instances per concept ID (bimanual = 2, objects = 1).
+DEFAULT_MAX_INSTANCES: Dict[int, int] = {
+    CONCEPT_ARM:  2,
+    CONCEPT_HAND: 2,
+    CONCEPT_OBJ:  1,
+}
 
 def bgr2rgb(frame: np.ndarray) -> np.ndarray:
     """Convert BGR (OpenCV / RealSense) to RGB."""
@@ -120,6 +154,7 @@ class SAM2WithPrompt:
         max_instances_per_concept: dict,
         device: str = "cuda",
         compile: bool = True,
+        merge_arm_mask: bool = True,
     ):
         """
         Args:
@@ -135,6 +170,7 @@ class SAM2WithPrompt:
             compile:                    Apply torch.compile to SAM2 (CUDA only).
         """
         self.device = device
+        self._merge_arm_mask = merge_arm_mask
         self._objects: list[dict] = []
 
         self.sam3 = SAM3Inference(
@@ -219,10 +255,39 @@ class SAM2WithPrompt:
                 print(f"  [init_prompt] no detections for '{concept}'")
                 continue
 
+            # ── Merged arm path ─────────────────────────────────────────────
+            # When merge_arm_mask is enabled, collapse all arm instances into
+            # one SAM2 object using the union mask and its bounding box.
+            if self._merge_arm_mask and obj_id == _SAM3_CONCEPT_ARM and masks is not None:
+                merged = self.sam3.merge_masks(sam3_results, obj_ids=[_SAM3_CONCEPT_ARM])
+                merged_mask = merged[_SAM3_CONCEPT_ARM]  # (1, H, W) bool or None
+                if merged_mask is not None:
+                    ys, xs = torch.where(merged_mask[0])
+                    merged_box = np.array(
+                        [xs.min().item(), ys.min().item(),
+                         xs.max().item(), ys.max().item()], dtype=np.float32
+                    )
+                    sam3_logits = _sam3_mask_to_logits(merged_mask, h4, w4)
+                    mean_score  = float(scores.mean().cpu())
+                    self._objects.append({
+                        "concept":      concept,
+                        "obj_id":       obj_id,
+                        "instance_idx": 0,
+                        "box":          merged_box,
+                        "sam3_logits":  sam3_logits,
+                        "_track_box":   merged_box.copy(),
+                        "prev_logits":  None,
+                        "mask":         None,
+                        "score":        mean_score,
+                    })
+                    print(f"  [init_prompt] {concept}(merged)  box={merged_box.astype(int)}  "
+                          f"instances={len(boxes)}  score={mean_score:.3f}")
+                continue
+
+            # ── Per-instance path (all other concepts) ───────────────────────
             boxes_np  = boxes.cpu().numpy().astype(np.float32)
             scores_np = scores.cpu().numpy().astype(np.float32)
 
-            # Collect instances first, then sort robot arm by x-center (left→right)
             instances = []
             for i, (box, score) in enumerate(zip(boxes_np, scores_np)):
                 sam3_logits = None
@@ -239,9 +304,9 @@ class SAM2WithPrompt:
                     "concept":      concept,
                     "obj_id":       obj_id,
                     "instance_idx": i,
-                    "box":          box,         # SAM3 init box (kept for reference)
-                    "sam3_logits":  sam3_logits, # (1, h4, w4) float32
-                    "_track_box":   box.copy(),  # box prompt updated each frame from mask
+                    "box":          box,
+                    "sam3_logits":  sam3_logits,
+                    "_track_box":   box.copy(),
                     "prev_logits":  None,
                     "mask":         None,
                     "score":        float(score),
@@ -376,8 +441,6 @@ if __name__ == "__main__":
                         default="configs/sam2.1/sam2.1_hiera_s.yaml")
     parser.add_argument("--device",    default="cuda")
     parser.add_argument("--compile",   action="store_true")
-    parser.add_argument("--hand",      action="store_true",
-                        help="Also track 'robot hand' (left + right). Default: arm + cup only.")
     parser.add_argument("--warmup",    type=int, default=3)
     parser.add_argument("--frames_dir",default=None)
     parser.add_argument("--out_dir",   default=None)
@@ -386,35 +449,6 @@ if __name__ == "__main__":
     parser.add_argument("--height",    type=int,   default=480)
     args = parser.parse_args()
     
-    
-    # Text prompts sent to SAM3. Change these strings to adjust detection vocabulary.
-    TEXT_ARM  = "robot arm"
-    TEXT_HAND = "robot hand"
-    TEXT_OBJ  = "box"
-
-    CONCEPT_ARM  = 1   # single prompt, up to 2 instances (both arms)
-    CONCEPT_HAND = 2   # single prompt, up to 2 instances (both hands)
-    CONCEPT_OBJ  = 3
-
-    # Default concept map: text prompt → SAM3 object ID.
-    if args.hand:
-        DEFAULT_CONCEPT_MAP: Dict[str, int] = {
-            TEXT_ARM:  CONCEPT_ARM,
-            TEXT_HAND: CONCEPT_HAND,
-            TEXT_OBJ:  CONCEPT_OBJ,
-        }
-    else:
-        DEFAULT_CONCEPT_MAP: Dict[str, int] = {
-            TEXT_ARM:  CONCEPT_ARM,
-            TEXT_OBJ:  CONCEPT_OBJ,
-        }
-
-    # Default max instances per concept ID (bimanual = 2, objects = 1).
-    DEFAULT_MAX_INSTANCES: Dict[int, int] = {
-        CONCEPT_ARM:  2,
-        CONCEPT_HAND: 2,
-        CONCEPT_OBJ:  1,
-    }
 
     def _resolve(p: str) -> str:
         path = Path(p)
@@ -422,12 +456,12 @@ if __name__ == "__main__":
 
     # ── Frame list ──────────────────────────────────────────────────────────
     if args.frames_dir is not None:
-        frames_dir  = Path(args.frames_dir)
+        frames_dir  = Path(_resolve(args.frames_dir))
         frame_paths = sorted(p for p in frames_dir.iterdir()
                              if p.suffix.lower() in (".jpg", ".jpeg", ".png"))
         if not frame_paths:
             raise FileNotFoundError(f"No jpg/png frames in: {frames_dir}")
-        out_dir = Path(args.out_dir) if args.out_dir else \
+        out_dir = Path(_resolve(args.out_dir)) if args.out_dir else \
                   frames_dir.parent / (frames_dir.name + "_sam2wp")
         out_dir.mkdir(parents=True, exist_ok=True)
         mode = "folder"
