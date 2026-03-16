@@ -117,14 +117,6 @@ def main():
         help="Disable OpenCV preview window (useful when DISPLAY is unavailable).",
     )
     parser.add_argument(
-        "--decimation",
-        type=int,
-        default=None,
-        metavar="MAGNITUDE",
-        help="Apply decimation filter to depth before saving (e.g. 2 halves resolution to 320x240). "
-             "Matches cv_node behaviour for PromptDA. Omit to save full-resolution depth.",
-    )
-    parser.add_argument(
         "--duration",
         type=float,
         default=10.0,
@@ -155,12 +147,11 @@ def main():
 
     show_preview = not args.no_preview and bool(os.environ.get("DISPLAY"))
 
-    # Optional decimation filter (same as cv_node.build_rs_depth_filters)
-    decimation_filter = None
-    if args.decimation is not None:
-        decimation_filter = rs.decimation_filter()
-        decimation_filter.set_option(rs.option.filter_magnitude, args.decimation)
-        print(f"  decimation: magnitude={args.decimation} (depth output at 1/{args.decimation} resolution)")
+    # Filters: decimation(2) + hole_filling(2), applied before align
+    decimation_filter = rs.decimation_filter()
+    decimation_filter.set_option(rs.option.filter_magnitude, 2)
+    hole_filling_filter = rs.hole_filling_filter()
+    hole_filling_filter.set_option(rs.option.holes_fill, 2)
 
     # Pipeline
     pipeline  = rs.pipeline()
@@ -213,6 +204,8 @@ def main():
                 print("[warn] wait_for_frames timed out, retrying...")
                 continue
 
+            frames = decimation_filter.process(frames).as_frameset()
+            frames = hole_filling_filter.process(frames).as_frameset()
             frames = align.process(frames)
 
             color_frame = frames.get_color_frame()
@@ -222,8 +215,6 @@ def main():
 
             t_capture = time.time()
             color = np.asanyarray(color_frame.get_data())   # HxWx3 uint8 BGR
-            if decimation_filter is not None:
-                depth_frame = decimation_filter.process(depth_frame)
             depth = np.asanyarray(depth_frame.get_data())   # HxW  uint16
 
             # Save color as JPEG (lossless quality=95)

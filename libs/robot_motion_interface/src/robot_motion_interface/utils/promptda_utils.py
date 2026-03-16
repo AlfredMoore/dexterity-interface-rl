@@ -13,9 +13,10 @@ Benchmark (synthetic):
         --ckpt models/promptda/PromptDA-s-transparent.ckpt
 
 Run on recorded realsense data:
+    # 4090, 11.30s 88.5hz
     python -m robot_motion_interface.utils.promptda_utils \
         --ckpt models/promptda/PromptDA-s-transparent.ckpt \
-        --frames_dir models/data_examples/realsense/rs_record_20260314_223830
+        --frames_dir models/data_examples/realsense/rs_record_distant_20260316_053733
 """
 
 import cv2
@@ -287,20 +288,17 @@ if __name__ == "__main__":
     print("=" * 60)
 
     if mode == "folder":
+        import subprocess
         video_path = out_dir.parent / (out_dir.name + ".mp4")
         vis_paths  = sorted(p for p in out_dir.iterdir()
                             if p.suffix.lower() == ".jpg")
         if vis_paths:
-            sample = cv2.imread(str(vis_paths[0]))
-            h_v, w_v = sample.shape[:2]
-            writer = cv2.VideoWriter(
-                str(video_path), cv2.VideoWriter_fourcc(*"mp4v"),
-                args.video_fps, (w_v, h_v)
-            )
-            for p in vis_paths:
-                f = cv2.imread(str(p))
-                if f is not None:
-                    writer.write(f)
-            writer.release()
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-framerate", str(args.video_fps),
+                "-pattern_type", "glob", "-i", str(out_dir / "*.jpg"),
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                str(video_path),
+            ], check=True)
             print(f"\n  depth frames → {out_dir}")
             print(f"  video saved  → {video_path}  ({args.video_fps:.1f} fps)")

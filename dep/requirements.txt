@@ -52,6 +52,13 @@ huggingface_hub
 decord
 psutil
 
+# --- Depth Anything 3 Specific Dependencies ---
+moviepy==1.0.3
+plyfile
+pycolmap
+evo
+e3nn
+
 # --- Utilities & Debugging ---
 ipdb
 termcolor

@@ -1,0 +1,11 @@
+retargeting:
+  type: position
+  urdf_path: tesollo_dg3f_left.urdf
+
+  target_link_names: ["left_F1_TIP", "left_F2_TIP", "left_F3_TIP"]
+
+  target_link_human_indices: [0, 1, 2]
+
+  add_dummy_free_joint: true
+
+  low_pass_alpha: 1.0

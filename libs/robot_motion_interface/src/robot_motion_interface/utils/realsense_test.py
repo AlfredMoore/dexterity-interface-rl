@@ -1,3 +1,7 @@
+"""
+python -m robot_motion_interface.utils.realsense_test
+"""
+
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState

@@ -558,18 +558,15 @@ if __name__ == "__main__":
     print("=" * 60)
 
     if mode == "folder":
+        import subprocess
         video_path = out_dir.parent / (out_dir.name + ".mp4")
         video_fps  = args.video_fps
-        sample_bgr = cv2.imread(str(sorted(out_dir.iterdir())[0]))
-        h_v, w_v   = sample_bgr.shape[:2]
-        writer = cv2.VideoWriter(
-            str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), video_fps, (w_v, h_v)
-        )
-        for p in sorted(out_dir.iterdir()):
-            if p.suffix.lower() in (".jpg", ".jpeg", ".png"):
-                f = cv2.imread(str(p))
-                if f is not None:
-                    writer.write(f)
-        writer.release()
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-framerate", str(video_fps),
+            "-pattern_type", "glob", "-i", str(out_dir / "*.jpg"),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            str(video_path),
+        ], check=True)
         print(f"\n  annotated frames → {out_dir}")
         print(f"  video saved      → {video_path}  ({video_fps:.1f} fps)")
