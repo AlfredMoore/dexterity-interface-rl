@@ -1,0 +1,16 @@
+{
+  "cap_r": 0.0894,
+  "cap_h": 0.1789,
+  "body_r": 0.0977,
+  "body_h": 0.1939,
+  "finger_thickness": 0.012,
+  "n_episodes": 26,
+  "raw": {
+    "cap_r_raw": 0.1014,
+    "body_r_raw": 0.1097,
+    "cap_h_raw": 0.1789,
+    "body_h_raw": 0.1939,
+    "left_z_center": 0.001,
+    "right_z_center": -0.0264
+  }
+}

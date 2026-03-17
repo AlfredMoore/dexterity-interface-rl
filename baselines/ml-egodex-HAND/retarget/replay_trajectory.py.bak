@@ -1,0 +1,451 @@
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Replay retargeted 38-DOF trajectories in HAND-gat IsaacSim environment.
+
+Loads .npz files from retarget_for_sim.py and plays them back using
+inverse-action computation to drive the env's PD controllers.
+
+Usage (from HAND-gat root, inside env_isaaclab conda env):
+    # Single episode
+    python -m HAND.tasks.direct.hand.replay_trajectory \
+        --trajectory /path/to/0_sim.npz \
+        --num_envs 1 --video
+
+    # Batch mode (all episodes in directory)
+    python -m HAND.tasks.direct.hand.replay_trajectory \
+        --traj_dir /path/to/retargeted_sim_v6/ \
+        --num_envs 1 --teleport --video
+"""
+
+"""Launch Isaac Sim Simulator first."""
+
+import argparse
+import sys
+
+from isaaclab.app import AppLauncher
+
+parser = argparse.ArgumentParser(description="Replay retargeted trajectory in HAND-gat env.")
+parser.add_argument("--trajectory", type=str, default=None, help="Path to .npz trajectory file")
+parser.add_argument("--traj_dir", type=str, default=None, help="Directory with .npz trajectory files (batch mode)")
+parser.add_argument("--num_envs", type=int, default=1, help="Number of environments")
+parser.add_argument("--task", type=str, default="Template-Hand-Direct-v0", help="Task name")
+parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time")
+parser.add_argument("--video", action="store_true", default=False, help="Record video")
+parser.add_argument("--video_length", type=int, default=500, help="Video length in steps")
+parser.add_argument("--video_name_prefix", type=str, default="replay", help="Video name prefix")
+parser.add_argument("--settle_steps", type=int, default=30, help="Steps to settle before replay")
+parser.add_argument("--hold_steps", type=int, default=50, help="Steps to hold final pose")
+parser.add_argument("--teleport", action="store_true", default=False,
+                    help="Directly write joint positions (bypass PD controller)")
+parser.add_argument("--substeps", type=int, default=5,
+                    help="Simulation substeps per trajectory frame (for PD tracking)")
+parser.add_argument("--disable_fabric", action="store_true", default=False)
+
+AppLauncher.add_app_launcher_args(parser)
+args_cli, hydra_args = parser.parse_known_args()
+args_cli = parser.parse_args()
+if args_cli.video:
+    args_cli.enable_cameras = True
+
+sys.argv = [sys.argv[0]] + hydra_args
+
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+"""Rest everything follows."""
+
+import gymnasium as gym
+import numpy as np
+import os
+import time
+import torch
+from pathlib import Path
+
+import isaaclab_tasks  # noqa: F401
+from isaaclab.envs import DirectRLEnvCfg, DirectMARLEnvCfg, ManagerBasedRLEnvCfg
+
+import HAND.tasks  # noqa: F401
+from isaaclab_tasks.utils.hydra import hydra_task_config
+from HAND.tasks.direct.hand.hand_utils import PACKAGE_ROOT_DIR, DIRECT_ENV_DIR
+
+
+def compute_inverse_action(
+    desired_left: torch.Tensor,
+    desired_right: torch.Tensor,
+    current_left_targets: torch.Tensor,
+    current_right_targets: torch.Tensor,
+    prev_actions: torch.Tensor,
+    dt: float,
+    action_scale: float,
+    action_ema: float,
+    left_vel_scale: torch.Tensor,
+    right_vel_scale: torch.Tensor,
+    left_joint_indices: list[int],
+    right_joint_indices: list[int],
+    action_dim: int,
+) -> torch.Tensor:
+    """Compute raw action that drives PD targets toward desired joint positions.
+
+    Inverse of the target update equation:
+        smoothed = raw.clamp(-1,1) * EMA + prev * (1-EMA)
+        new_target = old_target + smoothed * dt * vel_scale * action_scale
+    """
+    num_envs = desired_left.shape[0]
+
+    # Compute needed smoothed action per arm
+    left_delta = desired_left - current_left_targets
+    left_smoothed = left_delta / (dt * left_vel_scale * action_scale + 1e-8)
+
+    right_delta = desired_right - current_right_targets
+    right_smoothed = right_delta / (dt * right_vel_scale * action_scale + 1e-8)
+
+    # Reconstruct full smoothed action vector
+    smoothed = torch.zeros(num_envs, action_dim, device=desired_left.device)
+    smoothed[:, left_joint_indices] = left_smoothed
+    smoothed[:, right_joint_indices] = right_smoothed
+
+    # Inverse EMA: smoothed = raw * EMA + prev * (1 - EMA)
+    # => raw = (smoothed - prev * (1 - EMA)) / EMA
+    raw = (smoothed - prev_actions * (1 - action_ema)) / (action_ema + 1e-8)
+    raw = raw.clamp(-1.0, 1.0)
+
+    return raw
+
+
+def load_trajectory(path: str) -> dict:
+    """Load a retargeted trajectory .npz file."""
+    data = np.load(path, allow_pickle=True)
+    return {
+        "joint_positions": data["joint_positions"],  # (T, 38)
+        "ik_success": data["ik_success"],  # (T, 2)
+    }
+
+
+def replay_single(
+    env,
+    traj_path: str,
+    use_teleport: bool,
+    substeps: int,
+    settle_steps: int,
+    hold_steps: int,
+    real_time: bool = False,
+    video_length: int = 0,
+) -> dict:
+    """
+    Replay a single trajectory in the environment.
+
+    Returns dict with max_rotation, final_rotation, success, frames.
+    """
+    traj = load_trajectory(traj_path)
+    joint_positions = traj["joint_positions"]  # (T, 38)
+    ik_success = traj["ik_success"]  # (T, 2)
+    T = len(joint_positions)
+    traj_name = Path(traj_path).stem
+    print(f"\n[INFO] Trajectory {traj_name}: {T} frames, IK success: "
+          f"left={ik_success[:, 0].mean():.1%}, right={ik_success[:, 1].mean():.1%}")
+
+    # Filter: only use frames where both arms have IK success
+    valid_mask = ik_success.all(axis=1)
+    valid_indices = np.where(valid_mask)[0]
+    print(f"[INFO] Valid frames (both IK ok): {len(valid_indices)}/{T}")
+
+    # If there are gaps, interpolate through them
+    if len(valid_indices) < T and len(valid_indices) > 1:
+        print("[INFO] Interpolating through IK-failed frames...")
+        interp_positions = np.copy(joint_positions)
+        for j in range(38):
+            interp_positions[:, j] = np.interp(
+                np.arange(T),
+                valid_indices,
+                joint_positions[valid_indices, j],
+            )
+        joint_positions = interp_positions
+
+    # Get env internals
+    unwrapped = env.unwrapped
+    device = unwrapped.device
+    num_envs = unwrapped.num_envs
+    dt = unwrapped.dt
+    action_ema = unwrapped.action_EMA
+    action_scale = unwrapped.cfg.action_scale
+    action_dim = unwrapped.cfg.action_num  # 38
+
+    left_vel_scale = unwrapped.robot_action_scale_dict["left_joint_vel_action"]
+    right_vel_scale = unwrapped.robot_action_scale_dict["right_joint_vel_action"]
+    left_joint_indices = unwrapped.robot_joint_indices_dict["left"]
+    right_joint_indices = unwrapped.robot_joint_indices_dict["right"]
+
+    # Convert trajectory to torch
+    traj_tensor = torch.tensor(joint_positions, dtype=torch.float32, device=device)
+    # Split: left=[0:19], right=[19:38]
+    traj_left = traj_tensor[:, :19]   # (T, 19)
+    traj_right = traj_tensor[:, 19:]  # (T, 19)
+
+    # Reset environment
+    env.reset()
+
+    # Tracking
+    max_bottle_rotation = torch.zeros(num_envs, device=device)
+    step_count = 0
+
+    if use_teleport:
+        print(f"[REPLAY] TELEPORT mode, substeps={substeps}")
+    print(f"[REPLAY] {settle_steps} settle + {T} trajectory + {hold_steps} hold")
+
+    # Store previous bottle joint pos for cumulative tracking in teleport mode
+    prev_bottle_b_pos = unwrapped._bottle.data.joint_pos[
+        :, unwrapped.object_joint_indices_dict['bottle_b'][0]
+    ].clone()
+
+    def teleport_to_pose(left_pos_target, right_pos_target):
+        """Directly write joint positions to sim, bypassing PD action pipeline."""
+        nonlocal prev_bottle_b_pos
+
+        zero_vel_left = torch.zeros_like(left_pos_target)
+        zero_vel_right = torch.zeros_like(right_pos_target)
+
+        # Write joint state directly to physics sim
+        unwrapped._left_arm.write_joint_state_to_sim(left_pos_target, zero_vel_left)
+        unwrapped._left_arm.set_joint_position_target(left_pos_target)
+        unwrapped.left_dof_targets[:] = left_pos_target
+
+        unwrapped._right_arm.write_joint_state_to_sim(right_pos_target, zero_vel_right)
+        unwrapped._right_arm.set_joint_position_target(right_pos_target)
+        unwrapped.right_dof_targets[:] = right_pos_target
+
+        # Step physics multiple times for stability
+        for _ in range(substeps):
+            unwrapped.scene.write_data_to_sim()
+            unwrapped.sim.step(render=False)
+            unwrapped.scene.update(dt=unwrapped.physics_dt)
+
+        # Update cumulative bottle rotation tracking (normally done in _get_dones)
+        curr_bottle_b_pos = unwrapped._bottle.data.joint_pos[
+            :, unwrapped.object_joint_indices_dict['bottle_b'][0]
+        ]
+        delta = curr_bottle_b_pos - prev_bottle_b_pos
+        unwrapped.cum_bottle_b_joint_pos += delta.unsqueeze(-1)
+        prev_bottle_b_pos = curr_bottle_b_pos.clone()
+
+    with torch.inference_mode():
+        # Phase 1: Settle at initial pose
+        initial_left = traj_left[0].unsqueeze(0).expand(num_envs, -1)
+        initial_right = traj_right[0].unsqueeze(0).expand(num_envs, -1)
+
+        for s in range(settle_steps):
+            if use_teleport:
+                teleport_to_pose(initial_left, initial_right)
+            else:
+                action = compute_inverse_action(
+                    initial_left, initial_right,
+                    unwrapped.left_dof_targets, unwrapped.right_dof_targets,
+                    unwrapped.prev_actions,
+                    dt, action_scale, action_ema,
+                    left_vel_scale, right_vel_scale,
+                    left_joint_indices, right_joint_indices,
+                    action_dim,
+                )
+                env.step(action)
+            step_count += 1
+
+            if s % 10 == 0:
+                bottle_rot = unwrapped.cum_bottle_b_joint_pos.squeeze(-1)
+                print(f"  [Settle {s:3d}] bottle_rot={bottle_rot[0].item():.4f} rad")
+
+        # Phase 2: Replay trajectory
+        for t in range(T):
+            start_time = time.time()
+
+            desired_left = traj_left[t].unsqueeze(0).expand(num_envs, -1)
+            desired_right = traj_right[t].unsqueeze(0).expand(num_envs, -1)
+
+            if use_teleport:
+                teleport_to_pose(desired_left, desired_right)
+            else:
+                action = compute_inverse_action(
+                    desired_left, desired_right,
+                    unwrapped.left_dof_targets, unwrapped.right_dof_targets,
+                    unwrapped.prev_actions,
+                    dt, action_scale, action_ema,
+                    left_vel_scale, right_vel_scale,
+                    left_joint_indices, right_joint_indices,
+                    action_dim,
+                )
+                env.step(action)
+            step_count += 1
+
+            # Track bottle rotation
+            bottle_rot = unwrapped.cum_bottle_b_joint_pos.squeeze(-1)
+            max_bottle_rotation = torch.max(max_bottle_rotation, bottle_rot.abs())
+
+            if t % 20 == 0 or t == T - 1:
+                # Current joint tracking error
+                left_pos = unwrapped._left_arm.data.joint_pos[0]
+                right_pos = unwrapped._right_arm.data.joint_pos[0]
+                left_err = (left_pos - desired_left[0]).abs().mean().item()
+                right_err = (right_pos - desired_right[0]).abs().mean().item()
+
+                # Fingertip and bottle positions for diagnostics
+                l_ftips = unwrapped._left_arm.data.body_pos_w[0, unwrapped.robot_link_indices_dict["l_finger_tips"]] - unwrapped.scene.env_origins[0]
+                r_ftips = unwrapped._right_arm.data.body_pos_w[0, unwrapped.robot_link_indices_dict["r_finger_tips"]] - unwrapped.scene.env_origins[0]
+                bottle_pos = unwrapped._bottle.data.root_pos_w[0] - unwrapped.scene.env_origins[0]
+                lid_pos = unwrapped._bottle.data.body_pos_w[0, unwrapped.object_link_indices_dict['bottle_lid'][0]] - unwrapped.scene.env_origins[0]
+
+                l_dist = (l_ftips - lid_pos.unsqueeze(0)).norm(dim=-1).mean().item()
+                r_dist = (r_ftips - lid_pos.unsqueeze(0)).norm(dim=-1).mean().item()
+
+                print(f"  [Frame {t:4d}/{T}] bottle_rot={bottle_rot[0].item():+.4f} rad, "
+                      f"track_err: L={left_err:.4f} R={right_err:.4f}")
+                print(f"    lid={lid_pos.cpu().numpy()}, "
+                      f"L_ftip_dist={l_dist:.4f}, R_ftip_dist={r_dist:.4f}")
+                if t == 0 or t == T - 1:
+                    print(f"    L_ftips:\n{l_ftips.cpu().numpy()}")
+                    print(f"    R_ftips:\n{r_ftips.cpu().numpy()}")
+
+            # Real-time pacing
+            if real_time:
+                elapsed = time.time() - start_time
+                sleep_time = dt - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+            # Check if video is done
+            if video_length > 0 and step_count >= video_length:
+                break
+
+        # Phase 3: Hold final pose
+        final_left = traj_left[-1].unsqueeze(0).expand(num_envs, -1)
+        final_right = traj_right[-1].unsqueeze(0).expand(num_envs, -1)
+
+        for h in range(hold_steps):
+            if use_teleport:
+                teleport_to_pose(final_left, final_right)
+            else:
+                action = compute_inverse_action(
+                    final_left, final_right,
+                    unwrapped.left_dof_targets, unwrapped.right_dof_targets,
+                    unwrapped.prev_actions,
+                    dt, action_scale, action_ema,
+                    left_vel_scale, right_vel_scale,
+                    left_joint_indices, right_joint_indices,
+                    action_dim,
+                )
+                env.step(action)
+            step_count += 1
+
+            bottle_rot = unwrapped.cum_bottle_b_joint_pos.squeeze(-1)
+            max_bottle_rotation = torch.max(max_bottle_rotation, bottle_rot.abs())
+
+            if video_length > 0 and step_count >= video_length:
+                break
+
+    # Results for this episode
+    final_rot = unwrapped.cum_bottle_b_joint_pos.squeeze(-1)
+    max_rot_val = max_bottle_rotation[0].item()
+    final_rot_val = final_rot[0].item()
+    success = max_rot_val > np.pi
+
+    print(f"\n{'='*60}")
+    print(f"REPLAY RESULTS: {traj_name}")
+    print(f"{'='*60}")
+    print(f"  Frames replayed: {T}, Total sim steps: {step_count}")
+    for i in range(min(num_envs, 8)):
+        tag = "SUCCESS" if max_bottle_rotation[i].item() > np.pi else "FAIL"
+        print(f"  Env {i}: max_rot={max_bottle_rotation[i].item():.4f} rad "
+              f"({max_bottle_rotation[i].item() / np.pi:.2f}*pi), "
+              f"final_rot={final_rot[i].item():.4f} rad [{tag}]")
+
+    return {
+        "name": traj_name,
+        "frames": T,
+        "max_rotation": max_rot_val,
+        "final_rotation": final_rot_val,
+        "success": success,
+    }
+
+
+@hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
+def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg=None):
+    """Replay trajectory in HAND-gat environment."""
+
+    # Configure environment
+    env_cfg.scene.num_envs = args_cli.num_envs
+    env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+
+    log_dir = os.path.join(PACKAGE_ROOT_DIR, "logs", "replay")
+    os.makedirs(log_dir, exist_ok=True)
+    print(f"[INFO] Logging in: {log_dir}")
+
+    # Collect trajectory files
+    traj_files = []
+    if args_cli.traj_dir:
+        traj_files = sorted(Path(args_cli.traj_dir).glob("*_sim.npz"),
+                            key=lambda p: int(p.stem.split("_")[0]))
+        print(f"[INFO] Batch mode: found {len(traj_files)} trajectories in {args_cli.traj_dir}")
+    elif args_cli.trajectory:
+        traj_files = [Path(args_cli.trajectory)]
+    else:
+        print("[ERROR] Provide --trajectory or --traj_dir")
+        return
+
+    # Create environment
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    if args_cli.video:
+        video_kwargs = {
+            "video_folder": os.path.join(log_dir, "videos"),
+            "step_trigger": lambda step: step == 0,
+            "video_length": args_cli.video_length,
+            "disable_logger": False,
+            "name_prefix": args_cli.video_name_prefix,
+        }
+        env = gym.wrappers.RecordVideo(env, **video_kwargs)
+
+    print(f"[INFO] Obs space: {env.observation_space}")
+    print(f"[INFO] Action space: {env.action_space}")
+
+    # Auto-compute video_length if not explicitly set and using video
+    auto_video_length = args_cli.video_length
+
+    all_results = []
+    for traj_path in traj_files:
+        # Auto-adapt video length per episode
+        if args_cli.video:
+            traj_data = np.load(str(traj_path))
+            T_ep = len(traj_data["joint_positions"])
+            auto_video_length = args_cli.settle_steps + T_ep + args_cli.hold_steps + 10
+
+        result = replay_single(
+            env, str(traj_path),
+            use_teleport=args_cli.teleport,
+            substeps=args_cli.substeps,
+            settle_steps=args_cli.settle_steps,
+            hold_steps=args_cli.hold_steps,
+            real_time=args_cli.real_time,
+            video_length=auto_video_length if args_cli.video else 0,
+        )
+        all_results.append(result)
+
+    # Batch summary
+    if len(all_results) > 1:
+        print(f"\n{'='*60}")
+        print("BATCH RESULTS")
+        print(f"{'='*60}")
+        n_success = 0
+        for r in all_results:
+            tag = "SUCCESS" if r["success"] else "FAIL"
+            if r["success"]:
+                n_success += 1
+            print(f"  {r['name']:>10s}: max_rot={r['max_rotation']:.4f} rad "
+                  f"({r['max_rotation'] / np.pi:.2f}*pi) [{tag}]")
+        print(f"\nOverall: {n_success}/{len(all_results)} SUCCESS "
+              f"({n_success / len(all_results):.0%})")
+
+    env.close()
+
+
+if __name__ == "__main__":
+    main()
+    simulation_app.close()

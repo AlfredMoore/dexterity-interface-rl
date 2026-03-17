@@ -1,0 +1,104 @@
+<?xml version="1.0"?>
+<!--
+  EgoDex cup/bottle model estimated from fingertip annotations.
+  Dimensions from median of 26 add_remove_lid episodes:
+    cap_r  = 0.055m   body_r = 0.060m
+    cap_h  = 0.030m   body_h = 0.082m
+  Structure matches HAND-gat bottle: body(link2) + cap(link1) + b_joint(revolute z) + brake.
+  Uses cylinders instead of meshes.
+-->
+<robot name="egodex_bottle">
+
+  <!-- Body (base link, lower cylinder) -->
+  <link name="link2">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.060" length="0.082"/>
+      </geometry>
+      <material name="body_color">
+        <color rgba="0.9 0.3 0.3 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.060" length="0.082"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.15"/>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <inertia ixx="3.0e-04" ixy="0.0" ixz="0.0"
+               iyy="3.0e-04" iyz="0.0" izz="2.7e-04"/>
+    </inertial>
+  </link>
+
+  <!-- Cap/lid (upper cylinder, rotates around z) -->
+  <link name="link1">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.055" length="0.030"/>
+      </geometry>
+      <material name="cap_color">
+        <color rgba="0.9 0.9 0.9 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.055" length="0.030"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.02"/>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <inertia ixx="6.0e-06" ixy="0.0" ixz="0.0"
+               iyy="6.0e-06" iyz="0.0" izz="1.5e-05"/>
+    </inertial>
+  </link>
+
+  <!-- Brake link (friction element between cap and body) -->
+  <link name="brake">
+    <visual>
+      <geometry>
+        <box size="0.02 0.02 0.005"/>
+      </geometry>
+      <material name="gray">
+        <color rgba="0.5 0.5 0.5 1"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <box size="0.02 0.02 0.005"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.005"/>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <inertia ixx="1.8e-04" ixy="0.0" ixz="0.0"
+               iyy="1.8e-04" iyz="0.0" izz="1.8e-04"/>
+    </inertial>
+  </link>
+
+  <!-- Revolute joint: body -> cap (screw/twist axis = z) -->
+  <!-- Origin at top of body: body_h/2 + cap_h/2 = 0.041 + 0.015 = 0.056 -->
+  <joint name="b_joint" type="revolute">
+    <parent link="link2"/>
+    <child link="link1"/>
+    <origin rpy="0 0 0" xyz="0 0 0.056"/>
+    <axis xyz="0 0 1"/>
+    <dynamics damping="0.0" friction="0.0"/>
+  </joint>
+
+  <!-- Prismatic joint: body -> brake -->
+  <joint name="brake_joint" type="prismatic">
+    <parent link="link2"/>
+    <child link="brake"/>
+    <origin rpy="0 0 0" xyz="0 0 0.060"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.02" upper="0.02"/>
+  </joint>
+
+</robot>
