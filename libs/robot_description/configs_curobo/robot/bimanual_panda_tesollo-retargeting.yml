@@ -1,0 +1,231 @@
+##
+## cuRobo config for 38-DOF full-chain IK with fingertip position targets.
+## Used by retarget_for_sim.py to solve EgoDex fingertip positions -> robot joint angles.
+##
+## Key differences from bimanual_panda_tesollo.yml:
+##   - ee_link = left_F1_TIP (primary fingertip target)
+##   - link_names = remaining 5 fingertips (secondary targets via link_poses)
+##   - lock_joints = null (all 38 DOF active, fingers NOT locked)
+##
+
+robot_cfg:
+  kinematics:
+    use_usd_kinematics: False
+    # urdf_path and asset_root_path loaded in script
+    base_link: "world"
+
+    # Primary goal: left finger 1 tip
+    ee_link: "left_F1_TIP"
+
+    # Secondary targets (passed via link_poses dict in solve_single)
+    link_names: ["left_F2_TIP", "left_F3_TIP", "right_F1_TIP", "right_F2_TIP", "right_F3_TIP"]
+
+    # Collision links - same as base config
+    collision_link_names: [
+      # Left arm
+      'left_panda_link0', 'left_panda_link1', 'left_panda_link2', 'left_panda_link3',
+      'left_panda_link4', 'left_panda_link5', 'left_panda_link6', 'left_panda_link7',
+      'left_delto_base_link',
+      'left_F1_01', 'left_F1_02', 'left_F1_03', 'left_F1_04', 'left_F1_TIP',
+      'left_F2_01', 'left_F2_02', 'left_F2_03', 'left_F2_04', 'left_F2_TIP',
+      'left_F3_01', 'left_F3_02', 'left_F3_03', 'left_F3_04', 'left_F3_TIP',
+      # Right arm
+      'right_panda_link0', 'right_panda_link1', 'right_panda_link2', 'right_panda_link3',
+      'right_panda_link4', 'right_panda_link5', 'right_panda_link6', 'right_panda_link7',
+      'right_delto_base_link',
+      'right_F1_01', 'right_F1_02', 'right_F1_03', 'right_F1_04', 'right_F1_TIP',
+      'right_F2_01', 'right_F2_02', 'right_F2_03', 'right_F2_04', 'right_F2_TIP',
+      'right_F3_01', 'right_F3_02', 'right_F3_03', 'right_F3_04', 'right_F3_TIP',
+      # Table
+      'table_top',
+    ]
+
+    collision_sphere_buffer: 0.01
+    use_global_cumul: True
+
+    # Self-collision pairs to ignore (same as base config)
+    self_collision_ignore: {
+      # Left arm
+      "left_panda_link0": ["left_panda_link1", "left_panda_link2", "table_top"],
+      "left_panda_link1": ["left_panda_link2", "left_panda_link3", "left_panda_link4"],
+      "left_panda_link2": ["left_panda_link3", "left_panda_link4"],
+      "left_panda_link3": ["left_panda_link4", "left_panda_link6"],
+      "left_panda_link4": ["left_panda_link5", "left_panda_link6", "left_panda_link7"],
+      "left_panda_link5": ["left_panda_link6", "left_panda_link7", "left_delto_base_link"],
+      "left_panda_link6": ["left_panda_link7", "left_delto_base_link"],
+      "left_panda_link7": ["left_delto_base_link",
+        "left_F1_01", "left_F1_02", "left_F1_03", "left_F1_04", "left_F1_TIP",
+        "left_F2_01", "left_F2_02", "left_F2_03", "left_F2_04", "left_F2_TIP",
+        "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_delto_base_link": [
+        "left_F1_01", "left_F1_02", "left_F1_03", "left_F1_04", "left_F1_TIP",
+        "left_F2_01", "left_F2_02", "left_F2_03", "left_F2_04", "left_F2_TIP",
+        "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP",
+      ],
+      "left_F1_01": ["left_F1_02", "left_F1_03", "left_F1_04", "left_F1_TIP",
+                     "left_F2_01", "left_F2_02", "left_F2_03", "left_F2_04", "left_F2_TIP",
+                     "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F1_02": ["left_F1_03", "left_F1_04", "left_F1_TIP",
+                     "left_F2_01", "left_F2_02", "left_F2_03", "left_F2_04", "left_F2_TIP",
+                     "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F1_03": ["left_F1_04", "left_F1_TIP",
+                     "left_F2_01", "left_F2_02", "left_F2_03", "left_F2_04", "left_F2_TIP",
+                     "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F1_04": ["left_F1_TIP",
+                     "left_F2_01", "left_F2_02", "left_F2_03", "left_F2_04", "left_F2_TIP",
+                     "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F1_TIP": ["left_F2_01", "left_F2_02", "left_F2_03", "left_F2_04", "left_F2_TIP",
+                      "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F2_01": ["left_F2_02", "left_F2_03", "left_F2_04", "left_F2_TIP",
+                     "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F2_02": ["left_F2_03", "left_F2_04", "left_F2_TIP",
+                     "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F2_03": ["left_F2_04", "left_F2_TIP",
+                     "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F2_04": ["left_F2_TIP",
+                     "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F2_TIP": ["left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F3_01": ["left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F3_02": ["left_F3_03", "left_F3_04", "left_F3_TIP"],
+      "left_F3_03": ["left_F3_04", "left_F3_TIP"],
+      "left_F3_04": ["left_F3_TIP"],
+      # Right arm
+      "right_panda_link0": ["right_panda_link1", "right_panda_link2", "table_top"],
+      "right_panda_link1": ["right_panda_link2", "right_panda_link3", "right_panda_link4"],
+      "right_panda_link2": ["right_panda_link3", "right_panda_link4"],
+      "right_panda_link3": ["right_panda_link4", "right_panda_link6"],
+      "right_panda_link4": ["right_panda_link5", "right_panda_link6", "right_panda_link7"],
+      "right_panda_link5": ["right_panda_link6", "right_panda_link7", "right_delto_base_link"],
+      "right_panda_link6": ["right_panda_link7", "right_delto_base_link"],
+      "right_panda_link7": ["right_delto_base_link",
+        "right_F1_01", "right_F1_02", "right_F1_03", "right_F1_04", "right_F1_TIP",
+        "right_F2_01", "right_F2_02", "right_F2_03", "right_F2_04", "right_F2_TIP",
+        "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_delto_base_link": [
+        "right_F1_01", "right_F1_02", "right_F1_03", "right_F1_04", "right_F1_TIP",
+        "right_F2_01", "right_F2_02", "right_F2_03", "right_F2_04", "right_F2_TIP",
+        "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP",
+      ],
+      "right_F1_01": ["right_F1_02", "right_F1_03", "right_F1_04", "right_F1_TIP",
+                      "right_F2_01", "right_F2_02", "right_F2_03", "right_F2_04", "right_F2_TIP",
+                      "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F1_02": ["right_F1_03", "right_F1_04", "right_F1_TIP",
+                      "right_F2_01", "right_F2_02", "right_F2_03", "right_F2_04", "right_F2_TIP",
+                      "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F1_03": ["right_F1_04", "right_F1_TIP",
+                      "right_F2_01", "right_F2_02", "right_F2_03", "right_F2_04", "right_F2_TIP",
+                      "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F1_04": ["right_F1_TIP",
+                      "right_F2_01", "right_F2_02", "right_F2_03", "right_F2_04", "right_F2_TIP",
+                      "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F1_TIP": ["right_F2_01", "right_F2_02", "right_F2_03", "right_F2_04", "right_F2_TIP",
+                       "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F2_01": ["right_F2_02", "right_F2_03", "right_F2_04", "right_F2_TIP",
+                      "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F2_02": ["right_F2_03", "right_F2_04", "right_F2_TIP",
+                      "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F2_03": ["right_F2_04", "right_F2_TIP",
+                      "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F2_04": ["right_F2_TIP",
+                      "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F2_TIP": ["right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F3_01": ["right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F3_02": ["right_F3_03", "right_F3_04", "right_F3_TIP"],
+      "right_F3_03": ["right_F3_04", "right_F3_TIP"],
+      "right_F3_04": ["right_F3_TIP"],
+      # Table
+      "table_top": [
+        "left_panda_link0", "left_panda_link1",
+        "right_panda_link0", "right_panda_link1"
+      ],
+    }
+
+    self_collision_buffer: {
+      'left_panda_link0': 0.05,
+      'left_panda_link1': 0.05,
+      'left_delto_base_link': 0.002,
+      'left_F1_01': 0.002, 'left_F1_02': 0.002, 'left_F1_03': 0.002, 'left_F1_04': 0.002, 'left_F1_TIP': 0.002,
+      'left_F2_01': 0.002, 'left_F2_02': 0.002, 'left_F2_03': 0.002, 'left_F2_04': 0.002, 'left_F2_TIP': 0.002,
+      'left_F3_01': 0.002, 'left_F3_02': 0.002, 'left_F3_03': 0.002, 'left_F3_04': 0.002, 'left_F3_TIP': 0.002,
+      'right_panda_link0': 0.05,
+      'right_panda_link1': 0.05,
+      'right_delto_base_link': 0.002,
+      'right_F1_01': 0.002, 'right_F1_02': 0.002, 'right_F1_03': 0.002, 'right_F1_04': 0.002, 'right_F1_TIP': 0.002,
+      'right_F2_01': 0.002, 'right_F2_02': 0.002, 'right_F2_03': 0.002, 'right_F2_04': 0.002, 'right_F2_TIP': 0.002,
+      'right_F3_01': 0.002, 'right_F3_02': 0.002, 'right_F3_03': 0.002, 'right_F3_04': 0.002, 'right_F3_TIP': 0.002,
+    }
+
+    mesh_link_names: [
+      # Left arm
+      'left_panda_link0', 'left_panda_link1', 'left_panda_link2', 'left_panda_link3',
+      'left_panda_link4', 'left_panda_link5', 'left_panda_link6', 'left_panda_link7',
+      'left_delto_base_link',
+      'left_F1_01', 'left_F1_02', 'left_F1_03', 'left_F1_04', 'left_F1_TIP',
+      'left_F2_01', 'left_F2_02', 'left_F2_03', 'left_F2_04', 'left_F2_TIP',
+      'left_F3_01', 'left_F3_02', 'left_F3_03', 'left_F3_04', 'left_F3_TIP',
+      # Right arm
+      'right_panda_link0', 'right_panda_link1', 'right_panda_link2', 'right_panda_link3',
+      'right_panda_link4', 'right_panda_link5', 'right_panda_link6', 'right_panda_link7',
+      'right_delto_base_link',
+      'right_F1_01', 'right_F1_02', 'right_F1_03', 'right_F1_04', 'right_F1_TIP',
+      'right_F2_01', 'right_F2_02', 'right_F2_03', 'right_F2_04', 'right_F2_TIP',
+      'right_F3_01', 'right_F3_02', 'right_F3_03', 'right_F3_04', 'right_F3_TIP',
+    ]
+
+    # All 38 DOF active (no locked joints)
+    lock_joints: null
+
+    cspace:
+      joint_names: [
+        # Left arm (7 DoF)
+        'left_panda_joint1', 'left_panda_joint2', 'left_panda_joint3', 'left_panda_joint4',
+        'left_panda_joint5', 'left_panda_joint6', 'left_panda_joint7',
+        # Left gripper (12 DoF)
+        'left_F1M1', 'left_F1M2', 'left_F1M3', 'left_F1M4',
+        'left_F2M1', 'left_F2M2', 'left_F2M3', 'left_F2M4',
+        'left_F3M1', 'left_F3M2', 'left_F3M3', 'left_F3M4',
+        # Right arm (7 DoF)
+        'right_panda_joint1', 'right_panda_joint2', 'right_panda_joint3', 'right_panda_joint4',
+        'right_panda_joint5', 'right_panda_joint6', 'right_panda_joint7',
+        # Right gripper (12 DoF)
+        'right_F1M1', 'right_F1M2', 'right_F1M3', 'right_F1M4',
+        'right_F2M1', 'right_F2M2', 'right_F2M3', 'right_F2M4',
+        'right_F3M1', 'right_F3M2', 'right_F3M3', 'right_F3M4',
+      ]
+
+      retract_config: [
+        # Left arm
+        0.0, -1.3, 0.0, -2.5, 0.0, 1.0, 0.0,
+        # Left gripper - open
+        0.0, 0.0, 0.7853981633974483, 0.5235987755982988,
+        0.0, 0.0, 0.7853981633974483, 0.5235987755982988,
+        0.0, 0.0, 0.7853981633974483, 0.5235987755982988,
+        # Right arm
+        0.0, -1.3, 0.0, -2.5, 0.0, 1.0, 0.0,
+        # Right gripper - open
+        0.0, 0.0, 0.7853981633974483, 0.5235987755982988,
+        0.0, 0.0, 0.7853981633974483, 0.5235987755982988,
+        0.0, 0.0, 0.7853981633974483, 0.5235987755982988,
+      ]
+
+      # Higher null space weight on arm joints to encourage minimal arm motion
+      # when warm-starting from previous frame
+      null_space_weight: [
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,  # Left arm
+        0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,  # Left gripper
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,  # Right arm
+        0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,  # Right gripper
+      ]
+
+      cspace_distance_weight: [
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,  # Left arm
+        0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,  # Left gripper
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,  # Right arm
+        0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,  # Right gripper
+      ]
+
+      max_jerk: 500.0
+      max_acceleration: 7.5
+      velocity_scale: 1.0
+      acceleration_scale: 1.0
+      jerk_scale: 1.0

@@ -184,6 +184,67 @@ class PandaArmIKSolver:
             q  = np.clip(q, self.model.lowerPositionLimit, self.model.upperPositionLimit)
         return q, False
 
+    def fk_hand_base(self, q: np.ndarray) -> np.ndarray:
+        """
+        Compute the SE(3) pose of the Tesollo hand base (delto_base_link)
+        given the 7-DOF arm joint angles.
+
+        The chain is: base → panda_link8 → (fixed joint: xyz=0,0,0.106 rpy=0,0,-0.785) → delto_base_link.
+        We use pinocchio FK to get panda_link8 and apply the fixed offset.
+
+        Returns: (4, 4) SE(3) hand base pose in the arm base frame.
+        """
+        pin.forwardKinematics(self.model, self.data, q)
+        pin.updateFramePlacements(self.model, self.data)
+        T_link8 = self.data.oMf[self.ee_frame_id].homogeneous
+
+        # Fixed joint: panda_link8 → delto_base_link
+        # From URDF: origin rpy="0 0 -0.785" xyz="0 0 0.106"
+        cos_a = np.cos(-0.785)
+        sin_a = np.sin(-0.785)
+        T_mount = np.eye(4)
+        T_mount[:3, :3] = np.array([
+            [cos_a, -sin_a, 0],
+            [sin_a,  cos_a, 0],
+            [0,      0,     1],
+        ])
+        T_mount[2, 3] = 0.106
+
+        return T_link8 @ T_mount
+
+    def solve_position_only(
+        self,
+        target_pos: np.ndarray,
+        q_init: Optional[np.ndarray] = None,
+        max_iter: int = 200,
+        tol: float = 1e-3,
+        damping: float = 1e-4,
+    ) -> tuple[np.ndarray, bool]:
+        """
+        Position-only IK (3-DOF task, ignores orientation).
+        Useful as fallback when full 6-DOF IK fails due to unreachable orientations.
+
+        Returns:
+            q:       (7,) joint angles.
+            success: True if position error < tol.
+        """
+        q = q_init.copy() if q_init is not None else self.q_default.copy()
+        for _ in range(max_iter):
+            pin.forwardKinematics(self.model, self.data, q)
+            pin.updateFramePlacements(self.model, self.data)
+            curr_pos = self.data.oMf[self.ee_frame_id].translation
+            err = target_pos - curr_pos
+            if np.linalg.norm(err) < tol:
+                return q, True
+            J_full = pin.computeFrameJacobian(
+                self.model, self.data, q, self.ee_frame_id, pin.LOCAL_WORLD_ALIGNED
+            )
+            J_pos = J_full[:3, :]  # position-only Jacobian
+            dq = np.linalg.solve(J_pos.T @ J_pos + damping * np.eye(self.model.nv), J_pos.T @ err)
+            q = pin.integrate(self.model, q, dq * 0.5)
+            q = np.clip(q, self.model.lowerPositionLimit, self.model.upperPositionLimit)
+        return q, False
+
 
 # ---------------------------------------------------------------------------
 # HandRetargeter
@@ -254,6 +315,60 @@ class HandRetargeter:
             hand_type=self.side,
             is_mano_convention=False,
         )
+
+    def reset(self) -> None:
+        self._seq.reset()
+
+
+# ---------------------------------------------------------------------------
+# FixedBaseHandRetargeter
+# ---------------------------------------------------------------------------
+
+class FixedBaseHandRetargeter:
+    """
+    Hand retargeting with the base fixed (no free joint).
+
+    Fingertip positions must be given in the hand base frame (delto_base_link).
+    This avoids the mismatch when using separate arm IK + free-floating hand
+    retargeting: the finger angles are optimized for the actual wrist pose.
+
+    Args:
+        side: 'left' or 'right'.
+    """
+
+    _FINGER_JOINT_COUNT = 12
+
+    def __init__(self, side: str) -> None:
+        assert side in ("left", "right")
+        self.side = side
+
+        RetargetingConfig.set_default_urdf_dir(_ASSETS_DIR)
+        cfg = RetargetingConfig.load_from_file(
+            str(_CONFIG_DIR / f"tesollo_{side}_fixed.yaml")
+        )
+        self._seq: SeqRetargeting = cfg.build()
+
+        expected = LEFT_TESOLLO_JOINTS if side == "left" else RIGHT_TESOLLO_JOINTS
+        names    = self._seq.joint_names
+        self._finger_idx = [names.index(j) for j in expected if j in names]
+        assert len(self._finger_idx) == self._FINGER_JOINT_COUNT, (
+            f"Expected {self._FINGER_JOINT_COUNT} finger joints, "
+            f"found {len(self._finger_idx)} in {names}"
+        )
+
+    @property
+    def joint_names(self) -> list[str]:
+        expected = LEFT_TESOLLO_JOINTS if self.side == "left" else RIGHT_TESOLLO_JOINTS
+        return expected
+
+    def retarget(self, fingertip_positions_hand_frame: np.ndarray) -> np.ndarray:
+        """
+        fingertip_positions_hand_frame: (3, 3) — rows are [thumb, index, middle]
+            positions in the hand base frame (delto_base_link).
+        Returns (12,) finger joint angles.
+        """
+        qpos = self._seq.retarget(fingertip_positions_hand_frame.astype(np.float64))
+        return qpos[self._finger_idx]
 
     def reset(self) -> None:
         self._seq.reset()
