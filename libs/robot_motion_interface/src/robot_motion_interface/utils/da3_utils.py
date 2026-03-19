@@ -56,6 +56,8 @@ if "moviepy.editor" not in sys.modules:
 
 from depth_anything_3.api import DepthAnything3  # noqa: E402
 
+DEFAULT_DA3_MODEL = "depth-anything/DA3-BASE"
+
 
 class DA3Inference:
     """
@@ -67,7 +69,7 @@ class DA3Inference:
     """
 
     def __init__(self,
-                 model: str = "depth-anything/DA3METRIC-LARGE",
+                 model: str = DEFAULT_DA3_MODEL,
                  focal: float | None = None,
                  fx: float | None = None,
                  fy: float | None = None,
@@ -144,7 +146,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="DA3 benchmark / folder inference")
     parser.add_argument("--model",      type=str,
-                        default="depth-anything/DA3METRIC-LARGE",
+                        default=DEFAULT_DA3_MODEL,
                         help="HuggingFace repo name or local model directory")
     parser.add_argument("--focal",      type=float, default=None,
                         help="Camera focal length in pixels (average of fx, fy). "

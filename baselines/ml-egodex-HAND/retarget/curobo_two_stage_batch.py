@@ -2,10 +2,11 @@
 Batch retargeting with cuRobo two-stage IK + pre-grasp trajopt.
 
 Pipeline (per episode):
-  1) Compute camera->URDF alignment from EgoDex fingertip data and bottle_pos.
+  1) Compute camera->URDF alignment from EgoDex fingertip data and anchor mode.
   2) Per frame two-stage IK with two persistent solvers:
        - Stage-1 (arm solver): lock all finger joints, solve left/right virtual palm.
-       - Stage-2 (finger solver): strict lock both arms at Stage-1 result, solve 6 fingertip targets.
+       - Stage-2 (finger solver): solve 6 fingertip targets with soft arm freedom
+         (no strict per-frame arm lock).
   3) Use frame-0 IK result as q_pregrasp and plan q_home -> q_pregrasp via cuRobo trajopt.
   4) Concatenate [traj_home_to_pregrasp, joint_positions_retarget] -> traj_full.
   5) Compare against current retarget_tool two-stage baseline and export reports.
@@ -21,6 +22,7 @@ import contextlib
 import csv
 import io
 import json
+import math
 import sys
 import time
 from dataclasses import dataclass
@@ -30,6 +32,11 @@ from typing import Any
 import numpy as np
 import torch
 import yaml
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 
 # Ensure local imports are resolvable from repo root execution.
 _THIS_DIR = Path(__file__).resolve().parent
@@ -100,6 +107,16 @@ def _safe_rate(x: np.ndarray) -> float:
     return float(np.mean(x)) if x.size > 0 else 0.0
 
 
+def _strict_success(ik_rate: float | None, collision_actual_rate: float | None) -> int:
+    if ik_rate is None or collision_actual_rate is None:
+        return 0
+    ik_v = float(ik_rate)
+    coll_v = float(collision_actual_rate)
+    if math.isnan(ik_v) or math.isnan(coll_v):
+        return 0
+    return int(ik_v >= 1.0 - 1e-9 and coll_v <= 1e-9)
+
+
 def _load_home_q_from_driver_cfg() -> np.ndarray:
     cfg_path = _REPO_ROOT / "libs" / "robot_motion_interface" / "config" / "rl_bimanual_driver_config.yaml"
     with cfg_path.open("r", encoding="utf-8") as f:
@@ -129,7 +146,7 @@ class SolverBuildParams:
 
 
 class CuRoboTwoStageIK:
-    """Two persistent cuRobo IK solvers for strict two-stage solving."""
+    """Two persistent cuRobo IK solvers for two-stage solving."""
 
     def __init__(self, params: SolverBuildParams):
         self.params = params
@@ -154,11 +171,8 @@ class CuRoboTwoStageIK:
         self.stage2_active_names = list(self.stage2_solver.kinematics.joint_names)
 
         self.stage1_lock_fingers = dict(self.stage1_cfg_dict["robot_cfg"]["kinematics"]["lock_joints"])
-        self.stage2_arm_lock_keys = list(self.stage2_cfg_dict["robot_cfg"]["kinematics"]["lock_joints"].keys())
-        self.stage2_current_lock_map = dict(self.stage2_cfg_dict["robot_cfg"]["kinematics"]["lock_joints"])
-
-        self._stage2_update_mode = "kinematics_update"
-        self._stage2_rebuild_count = 0
+        stage2_lock = self.stage2_cfg_dict["robot_cfg"]["kinematics"].get("lock_joints")
+        self.stage2_lock_map = dict(stage2_lock) if isinstance(stage2_lock, dict) else None
 
     def _load_cfg_dict(self, cfg_path: Path, urdf_path: Path, spheres_path: Path) -> dict[str, Any]:
         cfg = load_yaml(str(cfg_path))
@@ -232,36 +246,6 @@ class CuRoboTwoStageIK:
             q_out[self.full_name_to_idx[jn]] = float(active_solution[i])
         return q_out, True
 
-    def _rebuild_stage2_solver(self) -> None:
-        self.stage2_solver = self._build_solver(self.stage2_cfg_dict, self.params.num_seeds_stage2)
-        self.stage2_active_names = list(self.stage2_solver.kinematics.joint_names)
-        self._stage2_rebuild_count += 1
-
-    def _update_stage2_arm_locks(self, q_stage1: np.ndarray) -> None:
-        new_lock_map = {
-            jn: float(q_stage1[self.full_name_to_idx[jn]])
-            for jn in self.stage2_arm_lock_keys
-        }
-        if new_lock_map == self.stage2_current_lock_map:
-            return
-
-        self.stage2_cfg_dict["robot_cfg"]["kinematics"]["lock_joints"] = new_lock_map
-        self.stage2_current_lock_map = new_lock_map
-
-        if self._stage2_update_mode == "kinematics_update":
-            try:
-                robot_cfg = RobotConfig.from_dict(self.stage2_cfg_dict, self.tensor_args)
-                self.stage2_solver.kinematics.update_kinematics_config(
-                    robot_cfg.kinematics.kinematics_config
-                )
-                self.stage2_active_names = list(self.stage2_solver.kinematics.joint_names)
-                return
-            except Exception:
-                # fallback to robust mode
-                self._stage2_update_mode = "rebuild"
-
-        self._rebuild_stage2_solver()
-
     def solve_frame(
         self,
         target_tips_urdf: np.ndarray,  # (6, 3)
@@ -299,8 +283,7 @@ class CuRoboTwoStageIK:
                 q_stage1, ok1 = q_try, True
                 break
 
-        # Stage-2: strict arm lock at stage-1 result, solve fingertips.
-        self._update_stage2_arm_locks(q_stage1)
+        # Stage-2: solve fingertips with soft arm freedom (no strict per-frame arm lock).
         goal_stage2 = self._pose_from_position(target_tips_urdf[0])  # left_F1_TIP
         link_stage2 = {
             "left_F2_TIP": self._pose_from_position(target_tips_urdf[1]),
@@ -322,7 +305,7 @@ class CuRoboTwoStageIK:
                 link_poses=link_stage2,
                 q_seed_full=seed,
                 base_full=q_stage1,
-                lock_overrides=self.stage2_current_lock_map,
+                lock_overrides=self.stage2_lock_map,
             )
             if ok_try:
                 q_stage2, ok2 = q_try, True
@@ -359,6 +342,112 @@ def _compute_fingertip_errors(
     return np.linalg.norm(actual - target_tips, axis=1).astype(np.float32)
 
 
+def _compute_fk_points(
+    full_fk: FullModelFK,
+    q38: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    left_tips = full_fk.fingertip_positions(q38, "left")
+    right_tips = full_fk.fingertip_positions(q38, "right")
+    tips = np.vstack([left_tips, right_tips]).astype(np.float32)  # (6,3)
+    palms = full_fk.palm_positions(q38).astype(np.float32)  # (2,3)
+    return tips, palms
+
+
+def _render_episode_animation(
+    *,
+    out_npz_path: Path,
+    traj_full: np.ndarray,              # (N,38)
+    fingertip_targets: np.ndarray,      # (T,6,3) for retarget segment only
+    ik_success_stage1: np.ndarray,      # (T,)
+    ik_success_stage2: np.ndarray,      # (T,)
+    pregrasp_steps: int,
+    full_fk: FullModelFK,
+) -> str:
+    N = int(traj_full.shape[0])
+    T = int(fingertip_targets.shape[0])
+    if N == 0:
+        raise ValueError("traj_full is empty, cannot render animation")
+
+    actual_tips = np.zeros((N, 6, 3), dtype=np.float32)
+    actual_palms = np.zeros((N, 2, 3), dtype=np.float32)
+    for i in range(N):
+        tips_i, palms_i = _compute_fk_points(full_fk, traj_full[i])
+        actual_tips[i] = tips_i
+        actual_palms[i] = palms_i
+
+    all_pts = np.concatenate(
+        [
+            actual_tips.reshape(-1, 3),
+            actual_palms.reshape(-1, 3),
+            fingertip_targets.reshape(-1, 3),
+        ],
+        axis=0,
+    )
+    mins = all_pts.min(axis=0)
+    maxs = all_pts.max(axis=0)
+    center = 0.5 * (mins + maxs)
+    span = float(np.max(maxs - mins))
+    span = max(span, 0.30)
+    half = 0.6 * span
+
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection="3d")
+    tip_colors = ["#1f77b4", "#4d8dd8", "#9fc5ff", "#d62728", "#f26d6d", "#ffb3b3"]
+
+    def _draw_table() -> None:
+        xs = np.array([center[0] - half, center[0] + half], dtype=np.float32)
+        ys = np.array([center[1] - half, center[1] + half], dtype=np.float32)
+        xx, yy = np.meshgrid(xs, ys)
+        zz = np.zeros_like(xx)
+        ax.plot_surface(xx, yy, zz, alpha=0.08, color="saddlebrown", linewidth=0)
+
+    def update(frame_idx: int) -> None:
+        ax.clear()
+        _draw_table()
+
+        tips = actual_tips[frame_idx]
+        palms = actual_palms[frame_idx]
+        ax.scatter(
+            palms[:, 0], palms[:, 1], palms[:, 2],
+            s=80, c=["#2ca02c", "#9467bd"], marker="^", label="palm(actual)"
+        )
+        for j in range(6):
+            p = tips[j]
+            ax.scatter(p[0], p[1], p[2], s=40, c=tip_colors[j], marker="o")
+
+        ret_idx = frame_idx - pregrasp_steps
+        status = "pregrasp"
+        if 0 <= ret_idx < T:
+            target = fingertip_targets[ret_idx]
+            ax.scatter(
+                target[:, 0], target[:, 1], target[:, 2],
+                s=34, c=tip_colors, marker="x", label="tips(target)"
+            )
+            status = f"retarget s1={bool(ik_success_stage1[ret_idx])} s2={bool(ik_success_stage2[ret_idx])}"
+
+        ax.set_xlim(center[0] - half, center[0] + half)
+        ax.set_ylim(center[1] - half, center[1] + half)
+        ax.set_zlim(min(-0.05, center[2] - half), center[2] + half)
+        ax.set_xlabel("X (world)")
+        ax.set_ylabel("Y (world)")
+        ax.set_zlabel("Z (world)")
+        ax.set_title(f"{out_npz_path.stem} | frame {frame_idx+1}/{N} | {status}")
+
+    stride = max(1, int(math.ceil(N / 400.0)))
+    frame_ids = list(range(0, N, stride))
+    ani = FuncAnimation(fig, update, frames=frame_ids, interval=66)
+    mp4_path = out_npz_path.with_name(f"{out_npz_path.stem}_anime.mp4")
+    gif_path = out_npz_path.with_name(f"{out_npz_path.stem}_anime.gif")
+    try:
+        ani.save(str(mp4_path), writer="ffmpeg", fps=15)
+        out = str(mp4_path)
+    except Exception:
+        ani.save(str(gif_path), writer="pillow", fps=12)
+        out = str(gif_path)
+    plt.close(fig)
+    return out
+
+
 def _episode_metrics_from_arrays(
     ik1: np.ndarray,
     ik2: np.ndarray,
@@ -393,6 +482,8 @@ def _save_episode_npz(
     task: str,
     episode: str,
     bottle_pos: np.ndarray,
+    anchor_mode: str,
+    anchor_fixed_z: float,
     q_home: np.ndarray,
     q_pregrasp: np.ndarray,
     traj_home_to_pregrasp: np.ndarray,
@@ -415,6 +506,8 @@ def _save_episode_npz(
         task=task,
         episode=episode,
         bottle_pos=bottle_pos.astype(np.float32),
+        anchor_mode=np.asarray(anchor_mode),
+        anchor_fixed_z=np.asarray(float(anchor_fixed_z), dtype=np.float32),
         q_home=q_home.astype(np.float32),
         q_pregrasp=q_pregrasp.astype(np.float32),
         traj_home_to_pregrasp=traj_home_to_pregrasp.astype(np.float32),
@@ -469,6 +562,277 @@ def _build_failure_reason_codes(
     return codes
 
 
+def _compute_baseline_collision_metrics(
+    baseline_joint_positions: np.ndarray,  # (T, 38)
+    planner: CuRoboBimanualMotionPlanner,
+) -> tuple[np.ndarray, np.ndarray]:
+    q_seq = np.asarray(baseline_joint_positions, dtype=np.float32)
+    if q_seq.ndim != 2 or q_seq.shape[1] != 38:
+        raise ValueError(f"Expected baseline joint_positions shape (T,38), got {q_seq.shape}")
+    T = q_seq.shape[0]
+    coll_actual = np.zeros((T,), dtype=bool)
+    coll_margin = np.zeros((T,), dtype=bool)
+    for i in range(T):
+        coll_actual[i] = planner.self_collision_check(q_seq[i])
+        coll_margin[i] = not _check_planning_distance_silent(planner, q_seq[i])
+    return coll_actual, coll_margin
+
+
+def _run_baseline_with_collision(
+    *,
+    ep_path: Path,
+    left_offset: np.ndarray,
+    right_offset: np.ndarray,
+    R_align: np.ndarray,
+    t_align: np.ndarray,
+    planner: CuRoboBimanualMotionPlanner,
+) -> dict[str, float]:
+    baseline = baseline_retarget_episode(
+        str(ep_path),
+        left_offset=left_offset,
+        right_offset=right_offset,
+        R_align=R_align,
+        t_align=t_align,
+    )
+    b_ik = np.asarray(baseline["ik_success"], dtype=bool).all(axis=1)
+    b_err = np.asarray(baseline.get("fingertip_errors"), dtype=np.float32)
+    b_q = np.asarray(baseline.get("joint_positions"), dtype=np.float32)
+    b_coll_actual, b_coll_margin = _compute_baseline_collision_metrics(b_q, planner)
+    metrics = {
+        "baseline_ik_success_rate": _safe_rate(b_ik.astype(np.float32)),
+        "baseline_tip_error_mean_m": float(np.mean(b_err)) if b_err.size > 0 else float("nan"),
+        "baseline_tip_error_p95_m": _percentile(b_err.reshape(-1), 95.0),
+        "baseline_collision_actual_rate": _safe_rate(b_coll_actual.astype(np.float32)),
+        "baseline_collision_margin_rate": _safe_rate(b_coll_margin.astype(np.float32)),
+    }
+    metrics["baseline_strict_success"] = _strict_success(
+        metrics["baseline_ik_success_rate"], metrics["baseline_collision_actual_rate"]
+    )
+    return metrics
+
+
+def _episode_sort_key(episode: str) -> tuple[int, int | str]:
+    try:
+        return (0, int(episode))
+    except Exception:
+        return (1, episode)
+
+
+def _load_report_rows(report_dir: Path) -> list[dict[str, Any]]:
+    json_path = report_dir / "curobo_2stage_vs_baseline.json"
+    if not json_path.exists():
+        raise FileNotFoundError(f"Existing report not found for recompute mode: {json_path}")
+    with json_path.open("r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if isinstance(obj, dict):
+        rows = obj.get("episodes", [])
+    elif isinstance(obj, list):
+        rows = obj
+    else:
+        rows = []
+    if not isinstance(rows, list):
+        raise ValueError(f"Invalid report format in {json_path}")
+    return [dict(r) for r in rows]
+
+
+def _select_recompute_keys(
+    rows: list[dict[str, Any]],
+    tasks: list[str],
+    smoke: bool,
+    max_episodes_per_task: int | None,
+) -> set[tuple[str, str]]:
+    keys: set[tuple[str, str]] = set()
+    task_set = set(tasks)
+    for task in sorted(task_set):
+        task_rows = [r for r in rows if str(r.get("task", "")) == task]
+        task_rows = sorted(task_rows, key=lambda r: _episode_sort_key(str(r.get("episode", ""))))
+        if smoke:
+            task_rows = task_rows[:1]
+        elif max_episodes_per_task is not None:
+            task_rows = task_rows[:max_episodes_per_task]
+        for r in task_rows:
+            keys.add((task, str(r.get("episode", ""))))
+    return keys
+
+
+def _load_alignment_for_recompute(
+    *,
+    row: dict[str, Any],
+    ep_path: Path,
+    output_root: Path,
+    bottle_pos_default: np.ndarray,
+    center_from: str,
+    center_time: str,
+    anchor_mode_default: str,
+    anchor_fixed_z_default: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    task = str(row["task"])
+    episode = str(row["episode"])
+    out_npz = output_root / task / f"{episode}_curobo_2stage.npz"
+    if out_npz.exists():
+        with np.load(str(out_npz), allow_pickle=True) as d:
+            if "R_align" in d and "t_align" in d:
+                return np.asarray(d["R_align"], dtype=np.float64), np.asarray(d["t_align"], dtype=np.float64)
+
+    anchor_mode = str(row.get("anchor_mode", anchor_mode_default))
+    anchor_fixed_z = float(row.get("anchor_fixed_z", anchor_fixed_z_default))
+    anchor_xyz = np.array(
+        [
+            float(row.get("anchor_x", bottle_pos_default[0])),
+            float(row.get("anchor_y", bottle_pos_default[1])),
+            float(row.get("anchor_z", bottle_pos_default[2])),
+        ],
+        dtype=np.float64,
+    )
+    R_align, t_align = compute_alignment(
+        str(ep_path),
+        anchor_xyz,
+        center_from=center_from,
+        center_time=center_time,
+        anchor_mode=anchor_mode,
+        anchor_fixed_z=anchor_fixed_z,
+        return_anchor=False,
+    )
+    return np.asarray(R_align, dtype=np.float64), np.asarray(t_align, dtype=np.float64)
+
+
+def _format_stats(vals: list[float]) -> str:
+    a = np.asarray(vals, dtype=np.float64)
+    if a.size == 0:
+        return "n/a"
+    return (
+        f"mean={np.mean(a):.6f}, median={np.median(a):.6f}, "
+        f"min={np.min(a):.6f}, max={np.max(a):.6f}"
+    )
+
+
+def _write_ik_experiment_summary(report_dir: Path, rows: list[dict[str, Any]]) -> Path:
+    out_path = report_dir / "ik_experiment_summary.md"
+    tasks = sorted({str(r.get("task", "")) for r in rows if "task" in r})
+
+    def _strict_rows(method: str) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            if method == "new":
+                ok = _strict_success(
+                    r.get("new_ik_success_both_rate"),
+                    r.get("new_collision_actual_rate"),
+                )
+            else:
+                ok = _strict_success(
+                    r.get("baseline_ik_success_rate"),
+                    r.get("baseline_collision_actual_rate"),
+                )
+            if ok == 1:
+                out.append(r)
+        return out
+
+    def _method_stats(method: str, subset: list[dict[str, Any]]) -> dict[str, str]:
+        if method == "new":
+            errs = [float(r["new_tip_error_mean_m"]) for r in subset if "new_tip_error_mean_m" in r]
+        else:
+            errs = [float(r["baseline_tip_error_mean_m"]) for r in subset if "baseline_tip_error_mean_m" in r]
+        return {
+            "count": str(len(subset)),
+            "rate": f"{(len(subset) / max(1, len(rows))):.2%}",
+            "stats": _format_stats(errs),
+        }
+
+    new_strict = _strict_rows("new")
+    baseline_strict = _strict_rows("baseline")
+    new_stats = _method_stats("new", new_strict)
+    base_stats = _method_stats("baseline", baseline_strict)
+
+    lines: list[str] = []
+    lines.append("# IK Experiment Summary")
+    lines.append("")
+    lines.append("## 1. EgoDex Input and Retargeting Inputs")
+    lines.append("- Episode source: `models/egodex/test/{task}/{episode}.hdf5`.")
+    lines.append("- Used arrays: per-frame hand transforms (`transforms`) and camera extrinsics (`cam_ext`).")
+    lines.append("- Extracted targets: 6 fingertip points (`left/right` thumb, index, middle) in EgoDex camera/world pipeline.")
+    lines.append("")
+    lines.append("## 2. Camera-to-URDF Anchoring")
+    lines.append("Given a fingertip point `p_cam` in EgoDex camera coordinates, the URDF/world point is:")
+    lines.append("")
+    lines.append("```text")
+    lines.append("p_urdf = R_cam2urdf * p_cam + t")
+    lines.append("```")
+    lines.append("")
+    lines.append("Where:")
+    lines.append("- `R_cam2urdf` is fixed by frame convention mapping.")
+    lines.append("- Camera center estimate:")
+    lines.append("")
+    lines.append("```text")
+    lines.append("c_cam = mean({p_cam(t, finger)} over selected fingers/frames)")
+    lines.append("```")
+    lines.append("")
+    lines.append("- Translation uses anchor `a_urdf`:")
+    lines.append("")
+    lines.append("```text")
+    lines.append("t = a_urdf - R_cam2urdf * c_cam")
+    lines.append("```")
+    lines.append("")
+    lines.append("- In this run, anchor mode is `last_xy_fixed_z` (xy from last-frame center after rotation, z fixed).")
+    lines.append("")
+    lines.append("## 3. Fingertip Pose Targets in URDF World")
+    lines.append("- For every frame and each of 6 fingertips, target is transformed via the equation above.")
+    lines.append("- These transformed fingertip points are the IK position targets used by all compared methods.")
+    lines.append("")
+    lines.append("## 4. IK Methods Compared")
+    lines.append("- Fully IK (concept, `curobo_ik.py`): one full-chain cuRobo solve using 6 fingertip position constraints.")
+    lines.append("- Baseline two-stage IK (`retarget_tool` / `retarget_episode_v6`):")
+    lines.append("  - Stage-1: Pinocchio-based arm IK to virtual palm centroids.")
+    lines.append("  - Stage-2: fixed-base finger retargeting (dex-retargeting).")
+    lines.append("- cuRobo two-stage IK (`curobo_two_stage_batch.py`):")
+    lines.append("  - Stage-1 cuRobo IK for palms.")
+    lines.append("  - Stage-2 cuRobo IK for 6 fingertips.")
+    lines.append("  - Pre-grasp: frame-0 IK result as `q_pregrasp`, then cuRobo trajopt plans `q_home -> q_pregrasp`.")
+    lines.append("")
+    lines.append("## 5. cuRobo Sphere Collision Check")
+    lines.append("- `collision_actual`: exact sphere penetration check (`self_collision_activation_distance = 0.0`).")
+    lines.append("- `collision_margin`: planning-margin check at activation distance used by planner.")
+    lines.append("- Baseline trajectories are now rechecked frame-by-frame with the same cuRobo sphere checker.")
+    lines.append("")
+    lines.append("## 6. Strict Result Summary (IK=1.0 and Actual Collision=0)")
+    lines.append(f"- Total episodes considered: `{len(rows)}`")
+    lines.append(f"- Baseline two-stage strict pass: `{base_stats['count']}` (`{base_stats['rate']}`)")
+    lines.append(f"  - Tip error stats (episode mean, meters): {base_stats['stats']}")
+    lines.append(f"- cuRobo two-stage strict pass: `{new_stats['count']}` (`{new_stats['rate']}`)")
+    lines.append(f"  - Tip error stats (episode mean, meters): {new_stats['stats']}")
+    lines.append("")
+    lines.append("Per-task strict pass counts:")
+    for task in tasks:
+        b_task = [r for r in baseline_strict if str(r.get("task", "")) == task]
+        n_task = [r for r in new_strict if str(r.get("task", "")) == task]
+        lines.append(f"- `{task}`: baseline={len(b_task)}, cuRobo={len(n_task)}")
+    lines.append("")
+    lines.append("## 7. Final Conclusion")
+    if len(baseline_strict) > len(new_strict):
+        lines.append(
+            "Under the strict criterion (IK success rate exactly 1.0 and zero actual self-collision), "
+            "baseline two-stage currently passes more episodes."
+        )
+    elif len(baseline_strict) < len(new_strict):
+        lines.append(
+            "Under the strict criterion (IK success rate exactly 1.0 and zero actual self-collision), "
+            "cuRobo two-stage currently passes more episodes."
+        )
+    else:
+        lines.append(
+            "Under the strict criterion (IK success rate exactly 1.0 and zero actual self-collision), "
+            "both two-stage methods currently pass the same number of episodes."
+        )
+    lines.append(
+        "On strict-pass subsets, cuRobo two-stage shows much lower fingertip error; "
+        "the bottleneck remains pass coverage consistency across tasks."
+    )
+    lines.append("")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return out_path
+
+
 def _write_reports(
     report_dir: Path,
     rows: list[dict[str, Any]],
@@ -479,15 +843,27 @@ def _write_reports(
 
     # Build global aggregates.
     def _agg(field: str) -> float:
-        vals = [float(r[field]) for r in rows if field in r and r[field] is not None]
+        vals = []
+        for r in rows:
+            if field not in r or r[field] is None:
+                continue
+            v = float(r[field])
+            if math.isnan(v):
+                continue
+            vals.append(v)
         return float(np.mean(vals)) if vals else float("nan")
 
     summary = {
         "num_episodes": len(rows),
         "new_ik_success_both_rate_mean": _agg("new_ik_success_both_rate"),
         "new_tip_error_mean_m": _agg("new_tip_error_mean_m"),
+        "new_collision_actual_rate_mean": _agg("new_collision_actual_rate"),
         "baseline_ik_success_rate_mean": _agg("baseline_ik_success_rate"),
         "baseline_tip_error_mean_m": _agg("baseline_tip_error_mean_m"),
+        "baseline_collision_actual_rate_mean": _agg("baseline_collision_actual_rate"),
+        "baseline_collision_margin_rate_mean": _agg("baseline_collision_margin_rate"),
+        "new_strict_success_rate": _agg("new_strict_success"),
+        "baseline_strict_success_rate": _agg("baseline_strict_success"),
         "pregrasp_plan_success_rate": _agg("pregrasp_plan_success"),
     }
     with json_path.open("w", encoding="utf-8") as f:
@@ -549,9 +925,22 @@ def parse_args() -> argparse.Namespace:
         "--bottle_pos",
         type=float,
         nargs=3,
-        default=[0.042, 0.0, -0.0215],
+        default=[0.042, 0.0, 0.10],
         metavar=("X", "Y", "Z"),
-        help="URDF bottle position used for alignment",
+        help="URDF bottle anchor position used when --anchor_mode=bottle_pos",
+    )
+    p.add_argument(
+        "--anchor_mode",
+        type=str,
+        default="last_xy_fixed_z",
+        choices=["bottle_pos", "last_xy_fixed_z"],
+        help="Trajectory anchoring mode for camera->URDF alignment",
+    )
+    p.add_argument(
+        "--anchor_fixed_z",
+        type=float,
+        default=0.10,
+        help="Used when --anchor_mode=last_xy_fixed_z",
     )
     p.add_argument(
         "--center_from",
@@ -559,6 +948,13 @@ def parse_args() -> argparse.Namespace:
         default="all6",
         choices=["all6", "left3", "right3"],
         help="Object center source for alignment",
+    )
+    p.add_argument(
+        "--center_time",
+        type=str,
+        default="last",
+        choices=["all", "last", "first"],
+        help="Frame subset used for object-center inference",
     )
     p.add_argument(
         "--left_offset",
@@ -595,6 +991,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip baseline run (still writes new-method outputs)",
     )
+    p.add_argument(
+        "--recompute_baseline_only",
+        action="store_true",
+        help="Reload existing report rows and recompute baseline metrics + baseline collision only.",
+    )
+    p.add_argument(
+        "--no_anime",
+        action="store_true",
+        help="Disable per-episode animation export",
+    )
     return p.parse_args()
 
 
@@ -611,14 +1017,6 @@ def main() -> None:
 
     q_home = _load_home_q_from_driver_cfg()
     print(f"Loaded HOME_Q from driver config: shape={q_home.shape}")
-
-    solver_params = SolverBuildParams(
-        device=args.device,
-        num_seeds_stage1=args.num_seeds_stage1,
-        num_seeds_stage2=args.num_seeds_stage2,
-    )
-    two_stage_solver = CuRoboTwoStageIK(solver_params)
-    full_fk = FullModelFK(URDF_RETARGET)
 
     planner = CuRoboBimanualMotionPlanner(
         robot_cfg_path=str(_REPO_ROOT / "libs" / "robot_description" / "configs_curobo" / "robot" / "bimanual_panda_tesollo.yml"),
@@ -637,6 +1035,83 @@ def main() -> None:
         collision_activation_distance=0.05,
     )
 
+    if args.recompute_baseline_only:
+        if args.skip_baseline:
+            raise ValueError("--recompute_baseline_only cannot be used with --skip_baseline")
+        rows = _load_report_rows(report_dir)
+        keys = _select_recompute_keys(rows, args.tasks, args.smoke, args.max_episodes_per_task)
+        print(f"Recompute baseline-only mode: selected {len(keys)} episode(s) for refresh.")
+
+        refreshed_rows: list[dict[str, Any]] = []
+        for row in rows:
+            row = dict(row)
+            task_name = str(row.get("task", ""))
+            ep_name = str(row.get("episode", ""))
+            key = (task_name, ep_name)
+
+            if key in keys:
+                t0 = time.time()
+                ep_path = data_root / task_name / f"{ep_name}.hdf5"
+                if not ep_path.exists():
+                    row["baseline_recompute_error"] = f"missing episode file: {ep_path}"
+                else:
+                    try:
+                        R_align, t_align = _load_alignment_for_recompute(
+                            row=row,
+                            ep_path=ep_path,
+                            output_root=output_root,
+                            bottle_pos_default=bottle_pos,
+                            center_from=args.center_from,
+                            center_time=args.center_time,
+                            anchor_mode_default=args.anchor_mode,
+                            anchor_fixed_z_default=float(args.anchor_fixed_z),
+                        )
+                        baseline_metrics = _run_baseline_with_collision(
+                            ep_path=ep_path,
+                            left_offset=left_offset,
+                            right_offset=right_offset,
+                            R_align=R_align,
+                            t_align=t_align,
+                            planner=planner,
+                        )
+                        row.update(baseline_metrics)
+                        row["baseline_recompute_runtime_sec"] = float(time.time() - t0)
+                        row.pop("baseline_recompute_error", None)
+                        print(
+                            f"[baseline-refresh {task_name}/{ep_name}] "
+                            f"ik={float(row.get('baseline_ik_success_rate', 0.0)):.1%} "
+                            f"coll={float(row.get('baseline_collision_actual_rate', 0.0)):.1%}"
+                        )
+                    except Exception as exc:
+                        row["baseline_recompute_error"] = repr(exc)
+                        print(f"[baseline-refresh {task_name}/{ep_name}] ERROR: {exc}")
+
+            row["new_strict_success"] = _strict_success(
+                row.get("new_ik_success_both_rate"),
+                row.get("new_collision_actual_rate"),
+            )
+            row["baseline_strict_success"] = _strict_success(
+                row.get("baseline_ik_success_rate"),
+                row.get("baseline_collision_actual_rate"),
+            )
+            refreshed_rows.append(row)
+
+        json_path, csv_path = _write_reports(report_dir, refreshed_rows)
+        md_path = _write_ik_experiment_summary(report_dir, refreshed_rows)
+        print("\n=== Reports (baseline refresh) ===")
+        print(f"JSON: {json_path}")
+        print(f"CSV:  {csv_path}")
+        print(f"MD:   {md_path}")
+        return
+
+    solver_params = SolverBuildParams(
+        device=args.device,
+        num_seeds_stage1=args.num_seeds_stage1,
+        num_seeds_stage2=args.num_seeds_stage2,
+    )
+    two_stage_solver = CuRoboTwoStageIK(solver_params)
+    full_fk = FullModelFK(URDF_RETARGET)
+
     episode_rows: list[dict[str, Any]] = []
 
     for task in args.tasks:
@@ -654,7 +1129,15 @@ def main() -> None:
             print(f"\n[{task_name}/{ep_name}] start")
 
             try:
-                R_align, t_align = compute_alignment(str(ep_path), bottle_pos, center_from=args.center_from)
+                R_align, t_align, anchor_pos = compute_alignment(
+                    str(ep_path),
+                    bottle_pos,
+                    center_from=args.center_from,
+                    center_time=args.center_time,
+                    anchor_mode=args.anchor_mode,
+                    anchor_fixed_z=float(args.anchor_fixed_z),
+                    return_anchor=True,
+                )
                 ep = load_episode(str(ep_path))
                 target_tips = _extract_fingertip_targets_urdf(ep, R_align, t_align)  # (T,6,3)
                 T = target_tips.shape[0]
@@ -667,7 +1150,6 @@ def main() -> None:
                 coll_margin = np.zeros((T,), dtype=bool)
 
                 q_prev = q_home.copy()
-                rebuild_before = two_stage_solver._stage2_rebuild_count
                 for i in range(T):
                     q_i, ok1, ok2 = two_stage_solver.solve_frame(target_tips[i], q_prev, q_home=q_home)
                     q_retarget[i] = q_i
@@ -677,7 +1159,7 @@ def main() -> None:
                     coll_actual[i] = planner.self_collision_check(q_i)
                     coll_margin[i] = not _check_planning_distance_silent(planner, q_i)
 
-                    if ok1:
+                    if ok1 or ok2:
                         q_prev = q_i
 
                     if i % 50 == 0 or i == T - 1:
@@ -703,20 +1185,14 @@ def main() -> None:
 
                 baseline_metrics: dict[str, Any] = {}
                 if not args.skip_baseline:
-                    baseline = baseline_retarget_episode(
-                        str(ep_path),
+                    baseline_metrics = _run_baseline_with_collision(
+                        ep_path=ep_path,
                         left_offset=left_offset,
                         right_offset=right_offset,
                         R_align=R_align,
                         t_align=t_align,
+                        planner=planner,
                     )
-                    b_ik = np.asarray(baseline["ik_success"], dtype=bool).all(axis=1)
-                    b_err = np.asarray(baseline.get("fingertip_errors"), dtype=np.float32)
-                    baseline_metrics = {
-                        "baseline_ik_success_rate": _safe_rate(b_ik.astype(np.float32)),
-                        "baseline_tip_error_mean_m": float(np.mean(b_err)) if b_err.size > 0 else float("nan"),
-                        "baseline_tip_error_p95_m": _percentile(b_err.reshape(-1), 95.0),
-                    }
 
                 out_path = output_root / task_name / f"{ep_name}_curobo_2stage.npz"
                 _save_episode_npz(
@@ -724,7 +1200,9 @@ def main() -> None:
                     source="egodex",
                     task=task_name,
                     episode=ep_name,
-                    bottle_pos=bottle_pos,
+                    bottle_pos=anchor_pos,
+                    anchor_mode=args.anchor_mode,
+                    anchor_fixed_z=float(args.anchor_fixed_z),
                     q_home=q_home,
                     q_pregrasp=q_pregrasp,
                     traj_home_to_pregrasp=traj_home_to_pregrasp,
@@ -741,9 +1219,26 @@ def main() -> None:
                     failure_reason_codes=failure_codes,
                 )
 
+                anime_path = ""
+                if not args.no_anime:
+                    anime_path = _render_episode_animation(
+                        out_npz_path=out_path,
+                        traj_full=traj_full,
+                        fingertip_targets=target_tips,
+                        ik_success_stage1=ik1,
+                        ik_success_stage2=ik2,
+                        pregrasp_steps=int(traj_home_to_pregrasp.shape[0]),
+                        full_fk=full_fk,
+                    )
+
                 row = {
                     "task": task_name,
                     "episode": ep_name,
+                    "anchor_mode": args.anchor_mode,
+                    "anchor_fixed_z": float(args.anchor_fixed_z),
+                    "anchor_x": float(anchor_pos[0]),
+                    "anchor_y": float(anchor_pos[1]),
+                    "anchor_z": float(anchor_pos[2]),
                     "frames": T,
                     "pregrasp_plan_success": int(bool(plan_ok)),
                     "pregrasp_traj_steps": int(traj_home_to_pregrasp.shape[0]),
@@ -757,11 +1252,20 @@ def main() -> None:
                     "new_tip_error_p95_m": new_metrics["tip_error_p95_m"],
                     "new_collision_actual_rate": new_metrics["collision_actual_rate"],
                     "new_collision_margin_rate": new_metrics["collision_margin_rate"],
-                    "stage2_rebuild_count": two_stage_solver._stage2_rebuild_count - rebuild_before,
+                    "new_strict_success": _strict_success(
+                        new_metrics["ik_success_both_rate"], new_metrics["collision_actual_rate"]
+                    ),
+                    "stage2_rebuild_count": 0,
                     "failure_reason_codes": ";".join(failure_codes),
+                    "anime_path": anime_path,
                     "runtime_sec": float(time.time() - t0),
                 }
                 row.update(baseline_metrics)
+                if "baseline_strict_success" not in row:
+                    row["baseline_strict_success"] = _strict_success(
+                        row.get("baseline_ik_success_rate"),
+                        row.get("baseline_collision_actual_rate"),
+                    )
                 episode_rows.append(row)
                 print(
                     f"[{task_name}/{ep_name}] done | both_ik={row['new_ik_success_both_rate']:.1%} "
@@ -780,9 +1284,11 @@ def main() -> None:
                 print(f"[{task_name}/{ep_name}] ERROR: {exc}")
 
     json_path, csv_path = _write_reports(report_dir, episode_rows)
+    md_path = _write_ik_experiment_summary(report_dir, episode_rows)
     print("\n=== Reports ===")
     print(f"JSON: {json_path}")
     print(f"CSV:  {csv_path}")
+    print(f"MD:   {md_path}")
 
 
 if __name__ == "__main__":

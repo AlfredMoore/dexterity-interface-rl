@@ -10,11 +10,11 @@ The object alignment is parameterized by --bottle_pos.
 
 Usage:
     # Single episode
-    python retarget_tool.py --bottle_pos 0.042 0.0 -0.0215 \
+    python retarget_tool.py --bottle_pos 0.042 0.0 0.10 \
         --episode_idx 0 --output traj_0.npz
 
     # All episodes
-    python retarget_tool.py --bottle_pos 0.042 0.0 -0.0215 \
+    python retarget_tool.py --bottle_pos 0.042 0.0 0.10 \
         --all --output_dir trajs/
 
     # Custom data directory
@@ -73,7 +73,11 @@ def compute_alignment(
     hdf5_path: str,
     bottle_pos: np.ndarray,
     center_from: str = "all6",
-) -> tuple[np.ndarray, np.ndarray]:
+    center_time: str = "last",
+    anchor_mode: str = "bottle_pos",
+    anchor_fixed_z: float = 0.10,
+    return_anchor: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Compute (R, t) from EgoDex camera frame -> bimanual URDF frame,
     centering the object at the given bottle_pos.
@@ -83,19 +87,42 @@ def compute_alignment(
     2. Analytical rotation: camera -> URDF
     3. Translation: align rotated object center to bottle_pos
 
-    Returns (R, t) where urdf_pos = R @ cam_pos + t.
+    Anchor modes:
+      - bottle_pos: anchor center to user-provided bottle_pos (legacy behavior).
+      - last_xy_fixed_z: anchor XY to last-frame center after rotation, and force Z.
+
+    Returns (R, t) or (R, t, anchor_pos) where urdf_pos = R @ cam_pos + t.
     """
     if center_from not in _CENTER_TIP_SETS:
         raise ValueError(
             f"Invalid center_from='{center_from}', expected one of {list(_CENTER_TIP_SETS.keys())}"
+        )
+    if center_time not in {"all", "last", "first"}:
+        raise ValueError(
+            "Invalid center_time='{}', expected one of ['all', 'last', 'first']".format(
+                center_time
+            )
+        )
+    if anchor_mode not in {"bottle_pos", "last_xy_fixed_z"}:
+        raise ValueError(
+            "Invalid anchor_mode='{}', expected one of ['bottle_pos', 'last_xy_fixed_z']".format(
+                anchor_mode
+            )
         )
     ep = load_episode(hdf5_path)
     identity_aligner = CoordinateAligner()
     T = len(ep["transforms"]["leftHand"])
 
     all_tips = _CENTER_TIP_SETS[center_from]
+    if center_time == "all":
+        frame_indices = range(T)
+    elif center_time == "last":
+        frame_indices = [T - 1]
+    else:
+        frame_indices = [0]
+
     all_positions = []
-    for i in range(T):
+    for i in frame_indices:
         cam_ext_i = ep["cam_ext"][i]
         for tip_name in all_tips:
             pos = _world_to_robot_pos(
@@ -106,13 +133,38 @@ def compute_alignment(
     cam_object_center = all_positions.mean(axis=0)
 
     R = _R_CAM_TO_URDF.copy()
-    t = bottle_pos - R @ cam_object_center
+    if anchor_mode == "bottle_pos":
+        anchor_pos = np.asarray(bottle_pos, dtype=np.float64).copy()
+    else:
+        cam_ext_last = ep["cam_ext"][T - 1]
+        last_positions = []
+        for tip_name in all_tips:
+            pos_last = _world_to_robot_pos(
+                ep["transforms"][tip_name][T - 1], cam_ext_last, identity_aligner
+            )
+            last_positions.append(pos_last)
+        last_positions = np.asarray(last_positions, dtype=np.float64)
+        cam_center_last = last_positions.mean(axis=0)
+        urdf_center_last = R @ cam_center_last
+        anchor_pos = np.array(
+            [urdf_center_last[0], urdf_center_last[1], float(anchor_fixed_z)],
+            dtype=np.float64,
+        )
+    t = anchor_pos - R @ cam_object_center
 
-    print(f"  Object center source: {center_from} ({len(all_tips)} tips)")
+    print(
+        f"  Object center source: {center_from} ({len(all_tips)} tips) "
+        f"@ {center_time} frame(s)"
+    )
+    print(f"  Anchor mode: {anchor_mode}")
+    if anchor_mode == "last_xy_fixed_z":
+        print(f"  Anchor fixed z: {anchor_fixed_z:.4f}")
     print(f"  Object center (cam): ({cam_object_center[0]:.4f}, "
           f"{cam_object_center[1]:.4f}, {cam_object_center[2]:.4f})")
-    print(f"  Bottle pos (urdf):   ({bottle_pos[0]:.4f}, "
-          f"{bottle_pos[1]:.4f}, {bottle_pos[2]:.4f})")
+    print(f"  Anchor pos (urdf):   ({anchor_pos[0]:.4f}, "
+          f"{anchor_pos[1]:.4f}, {anchor_pos[2]:.4f})")
+    if return_anchor:
+        return R, t, anchor_pos
     return R, t
 
 
@@ -233,13 +285,24 @@ def process_single(
     right_offset: np.ndarray,
     output_path: Path,
     center_from: str = "all6",
+    center_time: str = "last",
+    anchor_mode: str = "bottle_pos",
+    anchor_fixed_z: float = 0.10,
     visualize: bool = False,
     anim_path: Path | None = None,
 ) -> dict:
     """Retarget a single episode and save to output_path."""
     print(f"\nComputing alignment from {hdf5_path.name} "
           f"with bottle_pos=({bottle_pos[0]:.4f}, {bottle_pos[1]:.4f}, {bottle_pos[2]:.4f})...")
-    R_align, t_align = compute_alignment(str(hdf5_path), bottle_pos, center_from=center_from)
+    R_align, t_align, anchor_pos = compute_alignment(
+        str(hdf5_path),
+        bottle_pos,
+        center_from=center_from,
+        center_time=center_time,
+        anchor_mode=anchor_mode,
+        anchor_fixed_z=anchor_fixed_z,
+        return_anchor=True,
+    )
 
     print(f"Using palm offsets: left={left_offset}, right={right_offset}")
     print(f"Retargeting {hdf5_path.name}...")
@@ -264,11 +327,13 @@ def process_single(
         ik_success=result["ik_success"],
         fingertip_targets=result["fingertip_targets"],
         fingertip_errors=result.get("fingertip_errors"),
-        bottle_pos=bottle_pos,
+        bottle_pos=anchor_pos,
         R_align=R_align,
         t_align=t_align,
         left_offset=left_offset,
         right_offset=right_offset,
+        anchor_mode=anchor_mode,
+        anchor_fixed_z=np.array(float(anchor_fixed_z), dtype=np.float32),
         episode=hdf5_path.stem,
         fps=30,
     )
@@ -305,6 +370,30 @@ def main():
             "Which fingertip set to use for object-center inference: "
             "all6=both hands, left3=left thumb/index/middle, right3=right thumb/index/middle"
         ),
+    )
+    parser.add_argument(
+        "--center_time", type=str, default="last", choices=["all", "last", "first"],
+        help=(
+            "Which frame subset is used for object-center inference: "
+            "all=all frames, last=final frame, first=initial frame"
+        ),
+    )
+    parser.add_argument(
+        "--anchor_mode",
+        type=str,
+        default="bottle_pos",
+        choices=["bottle_pos", "last_xy_fixed_z"],
+        help=(
+            "How to place the trajectory in URDF world: "
+            "bottle_pos=legacy absolute anchor, "
+            "last_xy_fixed_z=XY from last-frame center and fixed Z"
+        ),
+    )
+    parser.add_argument(
+        "--anchor_fixed_z",
+        type=float,
+        default=0.10,
+        help="Used when anchor_mode=last_xy_fixed_z",
     )
     parser.add_argument(
         "--left_offset", type=float, nargs=3, default=_DEFAULT_LEFT_OFFSET.tolist(),
@@ -375,6 +464,9 @@ def main():
             right_offset,
             output_path,
             center_from=args.center_from,
+            center_time=args.center_time,
+            anchor_mode=args.anchor_mode,
+            anchor_fixed_z=float(args.anchor_fixed_z),
             visualize=args.viz,
         )
 
@@ -401,6 +493,9 @@ def main():
                 right_offset,
                 out_path,
                 center_from=args.center_from,
+                center_time=args.center_time,
+                anchor_mode=args.anchor_mode,
+                anchor_fixed_z=float(args.anchor_fixed_z),
                 visualize=args.viz,
             )
             results.append(r)

@@ -22,8 +22,21 @@ Run on recorded realsense data:
 import cv2
 import numpy as np
 import torch
+from pathlib import Path
 
 from promptda.promptda import PromptDA
+
+
+_UTILS_FILE = Path(__file__).resolve()
+_REPO_ROOT = _UTILS_FILE.parents[5]
+
+DEFAULT_PROMPTDA_CKPT = "models/promptda/PromptDA-s-transparent.ckpt"
+DEFAULT_PROMPTDA_ENCODER = "vits"
+
+
+def _resolve_repo_path(path: str | Path) -> Path:
+    p = Path(path)
+    return (_REPO_ROOT / p) if not p.is_absolute() else p
 
 class PromptDAInference:
     """
@@ -35,8 +48,8 @@ class PromptDAInference:
     """
 
     def __init__(self,
-                 ckpt_path: str,
-                 encoder: str = "vits",
+                 ckpt_path: str | None = None,
+                 encoder: str = DEFAULT_PROMPTDA_ENCODER,
                  device: str = "cuda",
                  max_size: int = 1008,
                  multiple_of: int = 14,
@@ -56,8 +69,12 @@ class PromptDAInference:
         self.multiple_of = multiple_of
         self.depth_scale = depth_scale
 
+        resolved_ckpt = _resolve_repo_path(ckpt_path or DEFAULT_PROMPTDA_CKPT)
+        self.ckpt_path = str(resolved_ckpt)
+        self.encoder = encoder
+
         self.model = PromptDA.from_pretrained(
-            ckpt_path, model_kwargs={"encoder": encoder}
+            self.ckpt_path, model_kwargs={"encoder": encoder}
         ).to(self.device).eval()
 
     def _preprocess_color(self, bgr: np.ndarray) -> torch.Tensor:
@@ -105,16 +122,11 @@ class PromptDAInference:
 if __name__ == "__main__":
     import argparse
     import time
-    from pathlib import Path
-
-    # Repo root: promptda_utils.py is 5 levels deep inside the repo
-    # libs/robot_motion_interface/src/robot_motion_interface/utils/promptda_utils.py
-    _REPO_ROOT = Path(__file__).resolve().parents[5]
 
     parser = argparse.ArgumentParser(description="PromptDA benchmark / folder inference")
-    parser.add_argument("--ckpt",       type=str, default=None,
-                        help="Checkpoint path (default: models/promptda/PromptDA-s-transparent.ckpt)")
-    parser.add_argument("--encoder",    type=str, default="vits", choices=["vits", "vitl"])
+    parser.add_argument("--ckpt",       type=str, default=DEFAULT_PROMPTDA_CKPT,
+                        help=f"Checkpoint path (default: {DEFAULT_PROMPTDA_CKPT})")
+    parser.add_argument("--encoder",    type=str, default=DEFAULT_PROMPTDA_ENCODER, choices=["vits", "vitl"])
     parser.add_argument("--device",     type=str, default="cuda")
     parser.add_argument("--width",      type=int, default=640)
     parser.add_argument("--height",     type=int, default=480)
@@ -130,12 +142,7 @@ if __name__ == "__main__":
                         help="FPS of the output video (folder mode, default: 30)")
     args = parser.parse_args()
 
-    def _resolve(p: str) -> Path:
-        path = Path(p)
-        return _REPO_ROOT / path if not path.is_absolute() else path
-
-    ckpt_path = str(_resolve(args.ckpt) if args.ckpt else
-                    _REPO_ROOT / "models" / "promptda" / "PromptDA-s-transparent.ckpt")
+    ckpt_path = str(_resolve_repo_path(args.ckpt))
 
     # ── Folder mode setup ───────────────────────────────────────────────────
     record_dir:  Path       = Path()
@@ -144,7 +151,7 @@ if __name__ == "__main__":
     out_dir:     Path       = Path()
 
     if args.frames_dir is not None:
-        record_dir = _resolve(args.frames_dir)
+        record_dir = _resolve_repo_path(args.frames_dir)
         color_dir  = record_dir / "color"
         depth_dir  = record_dir / "depth"
         if not color_dir.is_dir() or not depth_dir.is_dir():
@@ -155,7 +162,7 @@ if __name__ == "__main__":
                              if p.suffix.lower() in (".jpg", ".jpeg", ".png"))
         if not color_paths:
             raise FileNotFoundError(f"No color frames in {color_dir}")
-        out_dir = _resolve(args.out_dir) if args.out_dir else \
+        out_dir = _resolve_repo_path(args.out_dir) if args.out_dir else \
                   record_dir / "promptda"
         out_dir.mkdir(parents=True, exist_ok=True)
         mode = "folder"

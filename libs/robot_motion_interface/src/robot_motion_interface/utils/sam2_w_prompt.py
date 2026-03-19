@@ -67,6 +67,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from typing import Dict, Optional
+from pathlib import Path
 
 from robot_motion_interface.utils.sam3_utils import SAM3Inference, CONCEPT_ARM as _SAM3_CONCEPT_ARM
 from robot_motion_interface.utils.sam2_utils import SAM2Inference
@@ -75,7 +76,7 @@ from robot_motion_interface.utils.sam2_utils import SAM2Inference
 # Text prompts sent to SAM3. Change these strings to adjust detection vocabulary.
 TEXT_ARM  = "robot arm"
 TEXT_HAND = "robot hand"
-TEXT_OBJ  = "box"
+TEXT_OBJ  = "bottle"
 
 CONCEPT_ARM  = 1   # single prompt, up to 2 instances (both arms)
 CONCEPT_HAND = 2   # single prompt, up to 2 instances (both hands)
@@ -96,6 +97,24 @@ DEFAULT_MAX_INSTANCES: Dict[int, int] = {
     CONCEPT_HAND: 2,
     CONCEPT_OBJ:  1,
 }
+
+_UTILS_FILE = Path(__file__).resolve()
+_REPO_ROOT = _UTILS_FILE.parents[5]
+
+DEFAULT_SAM3_CKPT = "models/sam3/sam3.pt"
+DEFAULT_SAM2_CKPT = "models/sam2/sam2.1_hiera_large.pt"
+DEFAULT_SAM2_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
+
+
+def _resolve_repo_path(path: str) -> str:
+    p = Path(path)
+    if p.is_absolute():
+        return str(p)
+    candidate = _REPO_ROOT / p
+    if candidate.exists():
+        return str(candidate)
+    # Some SAM2 configs are looked up by name from the sam2 package.
+    return path
 
 def bgr2rgb(frame: np.ndarray) -> np.ndarray:
     """Convert BGR (OpenCV / RealSense) to RGB."""
@@ -135,9 +154,9 @@ class SAM2WithPrompt:
 
     Usage:
         tracker = SAM2WithPrompt(
-            sam2_ckpt="models/sam2/sam2.1_hiera_small.pt",
-            sam2_cfg="configs/sam2.1/sam2.1_hiera_s.yaml",
-            sam3_ckpt="models/sam3/sam3.pt",
+            sam2_ckpt=DEFAULT_SAM2_CKPT,
+            sam2_cfg=DEFAULT_SAM2_CFG,
+            sam3_ckpt=DEFAULT_SAM3_CKPT,
         )
         tracker.warmup(first_bgr_frame)
         tracker.init_prompt(init_bgr_frame)
@@ -147,14 +166,15 @@ class SAM2WithPrompt:
 
     def __init__(
         self,
-        sam2_ckpt: str,
-        sam2_cfg: str,
-        sam3_ckpt: str,
-        concept_map: dict,
-        max_instances_per_concept: dict,
+        sam2_ckpt: str = DEFAULT_SAM2_CKPT,
+        sam2_cfg: str = DEFAULT_SAM2_CFG,
+        sam3_ckpt: str = DEFAULT_SAM3_CKPT,
+        concept_map: Optional[dict] = None,
+        max_instances_per_concept: Optional[dict] = None,
         device: str = "cuda",
         compile: bool = True,
         merge_arm_mask: bool = True,
+        verbose: bool = True,
     ):
         """
         Args:
@@ -171,7 +191,14 @@ class SAM2WithPrompt:
         """
         self.device = device
         self._merge_arm_mask = merge_arm_mask
+        self.verbose = verbose
         self._objects: list[dict] = []
+        concept_map = dict(concept_map or DEFAULT_CONCEPT_MAP)
+        max_instances_per_concept = dict(max_instances_per_concept or DEFAULT_MAX_INSTANCES)
+
+        sam3_ckpt = _resolve_repo_path(sam3_ckpt)
+        sam2_ckpt = _resolve_repo_path(sam2_ckpt)
+        sam2_cfg = _resolve_repo_path(sam2_cfg)
 
         self.sam3 = SAM3Inference(
             ckpt_path=sam3_ckpt,
@@ -188,6 +215,10 @@ class SAM2WithPrompt:
             compile_image_encoder=compile,
             multimask_output=False,
         )
+
+    def _vprint(self, msg: str) -> None:
+        if self.verbose:
+            print(msg)
 
     # ── Warmup ─────────────────────────────────────────────────────────────
 
@@ -207,7 +238,7 @@ class SAM2WithPrompt:
         dummy_box = np.array([w // 4, h // 4, 3 * w // 4, 3 * h // 4], dtype=np.float32)
         rgb = bgr2rgb(frame)
 
-        print(f"  Warming up SAM2 ({n} iters) ...")
+        self._vprint(f"  Warming up SAM2 ({n} iters) ...")
         for _ in range(n):
             with torch.inference_mode():
                 with torch.autocast(self.sam2.device.type, dtype=torch.bfloat16):
@@ -223,7 +254,7 @@ class SAM2WithPrompt:
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        print("  Warmup done.")
+        self._vprint("  Warmup done.")
 
     # ── Initialisation ──────────────────────────────────────────────────────
 
@@ -252,7 +283,7 @@ class SAM2WithPrompt:
             scores  = result["scores"]  # (N,)   tensor or None
 
             if boxes is None:
-                print(f"  [init_prompt] no detections for '{concept}'")
+                self._vprint(f"  [init_prompt] no detections for '{concept}'")
                 continue
 
             # ── Merged arm path ─────────────────────────────────────────────
@@ -280,8 +311,10 @@ class SAM2WithPrompt:
                         "mask":         None,
                         "score":        mean_score,
                     })
-                    print(f"  [init_prompt] {concept}(merged)  box={merged_box.astype(int)}  "
-                          f"instances={len(boxes)}  score={mean_score:.3f}")
+                    self._vprint(
+                        f"  [init_prompt] {concept}(merged)  box={merged_box.astype(int)}  "
+                        f"instances={len(boxes)}  score={mean_score:.3f}"
+                    )
                 continue
 
             # ── Per-instance path (all other concepts) ───────────────────────
@@ -312,13 +345,15 @@ class SAM2WithPrompt:
                     "score":        float(score),
                 })
                 side = f" ({'left' if i == 0 else 'right'})" if self.sam3.max_instances.get(obj_id, 1) > 1 else ""
-                print(f"  [init_prompt] {concept}#{i}{side}  box={box.astype(int)}  score={score:.3f}")
+                self._vprint(
+                    f"  [init_prompt] {concept}#{i}{side}  box={box.astype(int)}  score={score:.3f}"
+                )
 
         # Offload SAM3 to CPU — VRAM freed
         self.sam3.processor.model.to("cpu")
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        print("  SAM3 offloaded to CPU.")
+        self._vprint("  SAM3 offloaded to CPU.")
 
         return list(self._objects)
 
@@ -427,18 +462,15 @@ def draw_results(frame: np.ndarray, objects: list[dict]) -> np.ndarray:
 if __name__ == "__main__":
     import argparse
     import time
-    from pathlib import Path
-
-    _REPO_ROOT = Path(__file__).resolve().parents[5]
 
     parser = argparse.ArgumentParser(
         description="Benchmark SAM3-init + SAM2-track pipeline"
     )
-    parser.add_argument("--sam3_ckpt", default="models/sam3/sam3.pt")
+    parser.add_argument("--sam3_ckpt", default=DEFAULT_SAM3_CKPT)
     parser.add_argument("--sam2_ckpt",
-                        default="models/sam2/sam2.1_hiera_small.pt")
+                        default=DEFAULT_SAM2_CKPT)
     parser.add_argument("--sam2_cfg",
-                        default="configs/sam2.1/sam2.1_hiera_s.yaml")
+                        default=DEFAULT_SAM2_CFG)
     parser.add_argument("--device",    default="cuda")
     parser.add_argument("--compile",   action="store_true")
     parser.add_argument("--warmup",    type=int, default=3)
@@ -450,18 +482,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
 
-    def _resolve(p: str) -> str:
-        path = Path(p)
-        return str(_REPO_ROOT / path) if not path.is_absolute() else p
-
     # ── Frame list ──────────────────────────────────────────────────────────
     if args.frames_dir is not None:
-        frames_dir  = Path(_resolve(args.frames_dir))
+        frames_dir  = Path(_resolve_repo_path(args.frames_dir))
         frame_paths = sorted(p for p in frames_dir.iterdir()
                              if p.suffix.lower() in (".jpg", ".jpeg", ".png"))
         if not frame_paths:
             raise FileNotFoundError(f"No jpg/png frames in: {frames_dir}")
-        out_dir = Path(_resolve(args.out_dir)) if args.out_dir else \
+        out_dir = Path(_resolve_repo_path(args.out_dir)) if args.out_dir else \
                   frames_dir.parent / (frames_dir.name + "_sam2wp")
         out_dir.mkdir(parents=True, exist_ok=True)
         mode = "folder"
@@ -481,8 +509,8 @@ if __name__ == "__main__":
     print("  SAM3-init + SAM2-track Benchmark")
     print("=" * 65)
     print(f"  GPU        : {gpu_info}")
-    print(f"  SAM3 ckpt  : {_resolve(args.sam3_ckpt)}")
-    print(f"  SAM2 ckpt  : {_resolve(args.sam2_ckpt)}")
+    print(f"  SAM3 ckpt  : {_resolve_repo_path(args.sam3_ckpt)}")
+    print(f"  SAM2 ckpt  : {_resolve_repo_path(args.sam2_ckpt)}")
     print(f"  compile    : {args.compile}")
     if mode == "folder":
         print(f"  frames_dir : {args.frames_dir}  ({len(frame_paths)} frames)")
@@ -491,9 +519,9 @@ if __name__ == "__main__":
     # ── Build ────────────────────────────────────────────────────────────────
     t_load = time.time()
     tracker = SAM2WithPrompt(
-        sam2_ckpt=_resolve(args.sam2_ckpt),
-        sam2_cfg=args.sam2_cfg,
-        sam3_ckpt=_resolve(args.sam3_ckpt),
+        sam2_ckpt=_resolve_repo_path(args.sam2_ckpt),
+        sam2_cfg=_resolve_repo_path(args.sam2_cfg),
+        sam3_ckpt=_resolve_repo_path(args.sam3_ckpt),
         concept_map=DEFAULT_CONCEPT_MAP,
         max_instances_per_concept=DEFAULT_MAX_INSTANCES,
         device=args.device,

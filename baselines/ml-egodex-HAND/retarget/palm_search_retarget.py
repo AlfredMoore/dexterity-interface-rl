@@ -62,6 +62,10 @@ _SIDE_TIP_FRAMES = {
     "left": ["left_F1_TIP", "left_F2_TIP", "left_F3_TIP"],
     "right": ["right_F1_TIP", "right_F2_TIP", "right_F3_TIP"],
 }
+_SIDE_PALM_FRAMES = {
+    "left": ["left_virtual_palm", "left_delto_base_link"],
+    "right": ["right_virtual_palm", "right_delto_base_link"],
+}
 _SIDE_ARM_JOINTS = {
     "left": LEFT_PANDA_JOINTS,
     "right": RIGHT_PANDA_JOINTS,
@@ -179,7 +183,7 @@ class PalmOffsetIKSolver:
 # ---------------------------------------------------------------------------
 
 class FullModelFK:
-    """Full bimanual model FK for fingertip position verification."""
+    """Full bimanual model FK for fingertip and palm position verification."""
 
     def __init__(self, urdf_path: Path = _BIMANUAL_URDF) -> None:
         self.model = pin.buildModelFromUrdf(str(urdf_path))
@@ -192,6 +196,17 @@ class FullModelFK:
                 fid = self.model.getFrameId(tip_name)
                 assert fid < len(self.model.frames), f"Frame '{tip_name}' not found"
                 self.tip_frame_ids[tip_name] = fid
+
+        self.palm_frame_ids = {}
+        for side in ("left", "right"):
+            chosen = None
+            for frame_name in _SIDE_PALM_FRAMES[side]:
+                fid = self.model.getFrameId(frame_name)
+                if fid < len(self.model.frames):
+                    chosen = fid
+                    break
+            assert chosen is not None, f"Palm frame not found for side='{side}'"
+            self.palm_frame_ids[side] = chosen
 
     def fingertip_positions(self, q38: np.ndarray, side: str) -> np.ndarray:
         """
@@ -209,6 +224,20 @@ class FullModelFK:
         for i, tip_name in enumerate(_SIDE_TIP_FRAMES[side]):
             tips[i] = self.data.oMf[self.tip_frame_ids[tip_name]].translation.copy()
         return tips
+
+    def palm_positions(self, q38: np.ndarray) -> np.ndarray:
+        """
+        Compute left/right palm world positions from full joint state.
+
+        Returns:
+            (2, 3) array — rows are [left_palm, right_palm]
+        """
+        pin.forwardKinematics(self.model, self.data, q38)
+        pin.updateFramePlacements(self.model, self.data)
+        palms = np.zeros((2, 3), dtype=np.float64)
+        palms[0] = self.data.oMf[self.palm_frame_ids["left"]].translation.copy()
+        palms[1] = self.data.oMf[self.palm_frame_ids["right"]].translation.copy()
+        return palms
 
 
 # ---------------------------------------------------------------------------

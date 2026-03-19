@@ -3,7 +3,7 @@ Ultralytics YOLO-World + ByteTrack wrapper for open-vocabulary bbox detection
 and persistent object tracking.
 
 Designed to feed SAM2 with per-object bbox prompts:
-    tracker = UltralyticsTracker(classes=["robot arm", "cup"])
+    tracker = UltralyticsTracker(classes=None)  # full detection
     detections = tracker.infer(bgr_frame)
     for det in detections:
         boxes, scores, logits = sam2.infer(bgr_frame, box=det.box)
@@ -33,6 +33,9 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+DEFAULT_ULTRALYTICS_MODEL = "yolov8s-worldv2.pt"
+DEFAULT_ULTRALYTICS_CLASSES: Optional[List[str]] = None
+
 
 @dataclass
 class Detection:
@@ -47,14 +50,16 @@ class UltralyticsTracker:
     """
     YOLO-World open-vocabulary detector + ByteTrack persistent tracker.
 
-    Text classes are set once; each infer() call runs detection + tracking
-    on a single BGR frame and returns a list of Detection objects with
-    stable track IDs across frames.
+    If classes is None, it runs in full-class detection mode. If classes
+    is provided, YOLO-World text classes are restricted to that list.
+
+    Each infer() call runs detection + tracking on a single BGR frame and
+    returns a list of Detection objects with stable track IDs across frames.
 
     Usage:
         tracker = UltralyticsTracker(
             model_path="yolov8s-worldv2.pt",
-            classes=["robot arm", "cup"],
+            classes=None,  # full detection
             device="cuda",
         )
         detections = tracker.infer(bgr_frame)
@@ -64,7 +69,7 @@ class UltralyticsTracker:
 
     def __init__(
         self,
-        model_path: str = "yolov8s-worldv2.pt",
+        model_path: str = DEFAULT_ULTRALYTICS_MODEL,
         classes: Optional[List[str]] = None,
         device: str = "cuda",
         conf: float = 0.3,
@@ -73,15 +78,21 @@ class UltralyticsTracker:
         from ultralytics import YOLO
         self.model = YOLO(model_path)
         self.model.to(device)
-        self._classes = classes or ["robot arm", "cup"]
-        self.model.set_classes(self._classes)
+        self._classes = [c for c in (classes or []) if c] or None
+        if self._classes is not None:
+            self.model.set_classes(self._classes)
         self.conf = conf
         self.iou  = iou
 
     def set_classes(self, classes: List[str]) -> None:
         """Update detection classes (re-encodes text embeddings)."""
-        self._classes = classes
-        self.model.set_classes(classes)
+        cls = [c for c in classes if c]
+        if not cls:
+            raise ValueError(
+                "classes cannot be empty; initialize UltralyticsTracker(classes=None) for full detection."
+            )
+        self._classes = cls
+        self.model.set_classes(cls)
 
     def infer(self, bgr: np.ndarray) -> List[Detection]:
         """
@@ -112,7 +123,10 @@ class UltralyticsTracker:
 
         detections = []
         for box, tid, cid, score in zip(boxes, track_ids, cls_ids, scores):
-            label = self._classes[int(cid)] if int(cid) < len(self._classes) else "unknown"
+            if self._classes is None:
+                label = self._label_from_result(r, int(cid))
+            else:
+                label = self._classes[int(cid)] if int(cid) < len(self._classes) else f"class_{int(cid)}"
             detections.append(Detection(
                 track_id=int(tid),
                 label=label,
@@ -120,6 +134,15 @@ class UltralyticsTracker:
                 score=float(score),
             ))
         return detections
+
+    @staticmethod
+    def _label_from_result(result: object, cid: int) -> str:
+        names = getattr(result, "names", None)
+        if isinstance(names, dict):
+            return str(names.get(cid, f"class_{cid}"))
+        if isinstance(names, (list, tuple)) and 0 <= cid < len(names):
+            return str(names[cid])
+        return f"class_{cid}"
 
     def reset(self) -> None:
         """Reset tracker state (clears all track IDs)."""
@@ -170,8 +193,8 @@ if __name__ == "__main__":
                         help="Model variant: s (default) / m / l / x")
     parser.add_argument("--model_path", type=str, default=None,
                         help="Override model path (e.g. local .pt file)")
-    parser.add_argument("--classes",    type=str, default="robot arm. cup.",
-                        help="Dot-separated class list")
+    parser.add_argument("--classes",    type=str, default="",
+                        help="Dot-separated class list; empty means full detection")
     parser.add_argument("--conf",       type=float, default=0.3)
     parser.add_argument("--iou",        type=float, default=0.5)
     parser.add_argument("--device",     type=str, default="cuda")
