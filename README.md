@@ -142,11 +142,19 @@ Test Nodes
 ros2 run robot_motion_interface_ros cv_node
 ```
 
-Launch Nodes
+Curobo TrajOpt Nodes
 ```bash
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 export ROS_STATIC_PEERS='192.168.4.4;remote.com'
 ros2 run robot_motion_interface_ros test_curobo
+```
+
+Retargeting Nodes
+```bash
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export ROS_STATIC_PEERS='192.168.4.4;remote.com'
+ros2 run robot_motion_interface_ros test_retarget_traj_player --ros-args \
+  -p traj_path:=models/egodex/traj-retarging/screw_unscrew_bottle_cap/0_curobo_2stage-interpolated.npz
 ```
 
 Attach to Policy Container

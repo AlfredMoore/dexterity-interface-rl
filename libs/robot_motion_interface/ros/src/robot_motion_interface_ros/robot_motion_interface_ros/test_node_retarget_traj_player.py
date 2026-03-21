@@ -1,15 +1,56 @@
 """
-Replay one retargeted trajectory NPZ to rl_driver_node at a fixed publish rate.
+Replay one retargeted trajectory NPZ to /target_joint_states at a fixed rate.
 
-Workflow
---------
-1. Load one trajectory NPZ (expects key: traj_full).
-2. Parse (task, episode) from trajectory path.
-3. Validate against report JSON:
-   - pregrasp_plan_success == 1
-   - new_ik_success_both_rate >= 0.05
-4. If valid: publish each waypoint to /target_joint_states at 30 Hz and exit.
-5. If invalid: log reason and abort without publishing.
+ROS parameters
+--------------
+Required:
+- traj_path (str): path to one trajectory file.
+  - Must be a .npz with key `traj_full` of shape (T, 38).
+  - Filename must match:
+    - `<episode>_curobo_2stage.npz`, or
+    - `<episode>_curobo_2stage-interpolated.npz`
+  - Task is inferred from parent folder name.
+
+Optional:
+- config_path (str): driver config path used to build canonical 38 joint names.
+  - Default: `libs/robot_motion_interface/config/rl_bimanual_driver_config.yaml`
+- report_path (str): validation report path.
+  - Default: `models/egodex/traj-retarging/reports/curobo_2stage_vs_baseline.json`
+- publish_hz (float): publish frequency.
+  - Default: 30.0
+
+Validation gate
+---------------
+The node loads report row by (task, episode). Playback starts only if:
+- pregrasp_plan_success == 1
+- new_ik_success_both_rate >= 0.05
+
+Usage examples
+--------------
+1) Minimal (only required traj_path):
+```bash
+ros2 run robot_motion_interface_ros test_retarget_traj_player --ros-args \
+  -p traj_path:=models/egodex/traj-retarging/screw_unscrew_bottle_cap/0_curobo_2stage.npz
+```
+
+2) Play interpolated trajectory:
+```bash
+ros2 run robot_motion_interface_ros test_retarget_traj_player --ros-args \
+  -p traj_path:=models/egodex/traj-retarging/screw_unscrew_bottle_cap/0_curobo_2stage-interpolated.npz
+```
+
+3) Override report/config/publish rate:
+```bash
+ros2 run robot_motion_interface_ros test_retarget_traj_player --ros-args \
+  -p traj_path:=models/egodex/traj-retarging/screw_unscrew_bottle_cap/0_curobo_2stage.npz \
+  -p report_path:=models/egodex/traj-retarging/reports/curobo_2stage_vs_baseline.json \
+  -p config_path:=libs/robot_motion_interface/config/rl_bimanual_driver_config.yaml \
+  -p publish_hz:=20.0
+```
+
+Note:
+- Relative paths are resolved from project root.
+- If auto root detection fails, set `DEXTERITY_PROJECT_ROOT`.
 """
 
 from __future__ import annotations
