@@ -1367,12 +1367,12 @@ This *_jar variant is manually derived to add a centered jar model for inspectio
   <joint name="left_panda_mount" type="fixed">
     <parent link="world" />
     <child link="left_panda_link0" />
-    <origin xyz="-0.558 -0.092 0.0" rpy="0 0 0" />
+    <origin xyz="-0.558 0.092 0.0" rpy="0 0 0" />
   </joint>
   <joint name="right_panda_mount" type="fixed">
     <parent link="world" />
     <child link="right_panda_link0" />
-    <origin xyz="0.5588 -0.092 0.0" rpy="0 0 3.14159265359" />
+    <origin xyz="0.5588 0.092 0.0" rpy="0 0 3.14159265359" />
   </joint>
   <!-- Jar at table center: world frame z=0 is tabletop surface in this URDF. -->
   <link name="jar_body">
