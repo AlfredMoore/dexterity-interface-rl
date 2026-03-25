@@ -3,7 +3,35 @@ fk_rate: 60
 infer_rate: 30
 
 policy_run_dir: "<rsl-rl run folder path>"
-cv_model_path: "<cv run folder path>"
+cv_verbose: false              # node-level info logs; warnings/errors still print
+
+cv_model:
+  promptda:
+    enable: true
+    verbose: false             # silence model stdout/stderr when false
+    checkpoint: ~            # default from promptda_utils.py (PromptDA-s-transparent.ckpt)
+    encoder: "vits"
+  sam2_w_prompt:
+    enable: false
+    verbose: false             # controls SAM2WithPrompt internal prints
+    sam3_ckpt: ~             # default from sam2_w_prompt.py (models/sam3/sam3.pt)
+    sam2_ckpt: ~             # default from sam2_w_prompt.py (sam2.1_hiera_large.pt)
+    sam2_cfg: ~              # default from sam2_w_prompt.py (configs/sam2.1_hiera_l.yaml)
+    compile: true
+  da3:
+    enable: true
+    verbose: false             # silence model stdout/stderr when false
+    model: ~                 # default from da3_utils.py (depth-anything/DA3-BASE)
+    process_res: 504
+  ultralytics:
+    enable: true
+    verbose: false             # silence model stdout/stderr when false
+    model_path: ~            # default from ultralytics_utils.py (yolov8s-worldv2.pt)
+    classes: ~               # null => full detection (no class filtering)
+    conf: 0.3
+    iou: 0.5
+  
+  
 
 realsense:
   metadata:

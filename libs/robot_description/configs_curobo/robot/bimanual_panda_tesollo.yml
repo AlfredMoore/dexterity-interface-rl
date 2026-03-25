@@ -50,7 +50,10 @@ robot_cfg:
       "left_panda_link4": ["left_panda_link5", "left_panda_link6", "left_panda_link7"],
       "left_panda_link5": ["left_panda_link6", "left_panda_link7", "left_delto_base_link"],
       "left_panda_link6": ["left_panda_link7", "left_delto_base_link"],
-      "left_panda_link7": ["left_delto_base_link"],
+      "left_panda_link7": ["left_delto_base_link",
+        "left_F1_01", "left_F1_02", "left_F1_03", "left_F1_04", "left_F1_TIP",
+        "left_F2_01", "left_F2_02", "left_F2_03", "left_F2_04", "left_F2_TIP",
+        "left_F3_01", "left_F3_02", "left_F3_03", "left_F3_04", "left_F3_TIP"],
 
       # Left gripper base ignores all fingers (from robotiq pattern)
       "left_delto_base_link": [
@@ -100,7 +103,10 @@ robot_cfg:
       "right_panda_link4": ["right_panda_link5", "right_panda_link6", "right_panda_link7"],
       "right_panda_link5": ["right_panda_link6", "right_panda_link7", "right_delto_base_link"],
       "right_panda_link6": ["right_panda_link7", "right_delto_base_link"],
-      "right_panda_link7": ["right_delto_base_link"],
+      "right_panda_link7": ["right_delto_base_link",
+        "right_F1_01", "right_F1_02", "right_F1_03", "right_F1_04", "right_F1_TIP",
+        "right_F2_01", "right_F2_02", "right_F2_03", "right_F2_04", "right_F2_TIP",
+        "right_F3_01", "right_F3_02", "right_F3_03", "right_F3_04", "right_F3_TIP"],
 
       # Right gripper base ignores all fingers
       "right_delto_base_link": [
@@ -154,9 +160,15 @@ robot_cfg:
       'left_panda_link0': 0.05,
       'left_panda_link1': 0.05,
       'left_delto_base_link': 0.002,
+      'left_F1_01': 0.002, 'left_F1_02': 0.002, 'left_F1_03': 0.002, 'left_F1_04': 0.002, 'left_F1_TIP': 0.002,
+      'left_F2_01': 0.002, 'left_F2_02': 0.002, 'left_F2_03': 0.002, 'left_F2_04': 0.002, 'left_F2_TIP': 0.002,
+      'left_F3_01': 0.002, 'left_F3_02': 0.002, 'left_F3_03': 0.002, 'left_F3_04': 0.002, 'left_F3_TIP': 0.002,
       'right_panda_link0': 0.05,
       'right_panda_link1': 0.05,
       'right_delto_base_link': 0.002,
+      'right_F1_01': 0.002, 'right_F1_02': 0.002, 'right_F1_03': 0.002, 'right_F1_04': 0.002, 'right_F1_TIP': 0.002,
+      'right_F2_01': 0.002, 'right_F2_02': 0.002, 'right_F2_03': 0.002, 'right_F2_04': 0.002, 'right_F2_TIP': 0.002,
+      'right_F3_01': 0.002, 'right_F3_02': 0.002, 'right_F3_03': 0.002, 'right_F3_04': 0.002, 'right_F3_TIP': 0.002,
     }
 
     # Use mesh collision for arm links and hand/finger links

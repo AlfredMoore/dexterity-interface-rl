@@ -1,0 +1,19 @@
+retargeting:
+  type: position
+  # Path is relative to the assets/ dir set via RetargetingConfig.set_default_urdf_dir()
+  urdf_path: tesollo_dg3f_right.urdf
+
+  # The 3 finger tips we target: F1=thumb-analog, F2=index-analog, F3=middle-analog
+  target_link_names: ["right_F1_TIP", "right_F2_TIP", "right_F3_TIP"]
+
+  # Maps robot tip index → row index in the (3, 3) fingertip array passed to retarget().
+  # Row 0 = thumb tip, row 1 = index tip, row 2 = middle tip (EgoDex convention).
+  target_link_human_indices: [0, 1, 2]
+
+  # Allow the hand base to float freely so the optimizer can place it correctly
+  # given absolute fingertip positions expressed in the robot base frame.
+  add_dummy_free_joint: true
+
+  # Low-pass filter strength: 1.0 = no filtering, 0.0 = frozen.
+  # Set to 1.0 for offline retargeting (no temporal smoothing needed at this stage).
+  low_pass_alpha: 1.0

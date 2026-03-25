@@ -56,6 +56,13 @@ xhost +local:docker
 docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/workspace --device /dev/bus/usb:/dev/bus/usb --net=host -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix dex-policy
 ```
 
+Dependencies
+```bash
+cd /workspace/dep
+pip install -r requirements.txt
+cd /workspace
+```
+
 Compile curobo
 ```bash
 cd /workspace/dep
@@ -63,6 +70,33 @@ git clone https://github.com/AlfredMoore/curobo-HAND.git curobo
 cd curobo
 pip install -e . --no-build-isolation
 python3 -m pytest .
+cd /workspace
+```
+
+Prompt depth anything
+```bash
+cd /workspace/dep
+git clone https://github.com/DepthAnything/PromptDA.git # 9161547
+# This repo is not ready for `pip install -e .`
+export PYTHONPATH=/workspace/dep/PromptDA:$PYTHONPATH
+cd /workspace
+```
+
+Segment Anything 2
+```bash
+cd /workspace/dep
+git clone https://github.com/facebookresearch/sam2.git  # 2b90b9f
+cd sam2
+pip install -e .
+cd /workspace
+```
+
+Efficient SAM 3 (including Segment Anything 3)
+```bash
+cd /workspace/dep
+git clone https://github.com/SimonZeng7108/efficientsam3.git -b sam3_litetext   # bef17f5
+cd efficientsam3
+pip install --force-reinstall --no-deps --no-build-isolation -e .
 cd /workspace
 ```
 
@@ -78,10 +112,10 @@ python -m robot_motion_interface.utils.realsense_test.py
 
 Commit the image from the host (optional)
 ```bash
-docker commit handrl-policy dex-policy:curobo_compiled
+docker commit handrl-policy dex-policy:compiled
 # Then you can directly run the full installed container by
 xhost +local:docker
-docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/workspace --device /dev/bus/usb:/dev/bus/usb --net=host -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix dex-policy:curobo_compiled
+docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/workspace --device /dev/bus/usb:/dev/bus/usb --net=host -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix dex-policy:compiled
 ```
 
 Run Pre-grasp Sampling Modules
@@ -108,16 +142,24 @@ Test Nodes
 ros2 run robot_motion_interface_ros cv_node
 ```
 
-Launch Nodes
+Curobo TrajOpt Nodes
 ```bash
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 export ROS_STATIC_PEERS='192.168.4.4;remote.com'
 ros2 run robot_motion_interface_ros test_curobo
 ```
 
+Retargeting Nodes
+```bash
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export ROS_STATIC_PEERS='192.168.4.4;remote.com'
+ros2 run robot_motion_interface_ros test_retarget_traj_player --ros-args \
+  -p traj_path:=models/egodex/traj-retarging/screw_unscrew_bottle_cap/0_curobo_2stage-interpolated.npz
+```
+
 Attach to Policy Container
 ```bash
-docker exec -it handrl-policy bash
+docker exec -it -e DISPLAY=$DISPLAY handrl-policy bash
 ```
 
 

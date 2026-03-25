@@ -1,0 +1,12 @@
+retargeting:
+  type: position
+  urdf_path: tesollo_dg3f_left.urdf
+
+  target_link_names: ["left_F1_TIP", "left_F2_TIP", "left_F3_TIP"]
+
+  target_link_human_indices: [0, 1, 2]
+
+  # Fixed base: fingertip positions must be in the hand base frame (delto_base_link)
+  add_dummy_free_joint: false
+
+  low_pass_alpha: 1.0

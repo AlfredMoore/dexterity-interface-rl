@@ -24,4 +24,5 @@ models/
 
 *.DS_Store
 
-dep/
+dep/*
+!dep/requirements.txt

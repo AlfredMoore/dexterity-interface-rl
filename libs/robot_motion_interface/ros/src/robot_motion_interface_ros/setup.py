@@ -27,6 +27,7 @@ setup(
             'cv_node = robot_motion_interface_ros.cv_node:main',
             'test_pre_grasp = robot_motion_interface_ros.test_node_pre_grasp:main',
             'test_curobo = robot_motion_interface_ros.test_node_for_curobo:main',
+            'test_retarget_traj_player = robot_motion_interface_ros.test_node_retarget_traj_player:main',
         ],
     },
 )
