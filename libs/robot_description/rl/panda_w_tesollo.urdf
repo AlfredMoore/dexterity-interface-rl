@@ -205,7 +205,7 @@
     <origin rpy="0 0 0" xyz="0 0 0.107"/>
   </joint>
   <material name="black">
-    <color rgba="0.196 0.196 0.196 1.0"/>
+    <color rgba="0.1 0.1 0.1 1.0"/>
   </material>
   <material name="white">
     <color rgba="1.0 1.0 1.0 1.0"/>
@@ -649,7 +649,7 @@
   <joint name="delto_offset_joint" type="fixed">
     <parent link="delto_base_link"/>
     <child link="delto_offset_link"/>
-    <origin rpy="0 0 0" xyz="0 0 0.05"/>
+    <origin rpy="0 0 0" xyz="0 0 0.02"/>
   </joint>
   <!-- TODO: Check rotation and height -->
   <joint name="panda_gripper_joint" type="fixed">
@@ -659,28 +659,32 @@
   </joint>
 
   <!-- dummy link and joint for finger tip top -->
+  <link name="F1_TIP_TOP">
+  </link>
+
+  <link name="F2_TIP_TOP">
+  </link>
+  
+  <link name="F3_TIP_TOP">
+  </link>
+  
   <joint name="TIPTOP1" type="fixed">
     <parent link="F1_TIP"/>
     <child link="F1_TIP_TOP"/>
-    <origin xyz="0.058 0 0.002" rpy="0 0 0"/> 
+    <origin xyz="0.058 0.005 0.00" rpy="0 0 0"/> 
   </joint>
-  <link name="F1_TIP_TOP">
-  </link>
 
   <joint name="TIPTOP2" type="fixed">
     <parent link="F2_TIP"/>
     <child link="F2_TIP_TOP"/>
-    <origin xyz="0.058 0 0.002" rpy="0 0 0"/> 
+    <origin xyz="0.058 0.005 0.00" rpy="0 0 0"/> 
   </joint>
-  <link name="F2_TIP_TOP">
-  </link>
 
   <joint name="TIPTOP3" type="fixed">
     <parent link="F3_TIP"/>
     <child link="F3_TIP_TOP"/>
-    <origin xyz="0.058 0 0.002" rpy="0 0 0"/> 
+    <origin xyz="0.058 0.005 0.00" rpy="0 0 0"/> 
   </joint>
-  <link name="F3_TIP_TOP">
-  </link>
+
 
 </robot>
