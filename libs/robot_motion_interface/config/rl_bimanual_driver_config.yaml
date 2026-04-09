@@ -9,7 +9,7 @@ panda_kd: [20.0, 20.0, 20.0, 20.0, 10.0, 20.0, 5.0]
 panda_max_joint_delta: 0.3
 
 tesollo_home_joint_positions: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-tesollo_control_loop_frequency: 500.0
+tesollo_control_loop_frequency: 200.0
 tesollo_kp: [4.7, 4.7, 4.7, 4.7, 4.7, 4.7, 4.7, 4.7, 4.7, 4.7, 4.7, 4.7]
 tesollo_kd: [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
 
