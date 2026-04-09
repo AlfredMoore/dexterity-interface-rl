@@ -14,13 +14,13 @@ tesollo_kp: [4.7, 4.7, 4.7, 4.7, 4.7, 4.7, 4.7, 4.7, 4.7, 4.7, 4.7, 4.7]
 tesollo_kd: [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
 
 
-left_panda_hostname: "192.168.4.2"
+left_panda_hostname: "192.168.4.3"
 left_panda_joint_names: [
   "panda_joint1", "panda_joint2", "panda_joint3", "panda_joint4", 
   "panda_joint5" ,"panda_joint6", "panda_joint7"
 ]
 
-left_tesollo_ip: "192.168.4.8"
+left_tesollo_ip: "192.168.4.7"
 left_tesollo_port: 502
 left_tesollo_joint_names: [
   "F1M1", "F1M2", "F1M3", "F1M4", 
@@ -28,13 +28,13 @@ left_tesollo_joint_names: [
   "F3M1", "F3M2", "F3M3", "F3M4", 
 ]
 
-right_panda_hostname: "192.168.4.3"
+right_panda_hostname: "192.168.4.2"
 right_panda_joint_names: [
   "panda_joint1", "panda_joint2", "panda_joint3", "panda_joint4", 
   "panda_joint5" ,"panda_joint6", "panda_joint7"
 ]
 
-right_tesollo_ip: "192.168.4.7"
+right_tesollo_ip: "192.168.4.8"
 right_tesollo_port: 502
 right_tesollo_joint_names:  [
   "F1M1", "F1M2", "F1M3", "F1M4", 
