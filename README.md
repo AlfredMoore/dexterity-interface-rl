@@ -21,7 +21,7 @@ source install/setup.bash
 ROS2 Run Driver Node
 ```bash
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
-export ROS_STATIC_PEERS='192.168.4.9;remote.com'
+export ROS_STATIC_PEERS='192.168.4.9'
 ros2 run robot_motion_interface_ros rl_driver
 ```
 
@@ -145,18 +145,25 @@ ros2 run robot_motion_interface_ros cv_node
 Curobo TrajOpt Nodes
 ```bash
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
-export ROS_STATIC_PEERS='192.168.4.4;remote.com'
+export ROS_STATIC_PEERS='192.168.4.4'
 ros2 run robot_motion_interface_ros test_curobo
 ```
 
 Retargeting Nodes
 ```bash
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
-export ROS_STATIC_PEERS='192.168.4.4;remote.com'
+export ROS_STATIC_PEERS='192.168.4.4'
 ros2 run robot_motion_interface_ros test_retarget_traj_player --ros-args \
   -p traj_path:=models/egodex/traj-retarging/screw_unscrew_bottle_cap/0_curobo_2stage-interpolated.npz
 ```
 
+Replay Traj
+```bash
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export ROS_STATIC_PEERS='192.168.4.4'
+ros2 run robot_motion_interface_ros replay_traj_pregrasp
+ros2 run robot_motion_interface_ros replay_traj_policy
+```
 Attach to Policy Container
 ```bash
 docker exec -it -e DISPLAY=$DISPLAY handrl-policy bash

@@ -28,6 +28,9 @@ setup(
             'test_pre_grasp = robot_motion_interface_ros.test_node_pre_grasp:main',
             'test_curobo = robot_motion_interface_ros.test_node_for_curobo:main',
             'test_retarget_traj_player = robot_motion_interface_ros.test_node_retarget_traj_player:main',
+            'run_traj = robot_motion_interface_ros.node_run_traj:main',
+            'replay_traj_pregrasp = robot_motion_interface_ros.replay_traj_np:main',
+            'replay_traj_policy = robot_motion_interface_ros.replay_traj_torch:main',
         ],
     },
 )

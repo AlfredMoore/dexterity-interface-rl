@@ -178,6 +178,12 @@ class RLPolicyNode(Node):
         self.left_joint_vel_scaled: np.ndarray = np.zeros(self._action_per_chain, dtype=np.float32)
         self.right_joint_vel_scaled: np.ndarray = np.zeros(self._action_per_chain, dtype=np.float32)
 
+        self.left_dof_targets = torch.zeros((1, self._action_per_chain), dtype=torch.float, device=self.device)
+        self.right_dof_targets = torch.zeros((1, self._action_per_chain), dtype=torch.float, device=self.device)
+
+        self.actions = torch.zeros((1, self._action_num), dtype=torch.float32, device=self.device)   # [1, dof]
+        
+        
         self.prev_actions = torch.zeros((1, self._action_num), dtype=torch.float32, device=self.device)   # [1, dof]
         self.prev_obs: torch.Tensor = torch.zeros((1, self._obs_unstacked_space), device=self.device).float()   # [env, obs_dim]
 
@@ -240,6 +246,8 @@ class RLPolicyNode(Node):
             init_q = np.concatenate([left_joint_pose, right_joint_pose], axis=0)
             self.joint_poses[0, :] = torch.from_numpy(init_q).to(self.device)
             self.targets[0, :] = self.joint_poses[0, :]  # [dof]
+            self.left_dof_targets[0, :] = self.targets[0, :self._action_per_chain]
+            self.right_dof_targets[0, :] = self.targets[0, self._action_per_chain:]
 
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -351,10 +359,15 @@ class RLPolicyNode(Node):
         _ = observations
         raw_actions, traj_done, traj_step = self.replay.next_action()
 
+        with self.lock:
+            # self.prev_left_joint_vel[:] = self.actions[:, self.policy_action_indices_dict["left"]]
+            # self.prev_right_joint_vel[:] = self.actions[:, self.policy_action_indices_dict["right"]]
+            self.prev_actions[:] = self.actions.clone()
+
         (
-            next_left_targets,
-            next_right_targets,
-            next_actions,
+            self.left_dof_targets[:],
+            self.right_dof_targets[:],
+            self.actions[:],
         ) = compute_targets(
             dt=self.dt,
             actions=raw_actions,
@@ -362,21 +375,20 @@ class RLPolicyNode(Node):
             action_EMA=self.ema,
             actions_scale=self._action_scale,
             
-            left_dof_targets=cur_targets[:, :self._action_per_chain],
-            right_dof_targets=cur_targets[:, self._action_per_chain:],
+            left_dof_targets=self.left_dof_targets[:],
+            right_dof_targets=self.right_dof_targets[:],
             policy_action_indices_dict=self.policy_action_indices_dict,
             robot_action_scale_dict=self.robot_action_scale_dict,
             robot_joint_limits_dict=self.robot_joint_limits_dict_t,
         )
-        next_targets = torch.cat([next_left_targets, next_right_targets], dim=-1)
+        next_targets = torch.cat([self.left_dof_targets, self.right_dof_targets], dim=-1)
         with self.lock:
-            self.targets[:, :] = next_targets
-            self.prev_actions[:, :] = next_actions
+            self.targets[0,:] = next_targets[0,:].clone()
 
         # 4. Publish to Driver
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.position = self.targets[0].cpu().tolist()  # [dof]
+        msg.position = next_targets[0].cpu().tolist()  # [dof]
         self.target_pub.publish(msg)
         done_msg = Bool()
         done_msg.data = traj_done

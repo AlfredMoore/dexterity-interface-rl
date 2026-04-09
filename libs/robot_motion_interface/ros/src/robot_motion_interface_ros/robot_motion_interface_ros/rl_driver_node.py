@@ -90,10 +90,12 @@ class RLDriverNode(Node):
             self._tesollo_left.home(blocking=False)
             self._panda_left.home(blocking=False)
             time.sleep(2.0)  # wait for homing to finish
+            self.get_logger().info(f"Left Chain Homed.")
             self._tesollo_right.home(blocking=False)
             self._panda_right.home(blocking=False)
             time.sleep(2.0)  # wait for homing to finish
-            self.get_logger().info("Robot Interface Started & Homed.")
+            self.get_logger().info(f"Right Chain Homed.")
+            self.get_logger().info(f"Robot Interface Started & Homed.")
 
         except Exception as e:
             self.get_logger().error(f"Failed to initialize interface: {e}")
@@ -117,9 +119,7 @@ class RLDriverNode(Node):
 
         # --- etc ---
         l_joint_names = self._panda_left.joint_names() + self._tesollo_left.joint_names()
-        l_joint_names = ['left_' + name for name in l_joint_names]
         r_joint_names = self._panda_right.joint_names() + self._tesollo_right.joint_names()
-        r_joint_names = ['right_' + name for name in r_joint_names]
         self.joint_names = l_joint_names + r_joint_names
 
 
