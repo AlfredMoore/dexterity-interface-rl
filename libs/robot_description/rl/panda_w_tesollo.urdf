@@ -651,11 +651,11 @@
     <child link="delto_offset_link"/>
     <origin rpy="0 0 0" xyz="0 0 0.02"/>
   </joint>
-  <!-- TODO: Check rotation and height -->
+  <!-- Rotation and height -->
   <joint name="panda_gripper_joint" type="fixed">
     <parent link="panda_link8"/>
     <child link="delto_base_link"/>
-    <origin rpy="0 0 -0.785" xyz="0 0 0.106"/>
+    <origin rpy="0 0 -1.015" xyz="0 0 0.106"/>
   </joint>
 
   <!-- dummy link and joint for finger tip top -->
