@@ -1,5 +1,5 @@
 # Node config
-joint_state_pub_timer_freq: 1000.0
+joint_state_pub_timer_freq: 120.0
 
 # HAND and ARM config
 panda_urdf_path: "../robot_description/rl/panda_w_tesollo.urdf"

@@ -161,8 +161,9 @@ Replay Traj
 ```bash
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 export ROS_STATIC_PEERS='192.168.4.4'
-ros2 run robot_motion_interface_ros replay_traj_pregrasp
-ros2 run robot_motion_interface_ros replay_traj_policy
+ros2 run robot_motion_interface_ros replay_target_pregrasp    # go to pre-grasp pose
+ros2 run robot_motion_interface_ros replay_target_policy  # replay policy control target
+ros2 run robot_motion_interface_ros replay_action_torch
 ```
 Attach to Policy Container
 ```bash
