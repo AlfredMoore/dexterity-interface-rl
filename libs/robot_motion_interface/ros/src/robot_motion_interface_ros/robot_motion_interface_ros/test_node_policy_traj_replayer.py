@@ -364,6 +364,9 @@ class RLPolicyNode(Node):
             # self.prev_right_joint_vel[:] = self.actions[:, self.policy_action_indices_dict["right"]]
             self.prev_actions[:] = self.actions.clone()
 
+        left_joint_pos_t = torch.from_numpy(cur_l_joint_poses).to(dtype=torch.float32, device=self.device).unsqueeze(0)
+        right_joint_pos_t = torch.from_numpy(cur_r_joint_poses).to(dtype=torch.float32, device=self.device).unsqueeze(0)
+
         (
             self.left_dof_targets[:],
             self.right_dof_targets[:],
@@ -375,8 +378,8 @@ class RLPolicyNode(Node):
             action_EMA=self.ema,
             actions_scale=self._action_scale,
             
-            left_dof_targets=self.left_dof_targets[:],
-            right_dof_targets=self.right_dof_targets[:],
+            left_joint_pos=left_joint_pos_t,
+            right_joint_pos=right_joint_pos_t,
             policy_action_indices_dict=self.policy_action_indices_dict,
             robot_action_scale_dict=self.robot_action_scale_dict,
             robot_joint_limits_dict=self.robot_joint_limits_dict_t,
@@ -412,8 +415,8 @@ def compute_targets(
     action_EMA: float,
     actions_scale: float,
     
-    left_dof_targets: torch.Tensor,
-    right_dof_targets: torch.Tensor,
+    left_joint_pos: torch.Tensor,
+    right_joint_pos: torch.Tensor,
     policy_action_indices_dict: Dict[str, list[int]],
     robot_action_scale_dict: Dict[str, torch.Tensor],
     robot_joint_limits_dict: Dict[str, torch.Tensor],
@@ -431,7 +434,7 @@ def compute_targets(
     ## left_arm
     left_actions = actions[:, policy_action_indices_dict["left"]]
     left_dof_targets = torch.clamp(
-        left_dof_targets + left_actions * dt * robot_action_scale_dict["left_joint_vel_action"] * actions_scale, 
+        left_joint_pos + left_actions * dt * robot_action_scale_dict["left_joint_vel_action"] * actions_scale,
         min=robot_joint_limits_dict["left_joint_pose_soft_lower"], 
         max=robot_joint_limits_dict["left_joint_pose_soft_upper"]
     )
@@ -439,7 +442,7 @@ def compute_targets(
     ## right_arm
     right_actions = actions[:, policy_action_indices_dict["right"]]
     right_dof_targets = torch.clamp(
-        right_dof_targets + right_actions * dt * robot_action_scale_dict["right_joint_vel_action"] * actions_scale, 
+        right_joint_pos + right_actions * dt * robot_action_scale_dict["right_joint_vel_action"] * actions_scale,
         min=robot_joint_limits_dict["right_joint_pose_soft_lower"], 
         max=robot_joint_limits_dict["right_joint_pose_soft_upper"]
     )

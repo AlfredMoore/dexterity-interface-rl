@@ -134,6 +134,7 @@ ROS2 Build
 cd /workspace/libs/robot_motion_interface/ros
 colcon build --symlink-install
 source install/setup.bash
+cd /workspace
 ```
 
 Test Nodes
