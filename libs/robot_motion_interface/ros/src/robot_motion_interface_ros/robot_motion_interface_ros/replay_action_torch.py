@@ -14,6 +14,10 @@ from sensor_msgs.msg import JointState
 import torch
 import yaml
 
+
+from robot_motion_interface.utils.sim2real import joint_mapping
+
+
 from robot_motion_interface.utils.qos import HIGH_PERF_QOS, HIGH_RELIA_QOS
 
 JS_QOS = HIGH_PERF_QOS
@@ -28,36 +32,25 @@ RMI_ROOT = Path(spec.origin).parent.parent.parent
 
 def compute_targets(
     dt: float,
-    actions: torch.Tensor,
-    prev_actions: torch.Tensor,
+    actions: torch.Tensor,       # [1, A] in policy order
+    prev_actions: torch.Tensor,  # [1, A] in policy order
     action_EMA: float,
     actions_scale: float,
-    
-    left_joint_pos: torch.Tensor,
-    right_joint_pos: torch.Tensor,
-    
-    policy_action_indices_dict: dict[str, list[int]],
-    robot_action_scale_dict: dict[str, torch.Tensor],
-    robot_joint_limits_dict: dict[str, torch.Tensor],
-
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    
-    actions = actions.clamp(-1.0, 1.0) * action_EMA + prev_actions * (1.0 - action_EMA)
-
-    left_actions = actions[:, policy_action_indices_dict["left"]]
-    left_dof_targets = torch.clamp(
-        left_joint_pos + left_actions * dt * robot_action_scale_dict["left_joint_vel_action"] * actions_scale,
-        min=robot_joint_limits_dict["left_joint_pose_soft_lower"],
-        max=robot_joint_limits_dict["left_joint_pose_soft_upper"],
+    joint_pos: torch.Tensor,     # [1, total_dof] in real driver order
+    policy2real_idx: torch.Tensor,  # [A] long, precomputed in __init__
+    full_scale: torch.Tensor,    # [1, A] in real order, precomputed in __init__
+    full_lower: torch.Tensor,    # [1, A] in real order, precomputed in __init__
+    full_upper: torch.Tensor,    # [1, A] in real order, precomputed in __init__
+) -> tuple[torch.Tensor, torch.Tensor]:
+    ema_actions = actions.clamp(-1.0, 1.0) * action_EMA + prev_actions * (1.0 - action_EMA)
+    # reorder policy → real, then apply velocity-action integration
+    actions_real = ema_actions[:, policy2real_idx]
+    full_targets = torch.clamp(
+        joint_pos + actions_real * dt * full_scale * actions_scale,
+        min=full_lower,
+        max=full_upper,
     )
-
-    right_actions = actions[:, policy_action_indices_dict["right"]]
-    right_dof_targets = torch.clamp(
-        right_joint_pos + right_actions * dt * robot_action_scale_dict["right_joint_vel_action"] * actions_scale,
-        min=robot_joint_limits_dict["right_joint_pose_soft_lower"],
-        max=robot_joint_limits_dict["right_joint_pose_soft_upper"],
-    )
-    return left_dof_targets, right_dof_targets, actions
+    return full_targets, ema_actions
 
 
 def _format_amp_token(value: float) -> str:
@@ -126,29 +119,53 @@ class RunTrajNode(Node):
         self.dt = float(runtime_cfg["dt"])
         self.action_EMA = float(runtime_cfg["action_EMA"])
         self.action_scale = float(runtime_cfg["action_scale"])
-        self.policy_action_indices_dict = runtime_cfg["policy_action_indices_dict"]
-        self.robot_action_scale_dict = {
-            "left_joint_vel_action": torch.tensor(
-                runtime_cfg["robot_action_scale_dict"]["left_joint_vel_action"], dtype=torch.float32
-            ).unsqueeze(0),
-            "right_joint_vel_action": torch.tensor(
-                runtime_cfg["robot_action_scale_dict"]["right_joint_vel_action"], dtype=torch.float32
-            ).unsqueeze(0),
-        }
-        self.robot_joint_limits_dict = {
-            "left_joint_pose_soft_lower": torch.tensor(
-                runtime_cfg["robot_joint_limits_dict"]["left_joint_pose_soft_lower"], dtype=torch.float32
-            ).unsqueeze(0),
-            "left_joint_pose_soft_upper": torch.tensor(
-                runtime_cfg["robot_joint_limits_dict"]["left_joint_pose_soft_upper"], dtype=torch.float32
-            ).unsqueeze(0),
-            "right_joint_pose_soft_lower": torch.tensor(
-                runtime_cfg["robot_joint_limits_dict"]["right_joint_pose_soft_lower"], dtype=torch.float32
-            ).unsqueeze(0),
-            "right_joint_pose_soft_upper": torch.tensor(
-                runtime_cfg["robot_joint_limits_dict"]["right_joint_pose_soft_upper"], dtype=torch.float32
-            ).unsqueeze(0),
-        }
+
+        # sim2real joint index mapping: policy order → real driver order
+        self.policy_bimanual_joint_names = runtime_cfg["bimanual_joint_names"]
+        policy2real_idx, real2policy_idx = joint_mapping(self.policy_bimanual_joint_names, self.joint_names)
+        self.policy2real_idx = torch.tensor(policy2real_idx, dtype=torch.long)
+        self.real2policy_idx = torch.tensor(real2policy_idx, dtype=torch.long)
+
+        # Precompute full-action-size scale and limits in real driver order to avoid
+        # per-step index lookups. policy_action_indices_dict may be non-contiguous,
+        # so we scatter into a policy-ordered buffer first, then reindex to real order.
+        pai = runtime_cfg["policy_action_indices_dict"]
+        left_idx = pai["left"]
+        right_idx = pai["right"]
+
+        scale_left = torch.tensor(
+            runtime_cfg["robot_action_scale_dict"]["left_joint_vel_action"], dtype=torch.float32
+        )
+        scale_right = torch.tensor(
+            runtime_cfg["robot_action_scale_dict"]["right_joint_vel_action"], dtype=torch.float32
+        )
+        lower_left = torch.tensor(
+            runtime_cfg["robot_joint_limits_dict"]["left_joint_pose_soft_lower"], dtype=torch.float32
+        )
+        lower_right = torch.tensor(
+            runtime_cfg["robot_joint_limits_dict"]["right_joint_pose_soft_lower"], dtype=torch.float32
+        )
+        upper_left = torch.tensor(
+            runtime_cfg["robot_joint_limits_dict"]["left_joint_pose_soft_upper"], dtype=torch.float32
+        )
+        upper_right = torch.tensor(
+            runtime_cfg["robot_joint_limits_dict"]["right_joint_pose_soft_upper"], dtype=torch.float32
+        )
+
+        full_scale_policy  = torch.zeros(self.action_num, dtype=torch.float32)
+        full_lower_policy  = torch.zeros(self.action_num, dtype=torch.float32)
+        full_upper_policy  = torch.zeros(self.action_num, dtype=torch.float32)
+        full_scale_policy[left_idx]  = scale_left
+        full_scale_policy[right_idx] = scale_right
+        full_lower_policy[left_idx]  = lower_left
+        full_lower_policy[right_idx] = lower_right
+        full_upper_policy[left_idx]  = upper_left
+        full_upper_policy[right_idx] = upper_right
+
+        # reindex policy → real, add batch dim [1, action_num]
+        self.full_scale = full_scale_policy[self.policy2real_idx].unsqueeze(0)
+        self.full_lower = full_lower_policy[self.policy2real_idx].unsqueeze(0)
+        self.full_upper = full_upper_policy[self.policy2real_idx].unsqueeze(0)
 
         # action space
         self.prev_actions = torch.zeros((1, self.action_num), dtype=torch.float32)
@@ -283,10 +300,18 @@ class RunTrajNode(Node):
                 raise ValueError(
                     f"home_joint_pos dim mismatch: got={home_joint_pos.numel()}, expected={self.action_num}"
                 )
-            self.home_joint_pos = home_joint_pos.contiguous()
+            # home_joint_pos is saved from simulation (policy order) → reorder to real driver order
+            self.home_joint_pos = home_joint_pos[self.policy2real_idx].contiguous()
+
+        # stim_joint_indices are stored as policy-order indices → convert to real-order indices
+        if self.stim_joint_indices_all is not None:
+            real_stim = [int(self.real2policy_idx[i]) for i in self.stim_joint_indices_all]
+            self.stim_joint_indices_all = real_stim
 
 
     def _sub_joint_state_cb(self, msg: JointState):
+        # Driver publishes joints in positional order (left arm+hand, right arm+hand)
+        # without left_/right_ prefix, so position-based copy is correct here.
         with self.lock:
             self.joint_poses[:] = np.array(msg.position, dtype=np.float32)
             self.joint_vels[:] = np.array(msg.velocity, dtype=np.float32)
@@ -339,23 +364,22 @@ class RunTrajNode(Node):
                     cur_q = self.joint_poses.copy()
                     cur_dq = self.joint_vels.copy()
 
-                left_joint_pos = torch.from_numpy(cur_q[: self.left_dof]).unsqueeze(0)
-                right_joint_pos = torch.from_numpy(cur_q[self.left_dof :]).unsqueeze(0)
-                raw_actions = self.actions_all[i, traj_id].unsqueeze(0)  # [1, A]
-                left_targets, right_targets, ema_actions = compute_targets(
+                joint_pos = torch.from_numpy(cur_q).unsqueeze(0)  # [1, total_dof] real order
+                raw_actions = self.actions_all[i, traj_id].unsqueeze(0)  # [1, A] policy order
+                full_targets, ema_actions = compute_targets(
                     self.dt,
                     raw_actions,
                     self.prev_actions,
                     self.action_EMA,
                     self.action_scale,
-                    left_joint_pos,
-                    right_joint_pos,
-                    self.policy_action_indices_dict,
-                    self.robot_action_scale_dict,
-                    self.robot_joint_limits_dict,
+                    joint_pos,
+                    self.policy2real_idx,
+                    self.full_scale,
+                    self.full_lower,
+                    self.full_upper,
                 )
                 self.prev_actions[:] = ema_actions
-                full_targets = torch.cat([left_targets, right_targets], dim=-1).squeeze(0)
+                full_targets = full_targets.squeeze(0)
 
                 if stim_idx_tensor is not None:
                     targets_to_publish = home_joint_pos_ref.clone()

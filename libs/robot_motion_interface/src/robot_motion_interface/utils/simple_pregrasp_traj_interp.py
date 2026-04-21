@@ -16,6 +16,8 @@ from pathlib import Path
 import numpy as np
 import yaml
 
+from robot_motion_interface.utils.sim2real import joint_mapping
+
 
 def _read_chain_pose(
     cfg: dict,
@@ -31,13 +33,22 @@ def main() -> None:
     rmi_root = Path(__file__).resolve().parents[3]
     runtime_dir = rmi_root / "runtime"
     cfg_path = runtime_dir / "HandEnv.yaml"
+    driver_cfg_path = rmi_root / "config" / "rl_bimanual_driver_config.yaml"
 
     with open(cfg_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
+    with open(driver_cfg_path, "r", encoding="utf-8") as f:
+        driver_cfg = yaml.safe_load(f)
 
     chain_joint_names = cfg["env"]["robot"]["jointNames"]["arm"] + cfg["env"]["robot"]["jointNames"]["hand"]
     action_per_chain = int(cfg["env"]["action"]["actionPerChain"])
     action_space = int(cfg["env"]["action"]["actionSpace"])
+
+    # sim (HandEnv) hand joint order differs from real driver order — reindex per chain
+    real_chain_names = driver_cfg["left_panda_joint_names"] + driver_cfg["left_tesollo_joint_names"]
+    chain2real_idx, _ = joint_mapping(chain_joint_names, real_chain_names)
+    # build full bimanual reindex: [left_chain reordered, right_chain reordered]
+    full_reindex = chain2real_idx + [i + action_per_chain for i in chain2real_idx]
 
     l_home = _read_chain_pose(cfg, mode="home", side="left", chain_joint_names=chain_joint_names)
     r_home = _read_chain_pose(cfg, mode="home", side="right", chain_joint_names=chain_joint_names)
@@ -61,6 +72,11 @@ def main() -> None:
     traj_right[:, action_per_chain:] = (1.0 - alphas[:, None]) * r_home[None, :] + alphas[:, None] * r_pre[None, :]
 
     traj_full = np.concatenate([traj_left, traj_right], axis=0)
+
+    # reorder sim joint order → real driver order
+    traj_left = traj_left[:, full_reindex]
+    traj_right = traj_right[:, full_reindex]
+    traj_full = traj_full[:, full_reindex]
 
     out_left = runtime_dir / "traj_pregrasp_left_100.npy"
     out_right = runtime_dir / "traj_pregrasp_right_100.npy"
