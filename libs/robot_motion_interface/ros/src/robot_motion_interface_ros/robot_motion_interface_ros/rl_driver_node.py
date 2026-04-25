@@ -87,14 +87,15 @@ class RLDriverNode(Node):
             self._panda_right.start_loop()
             self.get_logger().info(f"Started Interface Loops.")
 
-            self._tesollo_left.home(blocking=False)
-            self._panda_left.home(blocking=False)
-            time.sleep(2.0)  # wait for homing to finish
-            self.get_logger().info(f"Left Chain Homed.")
             self._tesollo_right.home(blocking=False)
             self._panda_right.home(blocking=False)
             time.sleep(2.0)  # wait for homing to finish
             self.get_logger().info(f"Right Chain Homed.")
+            self._tesollo_left.home(blocking=False)
+            self._panda_left.home(blocking=False)
+            time.sleep(2.0)  # wait for homing to finish
+            self.get_logger().info(f"Left Chain Homed.")
+
             self.get_logger().info(f"Robot Interface Started & Homed.")
 
         except Exception as e:
