@@ -21,7 +21,7 @@ cv_model:
   da3:
     enable: true
     verbose: false             # silence model stdout/stderr when false
-    model: ~                 # default from da3_utils.py (depth-anything/DA3-BASE)
+    model: ~
     process_res: 504
   ultralytics:
     enable: true

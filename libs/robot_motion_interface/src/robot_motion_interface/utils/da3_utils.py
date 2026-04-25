@@ -34,6 +34,7 @@ Intrinsics are read from rl_policy_node_config.yaml → realsense.color_intrinsi
 Models are downloaded to models/da3/ (HuggingFace cache format).
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -42,10 +43,28 @@ import numpy as np
 import torch
 from PIL import Image
 
-# DA3 source is in dep/Depth-Anything-3/src
+# DA3 source priority:
+# 1) DA3_SRC env var
+# 2) dep/Depth-Anything-3-HAND/src
+# 3) dep/Depth-Anything-3/src
 _UTILS_FILE = Path(__file__).resolve()
 _REPO_ROOT = _UTILS_FILE.parents[5]
-_DA3_SRC = _REPO_ROOT / "dep" / "Depth-Anything-3" / "src"
+_da3_src_env = os.environ.get("DA3_SRC", "").strip()
+if _da3_src_env:
+    _DA3_SRC = Path(_da3_src_env).expanduser().resolve()
+else:
+    _da3_candidates = [
+        _REPO_ROOT / "dep" / "Depth-Anything-3-HAND" / "src",
+        _REPO_ROOT / "dep" / "Depth-Anything-3" / "src",
+    ]
+    _DA3_SRC = next((p for p in _da3_candidates if p.exists()), _da3_candidates[0])
+
+if not _DA3_SRC.exists():
+    raise FileNotFoundError(
+        f"Cannot find DA3 source at {_DA3_SRC}. "
+        "Set DA3_SRC to a valid Depth-Anything-3 src directory."
+    )
+
 if str(_DA3_SRC) not in sys.path:
     sys.path.insert(0, str(_DA3_SRC))
 
@@ -57,6 +76,15 @@ if "moviepy.editor" not in sys.modules:
 from depth_anything_3.api import DepthAnything3  # noqa: E402
 
 DEFAULT_DA3_MODEL = "depth-anything/DA3-BASE"
+
+
+def _normalize_da3_model(model: str | None) -> str:
+    if model is None:
+        return DEFAULT_DA3_MODEL
+    text = str(model).strip()
+    if text.lower() in {"", "none", "null", "~"}:
+        return DEFAULT_DA3_MODEL
+    return text
 
 
 class DA3Inference:
@@ -87,6 +115,7 @@ class DA3Inference:
             device:      torch device string.
             process_res: Internal processing resolution (default 504).
         """
+        model = _normalize_da3_model(model)
         self.device = torch.device(device)
         self.focal = focal
         self.process_res = process_res
@@ -94,10 +123,14 @@ class DA3Inference:
 
         # Build (1, 3, 3) intrinsics matrix if full intrinsics provided
         self._intrinsics: np.ndarray | None = None
+        self._intrinsics_torch: torch.Tensor | None = None
         if fx is not None and fy is not None and cx is not None and cy is not None:
-            self._intrinsics = np.array([[fx, 0., cx],
-                                         [0., fy, cy],
-                                         [0., 0., 1.]], dtype=np.float32)[None]  # (1, 3, 3)
+            self._intrinsics = np.array([[fx, 0.0, cx],
+                                         [0.0, fy, cy],
+                                         [0.0, 0.0, 1.0]], dtype=np.float32)[None]  # (1, 3, 3)
+            self._intrinsics_torch = torch.from_numpy(self._intrinsics).to(
+                device=self.device, dtype=torch.float32
+            )
 
         cache_dir = _REPO_ROOT / "models" / "da3"
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -135,6 +168,54 @@ class DA3Inference:
         if "metric" in self._model_name and self.focal is not None:
             depth = self.focal * depth / 300.0
 
+        return depth
+
+    @torch.inference_mode()
+    def infer_torch_batched(self, rgb: torch.Tensor) -> torch.Tensor:
+        """
+        Run batched RGB depth inference on GPU with torch tensors.
+
+        Args:
+            rgb: Tensor with shape (N, H, W, 3) or (N, 3, H, W), RGB order.
+
+        Returns:
+            Depth tensor with shape (N, H', W') on the same device as input.
+        """
+        if not isinstance(rgb, torch.Tensor):
+            raise TypeError(f"Expected torch.Tensor, got {type(rgb)}")
+        if rgb.dim() != 4:
+            raise ValueError(
+                "Expected RGB tensor with shape (N,H,W,3) or (N,3,H,W), "
+                f"got {tuple(rgb.shape)}"
+            )
+        if not hasattr(self.model, "inference_torch"):
+            raise RuntimeError(
+                "Loaded DA3 model does not provide inference_torch. "
+                "Ensure Depth-Anything-3-HAND is selected."
+            )
+
+        intrinsics_t: torch.Tensor | None = None
+        if self._intrinsics_torch is not None:
+            if self._intrinsics_torch.device != rgb.device:
+                self._intrinsics_torch = self._intrinsics_torch.to(
+                    device=rgb.device, dtype=torch.float32
+                )
+            if self._intrinsics_torch.shape[0] == 1:
+                intrinsics_t = self._intrinsics_torch.expand(rgb.shape[0], -1, -1)
+            elif self._intrinsics_torch.shape[0] == rgb.shape[0]:
+                intrinsics_t = self._intrinsics_torch
+            else:
+                intrinsics_t = self._intrinsics_torch.repeat(rgb.shape[0], 1, 1)
+
+        outputs = self.model.inference_torch(
+            image=rgb,
+            intrinsics=intrinsics_t,
+            process_res=self.process_res,
+            process_res_method="upper_bound_resize",
+        )
+        depth = outputs["depth"]
+        if "metric" in self._model_name and self.focal is not None:
+            depth = self.focal * depth / 300.0
         return depth
 
 

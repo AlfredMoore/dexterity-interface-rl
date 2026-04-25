@@ -41,6 +41,7 @@ class CVPerceptionNode(Node):
 
         self._cv_model_cfg = config.get("cv_model", {})
         required_models = ["promptda", "sam2_w_prompt", "da3", "ultralytics"]
+        required_models = ["da3"]
         self._model_enabled: dict[str, bool] = {}
         self._model_verbose: dict[str, bool] = {}
         for model_name in required_models:
@@ -137,13 +138,13 @@ class CVPerceptionNode(Node):
         self._sam2_draw_results = None
         self._sam2_ready = False
 
-        if self._model_enabled["promptda"]:
+        if self._model_enabled.get("promptda"):
             self._init_promptda_model()
-        if self._model_enabled["da3"]:
+        if self._model_enabled.get("da3"):
             self._init_da3_model(c_intrinsics)
-        if self._model_enabled["sam2_w_prompt"]:
+        if self._model_enabled.get("sam2_w_prompt"):
             self._init_sam2_model()
-        if self._model_enabled["ultralytics"]:
+        if self._model_enabled.get("ultralytics"):
             self._init_ultralytics_model()
 
         # ── Warmup/init (startup only) ──────────────────────────────────────
@@ -151,22 +152,22 @@ class CVPerceptionNode(Node):
 
         # ── Timers (all 30 Hz) ──────────────────────────────────────────────
         self._timers = []
-        if self._model_enabled["promptda"] and self.promptda is not None:
+        if self._model_enabled.get("promptda") and self.promptda is not None:
             self._timers.append(self.create_timer(1.0 / MODEL_TIMER_HZ, self._promptda_timer_cb))
-        if self._model_enabled["da3"] and self.da3 is not None:
+        if self._model_enabled.get("da3") and self.da3 is not None:
             self._timers.append(self.create_timer(1.0 / MODEL_TIMER_HZ, self._da3_timer_cb))
-        if self._model_enabled["sam2_w_prompt"] and self.sam2_tracker is not None:
+        if self._model_enabled.get("sam2_w_prompt") and self.sam2_tracker is not None:
             self._timers.append(self.create_timer(1.0 / MODEL_TIMER_HZ, self._sam2_timer_cb))
-        if self._model_enabled["ultralytics"] and self.ultralytics is not None:
+        if self._model_enabled.get("ultralytics") and self.ultralytics is not None:
             self._timers.append(self.create_timer(1.0 / MODEL_TIMER_HZ, self._ultralytics_timer_cb))
 
         self._timers.append(self.create_timer(1.0 / COMPOSITOR_HZ, self._compositor_timer_cb))
         self._log_info(
             "CV node ready: "
-            f"promptda={self._model_enabled['promptda']} "
-            f"da3={self._model_enabled['da3']} "
-            f"sam2_w_prompt={self._model_enabled['sam2_w_prompt']} "
-            f"ultralytics={self._model_enabled['ultralytics']} "
+            f"promptda={self._model_enabled.get('promptda')} "
+            f"da3={self._model_enabled.get('da3')} "
+            f"sam2_w_prompt={self._model_enabled.get('sam2_w_prompt')} "
+            f"ultralytics={self._model_enabled.get('ultralytics')} "
             f"model_hz={MODEL_TIMER_HZ} compositor_hz={COMPOSITOR_HZ}"
         )
 

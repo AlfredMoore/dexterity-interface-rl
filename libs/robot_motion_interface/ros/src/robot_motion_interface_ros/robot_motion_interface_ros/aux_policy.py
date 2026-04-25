@@ -45,6 +45,15 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
+def _normalize_optional_text(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text.lower() in {"", "none", "null", "~"}:
+        return ""
+    return text
+
+
 def _scale_torch(target: torch.Tensor, lower: torch.Tensor, upper: torch.Tensor) -> torch.Tensor:
     return 2.0 * (target - lower) / (upper - lower) - 1.0
 
@@ -123,6 +132,20 @@ class AuxPolicyNode(Node):
         if not self.policy_node_cfg_path.is_absolute():
             self.policy_node_cfg_path = (runtime_dir / self.policy_node_cfg_path).resolve()
 
+        if not self.checkpoint_path.exists():
+            fallback_ckpts = [
+                runtime_dir / "model.pt",
+                runtime_dir / "model_0.pt",
+                runtime_dir / "model_6000.pt",
+            ]
+            for candidate in fallback_ckpts:
+                if candidate.exists():
+                    self.get_logger().warn(
+                        f"checkpoint_path not found ({self.checkpoint_path}), using fallback: {candidate}"
+                    )
+                    self.checkpoint_path = candidate.resolve()
+                    break
+
         self.capture_hz = float(self.get_parameter("capture_hz").value)
         self.da3_hz = float(self.get_parameter("da3_hz").value)
         self.policy_hz = float(self.get_parameter("policy_hz").value)
@@ -130,7 +153,7 @@ class AuxPolicyNode(Node):
         self.enable_da3_thread = bool(self.get_parameter("enable_da3_thread").value)
         self.enable_policy_timer = bool(self.get_parameter("enable_policy_timer").value)
 
-        da3_model_override = str(self.get_parameter("da3_model").value).strip()
+        da3_model_override = _normalize_optional_text(self.get_parameter("da3_model").value)
 
         for p in (self.checkpoint_path, self.runtime_cfg_path, self.env_cfg_path, self.agent_cfg_path, self.driver_cfg_path):
             if not p.exists():
@@ -217,10 +240,10 @@ class AuxPolicyNode(Node):
         )
 
     def _import_rsl_rl(self) -> None:
-        if not self.rsl_rl_root.exists():
-            raise FileNotFoundError(f"rsl_rl root not found: {self.rsl_rl_root}")
-        if str(self.rsl_rl_root) not in sys.path:
-            sys.path.insert(0, str(self.rsl_rl_root))
+        # if not self.rsl_rl_root.exists():
+        #     raise FileNotFoundError(f"rsl_rl root not found: {self.rsl_rl_root}")
+        # if str(self.rsl_rl_root) not in sys.path:
+        #     sys.path.insert(0, str(self.rsl_rl_root))
         try:
             from rsl_rl.modules.normalizer import EmpiricalNormalization
             from rsl_rl.modules.student_teacher_aux import StudentTeacherAux
@@ -320,10 +343,17 @@ class AuxPolicyNode(Node):
 
     def _build_policy_and_normalizer(self) -> None:
         policy_cfg = self.agent_cfg["policy"]
+        ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
+        model_sd = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
 
-        self.obs_dim = int(self.env_cfg["observation_space"])
-        self.state_dim = int(self.env_cfg["state_space"])
-        self.student_obs_unstacked_space = int(self.env_cfg["student_obs_unstacked_space"])
+        if "student.0.weight" not in model_sd:
+            raise KeyError("Checkpoint missing 'student.0.weight'")
+        if "teacher.0.weight" not in model_sd:
+            raise KeyError("Checkpoint missing 'teacher.0.weight'")
+        ckpt_student_in = int(model_sd["student.0.weight"].shape[1])
+        ckpt_teacher_in = int(model_sd["teacher.0.weight"].shape[1])
+        ckpt_action_dim = int(model_sd["student.6.weight"].shape[0]) if "student.6.weight" in model_sd else self.action_num
+
         self.vision_backbone_dim = int(policy_cfg["vision_backbone_dim"])
         self.vision_target_dim = int(policy_cfg["vision_target_dim"])
         self.vision_input_height = int(policy_cfg["vision_input_height"])
@@ -338,6 +368,10 @@ class AuxPolicyNode(Node):
                 f"got student_vision_modality={self.student_vision_modality}"
             )
 
+        self.n_stack_frame = int(self.env_cfg.get("n_stack_frame", 2))
+        if self.n_stack_frame <= 0:
+            self.n_stack_frame = 1
+
         self.student_obs_keys = list(self.env_cfg.get("student", []))
         self.student_obs_keys = [k for k in self.student_obs_keys if k != "visionFeatures"]
         if not self.student_obs_keys:
@@ -351,6 +385,68 @@ class AuxPolicyNode(Node):
                 "leftHandBasePos",
                 "rightHandBasePos",
             ]
+
+        obs_dof = self.env_cfg.get("obs_dof", self.env_cfg.get("obs_DOF", {}))
+        inferred_unstacked = 0
+        if isinstance(obs_dof, dict):
+            try:
+                inferred_unstacked = int(sum(int(obs_dof[k]) for k in self.student_obs_keys))
+            except KeyError:
+                inferred_unstacked = 0
+
+        student_unstacked_cfg = self.env_cfg.get("student_obs_unstacked_space", None)
+        if student_unstacked_cfg is not None:
+            self.student_obs_unstacked_space = int(student_unstacked_cfg)
+        elif inferred_unstacked > 0:
+            self.student_obs_unstacked_space = inferred_unstacked
+        else:
+            if ckpt_student_in <= self.vision_backbone_dim:
+                raise ValueError(
+                    "Checkpoint student input dim is invalid: "
+                    f"student_in={ckpt_student_in}, vision_backbone_dim={self.vision_backbone_dim}"
+                )
+            ckpt_obs_dim = ckpt_student_in - self.vision_backbone_dim
+            if ckpt_obs_dim % self.n_stack_frame == 0:
+                self.student_obs_unstacked_space = ckpt_obs_dim // self.n_stack_frame
+            else:
+                self.n_stack_frame = 1
+                self.student_obs_unstacked_space = ckpt_obs_dim
+
+        env_obs_dim = int(self.env_cfg.get("observation_space", self.student_obs_unstacked_space * self.n_stack_frame))
+        ckpt_obs_dim = ckpt_student_in - self.vision_backbone_dim
+        candidate_obs_dim = self.student_obs_unstacked_space * self.n_stack_frame
+        if candidate_obs_dim != ckpt_obs_dim:
+            self.get_logger().warn(
+                "Env/student stacked obs dim mismatches checkpoint; using checkpoint-compatible dimension. "
+                f"env_candidate={candidate_obs_dim}, ckpt_obs_dim={ckpt_obs_dim}"
+            )
+            self.obs_dim = ckpt_obs_dim
+            if self.obs_dim % self.n_stack_frame == 0:
+                self.student_obs_unstacked_space = self.obs_dim // self.n_stack_frame
+            else:
+                self.n_stack_frame = 1
+                self.student_obs_unstacked_space = self.obs_dim
+        else:
+            self.obs_dim = candidate_obs_dim
+
+        if env_obs_dim != self.obs_dim:
+            self.get_logger().warn(
+                f"env observation_space({env_obs_dim}) != effective obs_dim({self.obs_dim}); "
+                "effective obs_dim will be used for model construction."
+            )
+
+        env_state_dim = int(self.env_cfg.get("state_space", ckpt_teacher_in))
+        if env_state_dim != ckpt_teacher_in:
+            self.get_logger().warn(
+                f"env state_space({env_state_dim}) != checkpoint teacher input({ckpt_teacher_in}); "
+                "checkpoint value will be used."
+            )
+        self.state_dim = ckpt_teacher_in
+
+        if ckpt_action_dim != self.action_num:
+            raise ValueError(
+                f"Checkpoint action dim mismatch: ckpt={ckpt_action_dim}, runtime={self.action_num}"
+            )
 
         self.policy = self.StudentTeacherAux(
             num_student_obs=self.obs_dim,
@@ -370,8 +466,6 @@ class AuxPolicyNode(Node):
         ).to(self.device)
         self.policy.eval()
 
-        ckpt = torch.load(self.checkpoint_path, map_location=self.device, weights_only=False)
-        model_sd = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
         self.policy.load_state_dict(model_sd, strict=True)
 
         self.obs_normalizer = self.EmpiricalNormalization(shape=self.obs_dim).to(self.device)
@@ -409,20 +503,22 @@ class AuxPolicyNode(Node):
             raise ValueError(
                 f"obs normalizer shape mismatch: {self.obs_normalizer._mean.shape} vs obs_dim={self.obs_dim}"
             )
-        obs_dof = self.env_cfg.get("obs_dof", {})
+        obs_dof = self.env_cfg.get("obs_dof", self.env_cfg.get("obs_DOF", {}))
         if isinstance(obs_dof, dict) and self.student_obs_keys:
-            inferred_unstacked = int(sum(int(obs_dof[k]) for k in self.student_obs_keys))
-            if inferred_unstacked != self.student_obs_unstacked_space:
-                raise ValueError(
-                    "student_obs_unstacked_space mismatch: "
-                    f"inferred={inferred_unstacked}, cfg={self.student_obs_unstacked_space}"
-                )
-        n_stack_frame = int(self.env_cfg.get("n_stack_frame", 2))
-        if n_stack_frame * self.student_obs_unstacked_space != self.obs_dim:
+            try:
+                inferred_unstacked = int(sum(int(obs_dof[k]) for k in self.student_obs_keys))
+                if inferred_unstacked != self.student_obs_unstacked_space:
+                    self.get_logger().warn(
+                        "student_obs_unstacked_space differs from env obs_DOF sum: "
+                        f"inferred={inferred_unstacked}, effective={self.student_obs_unstacked_space}"
+                    )
+            except KeyError:
+                self.get_logger().warn("Some student obs keys are missing in env obs_DOF/obs_dof.")
+        if self.n_stack_frame * self.student_obs_unstacked_space != self.obs_dim:
             raise ValueError(
                 "stacked obs dim mismatch: "
-                f"n_stack_frame({n_stack_frame}) * student_obs_unstacked_space({self.student_obs_unstacked_space}) "
-                f"!= observation_space({self.obs_dim})"
+                f"n_stack_frame({self.n_stack_frame}) * "
+                f"student_obs_unstacked_space({self.student_obs_unstacked_space}) != obs_dim({self.obs_dim})"
             )
 
     def _build_pinocchio(self) -> None:
@@ -467,6 +563,7 @@ class AuxPolicyNode(Node):
             )
 
         model_name = da3_model_override or self._resolve_da3_model()
+        self.get_logger().info(f"Initializing DA3 with model: {model_name}")
         fx = float(color_intrinsics.get("fx", 0.0))
         fy = float(color_intrinsics.get("fy", 0.0))
         focal = 0.5 * (fx + fy) if fx > 0 and fy > 0 else None
@@ -477,7 +574,7 @@ class AuxPolicyNode(Node):
             fy=float(color_intrinsics.get("fy")) if "fy" in color_intrinsics else None,
             cx=float(color_intrinsics.get("cx")) if "cx" in color_intrinsics else None,
             cy=float(color_intrinsics.get("cy")) if "cy" in color_intrinsics else None,
-            device=str(self.device),
+            device=self.device,
             process_res=self.da3_process_res,
         )
         self.get_logger().info(f"DA3 ready: model={model_name}, process_res={self.da3_process_res}")
@@ -490,7 +587,7 @@ class AuxPolicyNode(Node):
     def _resolve_da3_model(self) -> str:
         cv_model = self.policy_node_cfg.get("cv_model", {})
         da3_cfg = cv_model.get("da3", {})
-        model = str(da3_cfg.get("model", "")).strip()
+        model = _normalize_optional_text(da3_cfg.get("model", ""))
         return model or DEFAULT_DA3_MODEL
 
     def _apply_sensor_settings(self, rs_profile, sensor_settings: dict[str, Any]) -> None:
@@ -559,9 +656,17 @@ class AuxPolicyNode(Node):
                 with self.vision_lock:
                     color_bgr = None if self.latest_color_bgr is None else self.latest_color_bgr.copy()
                 if color_bgr is not None:
-                    depth = self.da3.infer(color_bgr)
-                    depth_np = np.asarray(depth, dtype=np.float32)
-                    depth_t = torch.from_numpy(depth_np).to(self.device, non_blocking=True)
+                    if hasattr(self.da3, "infer_torch_batched"):
+                        color_t = torch.from_numpy(color_bgr).to(self.device, non_blocking=True)
+                        color_rgb_t = color_t[..., [2, 1, 0]].unsqueeze(0)  # [1, H, W, 3], RGB
+                        depth_t = self.da3.infer_torch_batched(color_rgb_t)
+                        if depth_t.dim() == 3 and depth_t.shape[0] == 1:
+                            depth_t = depth_t[0]
+                        depth_t = depth_t.to(dtype=torch.float32)
+                    else:
+                        depth = self.da3.infer(color_bgr)
+                        depth_np = np.asarray(depth, dtype=np.float32)
+                        depth_t = torch.from_numpy(depth_np).to(self.device, non_blocking=True)
                     depth_t = depth_t.clamp(min=self.depth_clip_min, max=self.depth_clip_max).to(torch.float16)
                     with self.vision_lock:
                         self.latest_depth = depth_t
@@ -650,8 +755,16 @@ class AuxPolicyNode(Node):
             "leftHandBasePos": left_hand_base_pos,
             "rightHandBasePos": right_hand_base_pos,
         }
-
-        return torch.cat([full_obs[k] for k in self.student_obs_keys], dim=-1)
+        for k in self.student_obs_keys:
+            if k not in full_obs:
+                raise KeyError(f"Student obs key '{k}' is not available in aux policy full_obs.")
+        student_obs = torch.cat([full_obs[k] for k in self.student_obs_keys], dim=-1)
+        if int(student_obs.shape[-1]) != self.student_obs_unstacked_space:
+            raise ValueError(
+                "Built student obs dim mismatch: "
+                f"built={int(student_obs.shape[-1])}, expected={self.student_obs_unstacked_space}"
+            )
+        return student_obs
 
     def _policy_update_loop(self) -> None:
         if not self.has_joint_state or not self.targets_initialized:
