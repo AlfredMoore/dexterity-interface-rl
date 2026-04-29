@@ -214,6 +214,34 @@ print(K)
 print(f"color distortion model = {_rs_color_intr['model']}, coeffs = {_rs_color_intr['distortion']}")
 print(f"depth distortion model = {_rs_depth_intr['model']}, depth_scale = {_depth_scale}")
 
+
+def _diff_intrinsics(yaml_d: dict, device_d: dict, label: str) -> None:
+    """Print yaml-vs-device intrinsics side by side; flag any mismatch with a marker."""
+    keys = ["width", "height", "fx", "fy", "cx", "cy", "distortion", "model"]
+    print(f"\n[compare] {label}: yaml (config) vs device (live)")
+    print(f"  {'key':<10} | {'yaml':<28} | {'device':<28} | match")
+    print(f"  {'-'*10}-+-{'-'*28}-+-{'-'*28}-+------")
+    for k in keys:
+        yv = yaml_d.get(k)
+        dv = device_d.get(k)
+        # Float-tolerant compare for scalar numeric keys
+        if isinstance(yv, (int, float)) and isinstance(dv, (int, float)):
+            same = abs(float(yv) - float(dv)) < 1e-3
+        elif isinstance(yv, list) and isinstance(dv, list):
+            if len(yv) != len(dv):
+                same = False
+            else:
+                same = all(abs(float(a) - float(b)) < 1e-3 for a, b in zip(yv, dv))
+        else:
+            same = (yv == dv)
+        flag = "OK" if same else "DIFF"
+        print(f"  {k:<10} | {str(yv):<28} | {str(dv):<28} | {flag}")
+
+
+_diff_intrinsics(_c_intrinsics, _rs_color_intr, "color_intrinsics")
+_diff_intrinsics(_d_intrinsics, _rs_depth_intr, "depth_intrinsics")
+print()
+
 # ── ArUco detector (OpenCV >= 4.7 API) ──────────────────────────────────────
 detector_params = cv2.aruco.DetectorParameters()
 _USE_NEW_API = hasattr(cv2.aruco, "ArucoDetector")
