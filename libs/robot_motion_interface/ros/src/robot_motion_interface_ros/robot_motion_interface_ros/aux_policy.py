@@ -767,11 +767,13 @@ class AuxPolicyNode(Node):
         return student_obs
 
     def _policy_update_loop(self) -> None:
+        t0 = time.perf_counter()
         if not self.has_joint_state or not self.targets_initialized:
             return
 
         with self.vision_lock:
             depth_t = None if self.latest_depth is None else self.latest_depth.clone()
+        t01 = time.perf_counter()    # vision lock and data copy
         if depth_t is None:
             return
         if depth_t.ndim == 2:
@@ -787,12 +789,14 @@ class AuxPolicyNode(Node):
             joint_vel_real = self.latest_joint_vel_real.clone()
             targets_real = self.targets_real.clone()
             prev_actions_policy = self.prev_actions_policy.clone()
+        t02 = time.perf_counter()    # joint lock and data copy
 
         cur_student_obs = self._compose_student_obs(
             joint_pos_real=joint_pos_real,
             joint_vel_real=joint_vel_real,
             targets_real=targets_real,
         )
+        t1 = time.perf_counter()    # obs collect
         stacked_obs = torch.cat((cur_student_obs, self.prev_student_obs), dim=-1)
         self.prev_student_obs = cur_student_obs.detach()
 
@@ -801,7 +805,7 @@ class AuxPolicyNode(Node):
         with torch.inference_mode():
             obs_normed = self.obs_normalizer(obs_clamped)
             actions_policy = self.policy.act_inference(obs_normed, vision_input=depth_t)
-
+        t2 = time.perf_counter()    # policy inference
         next_targets_real, ema_actions_policy = compute_targets(
             dt=self.dt,
             actions=actions_policy,
@@ -824,6 +828,16 @@ class AuxPolicyNode(Node):
         msg.name = self.real_joint_names
         msg.position = next_targets_real[0].detach().cpu().tolist()
         self.target_pub.publish(msg)
+        
+        t_end = time.perf_counter()
+        self.get_logger().info(
+            f"Policy update: \n"
+            f"  vision_lock={t01 - t0:.3f}s, \n"
+            f"  joint_lock={t02 - t01:.3f}s, \n"
+            f"  compose_obs={t1 - t02:.3f}s, \n"
+            f"  inference={t2 - t1:.3f}s, \n"
+            f"  total={t_end - t0:.3f}s\n"
+        )
 
     def destroy_node(self) -> bool:
         self._capture_running = False
