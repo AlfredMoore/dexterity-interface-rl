@@ -110,6 +110,14 @@ Realsense Test
 python -m robot_motion_interface.utils.realsense_test.py
 ```
 
+Calibrate Realsense extrinsics
+```bash
+python -m robot_motion_interface.utils.realsense_artag_cali \
+  --marker-size 0.1 \
+  --target-tag-id 0 \
+  --aruco-dict DICT_4X4_50
+```
+
 Commit the image from the host (optional)
 ```bash
 docker commit handrl-policy dex-policy:compiled

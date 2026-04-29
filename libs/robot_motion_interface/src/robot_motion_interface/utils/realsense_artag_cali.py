@@ -24,6 +24,7 @@ depth_scale, depth→color extrinsics) plus the computed `pose` and per-conventi
 quaternions.
 """
 
+import argparse
 import importlib.util
 import os
 import signal
@@ -36,18 +37,12 @@ import numpy as np
 import pyrealsense2 as rs
 import yaml
 
-# ── Tunable constants ───────────────────────────────────────────────────────
-ARUCO_DICT     = cv2.aruco.DICT_5X5_100   # change to match your printed tag (ignored if AUTO_DETECT_DICT)
-AUTO_DETECT_DICT = True                   # scan all known dicts until a marker is found, then lock in
-MARKER_SIZE_M  = 0.05                     # physical edge length (meters)
-TARGET_TAG_ID  = None                     # None = use first detected marker
-AXIS_LENGTH_M  = MARKER_SIZE_M * 1.5      # axis arms longer than the marker for visibility
+# ── Tunable constants / defaults ────────────────────────────────────────────
+DEFAULT_ARUCO_DICT_NAME = "DICT_4X4_50"
+DEFAULT_AUTO_DETECT_DICT = False
 AXIS_THICKNESS = 3                        # line thickness for drawn axes
-PRINT_EVERY_N  = 30                       # print every N loops to throttle stdout
-
-# World frame is the AR-tag frame rotated about its own +Z by this angle, then taken as origin.
-# Per user: rotate 180 deg around tag's z to make it the real-world origin.
-WORLD_TAG_Z_ROT_DEG = 180.0
+DEFAULT_PRINT_EVERY_N = 30                # print every N loops to throttle stdout
+DEFAULT_WORLD_TAG_Z_ROT_DEG = 180.0
 
 # Default depth clip range (m) and output render size copied from existing IsaacSim configs.
 # These are user-defined and not present in the RealSense profile, so we keep sane defaults.
@@ -79,6 +74,76 @@ _DICT_CANDIDATES = [
     "DICT_APRILTAG_16h5", "DICT_APRILTAG_25h9",
     "DICT_APRILTAG_36h10", "DICT_APRILTAG_36h11",
 ]
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "RealSense extrinsic calibration with ArUco. "
+            "Use explicit marker size/dictionary/target tag to avoid pose jumps."
+        )
+    )
+    parser.add_argument(
+        "--marker-size",
+        type=float,
+        required=True,
+        help="Physical ArUco side length in meters (required, e.g. 0.1).",
+    )
+    parser.add_argument(
+        "--aruco-dict",
+        type=str,
+        default=DEFAULT_ARUCO_DICT_NAME,
+        choices=_DICT_CANDIDATES,
+        help=f"Aruco dictionary to use when auto-detect is off (default: {DEFAULT_ARUCO_DICT_NAME}).",
+    )
+    parser.add_argument(
+        "--target-tag-id",
+        type=int,
+        required=True,
+        help="Target marker ID to track/save. Required to avoid 'first detected ID' drift.",
+    )
+    parser.add_argument(
+        "--auto-detect-dict",
+        action="store_true",
+        default=DEFAULT_AUTO_DETECT_DICT,
+        help="Scan all dicts and lock first hit. Disabled by default due to mis-detect risk.",
+    )
+    parser.add_argument(
+        "--print-every-n",
+        type=int,
+        default=DEFAULT_PRINT_EVERY_N,
+        help=f"Print throttle interval in frames (default: {DEFAULT_PRINT_EVERY_N}).",
+    )
+    parser.add_argument(
+        "--world-tag-z-rot-deg",
+        type=float,
+        default=DEFAULT_WORLD_TAG_Z_ROT_DEG,
+        help=f"World frame = tag frame rotated about +Z by this angle (default: {DEFAULT_WORLD_TAG_Z_ROT_DEG}).",
+    )
+    return parser.parse_args()
+
+
+ARGS = _parse_args()
+
+if ARGS.marker_size <= 0.0:
+    raise ValueError(f"--marker-size must be > 0, got {ARGS.marker_size}")
+
+ARUCO_DICT_NAME = ARGS.aruco_dict
+ARUCO_DICT = getattr(cv2.aruco, ARUCO_DICT_NAME, None)
+if ARUCO_DICT is None:
+    raise ValueError(f"Aruco dictionary not available in this OpenCV build: {ARUCO_DICT_NAME}")
+
+AUTO_DETECT_DICT = bool(ARGS.auto_detect_dict)
+if AUTO_DETECT_DICT:
+    print("[WARN] --auto-detect-dict enabled. This may lock a wrong dictionary in cluttered scenes.")
+
+MARKER_SIZE_M = float(ARGS.marker_size)
+TARGET_TAG_ID = int(ARGS.target_tag_id)
+AXIS_LENGTH_M = MARKER_SIZE_M * 1.5
+PRINT_EVERY_N = max(1, int(ARGS.print_every_n))
+
+# World frame is the AR-tag frame rotated about its own +Z by this angle, then taken as origin.
+WORLD_TAG_Z_ROT_DEG = float(ARGS.world_tag_z_rot_deg)
 
 # ── Config + paths (mirrors realsense_test.py) ──────────────────────────────
 spec = importlib.util.find_spec("robot_motion_interface")
@@ -244,6 +309,10 @@ print()
 
 # ── ArUco detector (OpenCV >= 4.7 API) ──────────────────────────────────────
 detector_params = cv2.aruco.DetectorParameters()
+detector_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+detector_params.cornerRefinementWinSize = 5
+detector_params.cornerRefinementMaxIterations = 30
+detector_params.cornerRefinementMinAccuracy = 0.01
 _USE_NEW_API = hasattr(cv2.aruco, "ArucoDetector")
 
 
@@ -567,6 +636,16 @@ def _save_extrinsics(T_cam_tag: np.ndarray, T_tag_cam: np.ndarray, tag_id: int,
     # because the existing HandEnv.yaml realsense pose uses convention=world.
     primary_conv = "world"
 
+    pos_xyz = [float(v) for v in cam_pose["pos"]]
+    rot_ros = [float(v) for v in quats["ros"]]
+    rot_opengl = [float(v) for v in quats["opengl"]]
+    rot_world = [float(v) for v in quats["world"]]
+    rot_primary = {
+        "ros": rot_ros,
+        "opengl": rot_opengl,
+        "world": rot_world,
+    }[primary_conv]
+
     realsense_block = {
         "rs_fps": int(_rs_fps),
         "width":  int(_rs_color_intr["width"]),
@@ -576,15 +655,27 @@ def _save_extrinsics(T_cam_tag: np.ndarray, T_tag_cam: np.ndarray, tag_id: int,
         "clip": list(DEFAULT_DEPTH_CLIP),
         "depth_scale": float(_depth_scale),
         "pose": {
-            "pos": cam_pose["pos"],
-            "rot": quats[primary_conv],            # quaternion (w, x, y, z)
+            "pos": list(pos_xyz),
+            "rot": list(rot_primary),            # quaternion (w, x, y, z)
             "convention": primary_conv,
         },
         "pose_all_conventions": {
             "source_convention": SOURCE_CONVENTION,  # OpenCV solvePnP natural output
-            "ros":    {"pos": cam_pose["pos"], "rot": quats["ros"]},
-            "opengl": {"pos": cam_pose["pos"], "rot": quats["opengl"]},
-            "world":  {"pos": cam_pose["pos"], "rot": quats["world"]},
+            "ros": {
+                "pos": list(pos_xyz),
+                "rot": list(rot_ros),
+                "convention": "ros",
+            },
+            "opengl": {
+                "pos": list(pos_xyz),
+                "rot": list(rot_opengl),
+                "convention": "opengl",
+            },
+            "world": {
+                "pos": list(pos_xyz),
+                "rot": list(rot_world),
+                "convention": "world",
+            },
         },
         "color_intrinsics": _rs_color_intr,
         "depth_intrinsics": {
@@ -679,45 +770,48 @@ try:
             cv2.aruco.drawDetectedMarkers(vis, corners, ids)
 
             id_list = ids.flatten().tolist()
-            if TARGET_TAG_ID is not None and TARGET_TAG_ID in id_list:
-                active_idx = id_list.index(TARGET_TAG_ID)
-            else:
-                active_idx = 0
-            active_id = int(id_list[active_idx])
-
-            ok, rvec, tvec = _pose_from_corners(corners[active_idx])
-            if ok:
-                active_rvec = rvec
-                active_tvec = tvec
-                active_T_cam_tag = _make_T(rvec, tvec)
-                T_tag_cam = _invert_T(active_T_cam_tag)
-                last_T_cam_tag = active_T_cam_tag
-                last_T_tag_cam = T_tag_cam
-                last_tag_id = active_id
-
-                # Tag frame: short, labeled "T" (T_x / T_y / T_z)
-                _draw_labeled_axes(
-                    vis, rvec, tvec, AXIS_LENGTH_M, AXIS_THICKNESS, label_prefix="T_"
-                )
-                # World frame (tag rotated +Z by WORLD_TAG_Z_ROT_DEG): longer arms,
-                # labeled "W" so it visually overlays at the same origin but reaches further.
-                rvec_w, tvec_w = _world_axes_in_cam(active_T_cam_tag)
-                _draw_labeled_axes(
-                    vis, rvec_w, tvec_w, AXIS_LENGTH_M * 2.0, AXIS_THICKNESS + 1, label_prefix="W_"
-                )
-
+            if TARGET_TAG_ID not in id_list:
                 if loop_idx % PRINT_EVERY_N == 0:
-                    t_ct = active_T_cam_tag[:3, 3]
-                    eul_ct = _euler_deg_from_R(active_T_cam_tag[:3, :3])
-                    t_tc = T_tag_cam[:3, 3]
-                    eul_tc = _euler_deg_from_R(T_tag_cam[:3, :3])
                     print(
-                        f"[{loop_idx:6d}] tag={active_id} | "
-                        f"t_cam_tag=({t_ct[0]:+.3f},{t_ct[1]:+.3f},{t_ct[2]:+.3f}) m  "
-                        f"rpy_deg=({eul_ct[0]:+.1f},{eul_ct[1]:+.1f},{eul_ct[2]:+.1f}) | "
-                        f"t_tag_cam=({t_tc[0]:+.3f},{t_tc[1]:+.3f},{t_tc[2]:+.3f}) m  "
-                        f"rpy_deg=({eul_tc[0]:+.1f},{eul_tc[1]:+.1f},{eul_tc[2]:+.1f})"
+                        f"[{loop_idx:6d}] target_tag_id={TARGET_TAG_ID} not found in detected ids={id_list}"
                     )
+            else:
+                active_idx = id_list.index(TARGET_TAG_ID)
+                active_id = int(id_list[active_idx])
+
+                ok, rvec, tvec = _pose_from_corners(corners[active_idx])
+                if ok:
+                    active_rvec = rvec
+                    active_tvec = tvec
+                    active_T_cam_tag = _make_T(rvec, tvec)
+                    T_tag_cam = _invert_T(active_T_cam_tag)
+                    last_T_cam_tag = active_T_cam_tag
+                    last_T_tag_cam = T_tag_cam
+                    last_tag_id = active_id
+
+                    # Tag frame: short, labeled "T" (T_x / T_y / T_z)
+                    _draw_labeled_axes(
+                        vis, rvec, tvec, AXIS_LENGTH_M, AXIS_THICKNESS, label_prefix="T_"
+                    )
+                    # World frame (tag rotated +Z by WORLD_TAG_Z_ROT_DEG): longer arms,
+                    # labeled "W" so it visually overlays at the same origin but reaches further.
+                    rvec_w, tvec_w = _world_axes_in_cam(active_T_cam_tag)
+                    _draw_labeled_axes(
+                        vis, rvec_w, tvec_w, AXIS_LENGTH_M * 2.0, AXIS_THICKNESS + 1, label_prefix="W_"
+                    )
+
+                    if loop_idx % PRINT_EVERY_N == 0:
+                        t_ct = active_T_cam_tag[:3, 3]
+                        eul_ct = _euler_deg_from_R(active_T_cam_tag[:3, :3])
+                        t_tc = T_tag_cam[:3, 3]
+                        eul_tc = _euler_deg_from_R(T_tag_cam[:3, :3])
+                        print(
+                            f"[{loop_idx:6d}] tag={active_id} | "
+                            f"t_cam_tag=({t_ct[0]:+.3f},{t_ct[1]:+.3f},{t_ct[2]:+.3f}) m  "
+                            f"rpy_deg=({eul_ct[0]:+.1f},{eul_ct[1]:+.1f},{eul_ct[2]:+.1f}) | "
+                            f"t_tag_cam=({t_tc[0]:+.3f},{t_tc[1]:+.3f},{t_tc[2]:+.3f}) m  "
+                            f"rpy_deg=({eul_tc[0]:+.1f},{eul_tc[1]:+.1f},{eul_tc[2]:+.1f})"
+                        )
 
         # FPS
         now = time.time()
