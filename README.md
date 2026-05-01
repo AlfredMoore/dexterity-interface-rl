@@ -61,6 +61,10 @@ Dependencies
 cd /workspace/dep
 pip install -r requirements.txt
 cd /workspace
+
+cd /workspace/dep/rsl_rl-HAND
+pip install -e .
+cd /workspace
 ```
 
 Compile curobo
@@ -177,6 +181,11 @@ ros2 run robot_motion_interface_ros replay_action_torch
 Attach to Policy Container
 ```bash
 docker exec -it -e DISPLAY=$DISPLAY handrl-policy bash
+```
+
+Run Aux Policy
+```bash
+ros2 run robot_motion_interface_ros aux_policy --ros-args -p policy_timing_log_every:=30
 ```
 
 

@@ -109,6 +109,7 @@ class AuxPolicyNode(Node):
 
         # DA3 override (None => config/default)
         self.declare_parameter("da3_model", "")
+        self.declare_parameter("enable_da3_timing_log", True)
 
         runtime_dir = Path(self.get_parameter("runtime_dir").value).expanduser().resolve()
         self.checkpoint_path = Path(self.get_parameter("checkpoint_path").value).expanduser()
@@ -133,18 +134,7 @@ class AuxPolicyNode(Node):
             self.policy_node_cfg_path = (runtime_dir / self.policy_node_cfg_path).resolve()
 
         if not self.checkpoint_path.exists():
-            fallback_ckpts = [
-                runtime_dir / "model.pt",
-                runtime_dir / "model_0.pt",
-                runtime_dir / "model_6000.pt",
-            ]
-            for candidate in fallback_ckpts:
-                if candidate.exists():
-                    self.get_logger().warn(
-                        f"checkpoint_path not found ({self.checkpoint_path}), using fallback: {candidate}"
-                    )
-                    self.checkpoint_path = candidate.resolve()
-                    break
+            raise FileNotFoundError(f"Checkpoint file not found: {self.checkpoint_path}")
 
         self.capture_hz = float(self.get_parameter("capture_hz").value)
         self.da3_hz = float(self.get_parameter("da3_hz").value)
@@ -152,6 +142,7 @@ class AuxPolicyNode(Node):
         self.enable_realsense = bool(self.get_parameter("enable_realsense").value)
         self.enable_da3_thread = bool(self.get_parameter("enable_da3_thread").value)
         self.enable_policy_timer = bool(self.get_parameter("enable_policy_timer").value)
+        self.enable_da3_timing_log = bool(self.get_parameter("enable_da3_timing_log").value)
 
         da3_model_override = _normalize_optional_text(self.get_parameter("da3_model").value)
 
@@ -183,13 +174,21 @@ class AuxPolicyNode(Node):
         # State buffers
         self.joint_lock = threading.Lock()
         self.vision_lock = threading.Lock()
-        self.latest_joint_pos_real = torch.zeros((1, self.action_num), dtype=torch.float32, device=self.device)
-        self.latest_joint_vel_real = torch.zeros((1, self.action_num), dtype=torch.float32, device=self.device)
+        self.latest_joint_pos_real_np = np.zeros((self.action_num,), dtype=np.float32)
+        self.latest_joint_vel_real_np = np.zeros((self.action_num,), dtype=np.float32)
+        self._joint_pos_snapshot_np = np.zeros((self.action_num,), dtype=np.float32)
+        self._joint_vel_snapshot_np = np.zeros((self.action_num,), dtype=np.float32)
         self.has_joint_state = False
         self.targets_real = torch.zeros((1, self.action_num), dtype=torch.float32, device=self.device)
         self.targets_initialized = False
         self.prev_actions_policy = torch.zeros((1, self.action_num), dtype=torch.float32, device=self.device)
         self.prev_student_obs = torch.zeros((1, self.student_obs_unstacked_space), dtype=torch.float32, device=self.device)
+        self._joint_pos_snapshot = torch.zeros((1, self.action_num), dtype=torch.float32, device=self.device)
+        self._joint_vel_snapshot = torch.zeros((1, self.action_num), dtype=torch.float32, device=self.device)
+        self._targets_snapshot = torch.zeros((1, self.action_num), dtype=torch.float32, device=self.device)
+        self._prev_actions_snapshot = torch.zeros((1, self.action_num), dtype=torch.float32, device=self.device)
+        self._stacked_obs_buf = torch.zeros((1, self.obs_dim), dtype=torch.float32, device=self.device)
+        self._obs_clamped_buf = torch.zeros((1, self.obs_dim), dtype=torch.float32, device=self.device)
 
         self.latest_color_bgr: np.ndarray | None = None
         self.latest_depth: torch.Tensor | None = None
@@ -236,7 +235,8 @@ class AuxPolicyNode(Node):
             "AuxPolicyNode ready. "
             f"capture_hz={self.capture_hz}, da3_hz={self.da3_hz}, policy_hz={self.policy_hz}, "
             f"enable_realsense={self.enable_realsense}, enable_da3_thread={self.enable_da3_thread}, "
-            f"enable_policy_timer={self.enable_policy_timer}"
+            f"enable_policy_timer={self.enable_policy_timer}, "
+            f"enable_da3_timing_log={self.enable_da3_timing_log}"
         )
 
     def _import_rsl_rl(self) -> None:
@@ -649,6 +649,8 @@ class AuxPolicyNode(Node):
         period = 1.0 / max(self.da3_hz, 1e-3)
         while self._da3_running:
             loop_start = time.perf_counter()
+            did_infer = False
+            infer_elapsed = 0.0
             if not self._try_enter_da3():
                 time.sleep(0.001)
                 continue
@@ -656,6 +658,7 @@ class AuxPolicyNode(Node):
                 with self.vision_lock:
                     color_bgr = None if self.latest_color_bgr is None else self.latest_color_bgr.copy()
                 if color_bgr is not None:
+                    infer_start = time.perf_counter()
                     if hasattr(self.da3, "infer_torch_batched"):
                         color_t = torch.from_numpy(color_bgr).to(self.device, non_blocking=True)
                         color_rgb_t = color_t[..., [2, 1, 0]].unsqueeze(0)  # [1, H, W, 3], RGB
@@ -668,15 +671,34 @@ class AuxPolicyNode(Node):
                         depth_np = np.asarray(depth, dtype=np.float32)
                         depth_t = torch.from_numpy(depth_np).to(self.device, non_blocking=True)
                     depth_t = depth_t.clamp(min=self.depth_clip_min, max=self.depth_clip_max).to(torch.float16)
+                    infer_elapsed = time.perf_counter() - infer_start
                     with self.vision_lock:
                         self.latest_depth = depth_t
                         self.latest_depth_stamp = time.time()
+                    did_infer = True
             except Exception as exc:
                 self.get_logger().warn(f"DA3 inference failed: {exc}")
             finally:
                 self._leave_da3()
 
             elapsed = time.perf_counter() - loop_start
+            if self.enable_da3_timing_log and did_infer:
+                self.get_logger().info(
+                    "DA3 timing: "
+                    f"infer={infer_elapsed:.4f}s, total={elapsed:.4f}s, target_period={period:.4f}s"
+                )
+                da3_extreme_threshold_s = 0.03
+                if infer_elapsed > da3_extreme_threshold_s or elapsed > da3_extreme_threshold_s:
+                    over_parts = []
+                    if infer_elapsed > da3_extreme_threshold_s:
+                        over_parts.append(
+                            f"infer={infer_elapsed:.4f}s>{da3_extreme_threshold_s:.3f}s"
+                        )
+                    if elapsed > da3_extreme_threshold_s:
+                        over_parts.append(
+                            f"total={elapsed:.4f}s>{da3_extreme_threshold_s:.3f}s"
+                        )
+                    self.get_logger().warn("[SLOW_DA3] " + " | ".join(over_parts))
             sleep_s = period - elapsed
             if sleep_s > 0:
                 time.sleep(sleep_s)
@@ -688,13 +710,12 @@ class AuxPolicyNode(Node):
             )
             return
         vel = msg.velocity if len(msg.velocity) == self.action_num else [0.0] * self.action_num
+        pos_np = np.asarray(msg.position, dtype=np.float32)
+        vel_np = np.asarray(vel, dtype=np.float32)
         with self.joint_lock:
-            self.latest_joint_pos_real[0, :] = torch.as_tensor(msg.position, dtype=torch.float32, device=self.device)
-            self.latest_joint_vel_real[0, :] = torch.as_tensor(vel, dtype=torch.float32, device=self.device)
+            np.copyto(self.latest_joint_pos_real_np, pos_np)
+            np.copyto(self.latest_joint_vel_real_np, vel_np)
             self.has_joint_state = True
-            if not self.targets_initialized:
-                self.targets_real[0, :] = self.latest_joint_pos_real[0, :]
-                self.targets_initialized = True
 
     def _pinocchio_forward_kinematics(
         self,
@@ -766,13 +787,50 @@ class AuxPolicyNode(Node):
             )
         return student_obs
 
+    def _log_policy_timing(
+        self,
+        vision_lock_s: float,
+        joint_lock_s: float,
+        compose_obs_s: float,
+        inference_s: float,
+        total_s: float,
+    ) -> None:
+        self.get_logger().info(
+            f"Policy update: \n"
+            f"  vision_lock={vision_lock_s:.3f}s, \n"
+            f"  joint_lock={joint_lock_s:.3f}s, \n"
+            f"  compose_obs={compose_obs_s:.3f}s, \n"
+            f"  inference={inference_s:.3f}s, \n"
+            f"  total={total_s:.3f}s\n"
+        )
+
+        stage_threshold_s = 0.01
+        total_threshold_s = 0.02
+        stage_timings = {
+            "vision_lock": vision_lock_s,
+            "joint_lock": joint_lock_s,
+            "compose_obs": compose_obs_s,
+            "inference": inference_s,
+        }
+        stage_over = [f"{name}={value:.4f}s" for name, value in stage_timings.items() if value > stage_threshold_s]
+        total_over = total_s > total_threshold_s
+        if total_over or stage_over:
+            over_parts = []
+            if total_over:
+                over_parts.append(f"total={total_s:.4f}s>{total_threshold_s:.3f}s")
+            if stage_over:
+                over_parts.append(
+                    f"stage>{stage_threshold_s:.3f}s: " + ", ".join(stage_over)
+                )
+            self.get_logger().warn("[SLOW_POLICY_UPDATE] " + " | ".join(over_parts))
+
     def _policy_update_loop(self) -> None:
         t0 = time.perf_counter()
-        if not self.has_joint_state or not self.targets_initialized:
+        if not self.has_joint_state:
             return
 
         with self.vision_lock:
-            depth_t = None if self.latest_depth is None else self.latest_depth.clone()
+            depth_t = self.latest_depth
         t01 = time.perf_counter()    # vision lock and data copy
         if depth_t is None:
             return
@@ -785,10 +843,27 @@ class AuxPolicyNode(Node):
             return
 
         with self.joint_lock:
-            joint_pos_real = self.latest_joint_pos_real.clone()
-            joint_vel_real = self.latest_joint_vel_real.clone()
-            targets_real = self.targets_real.clone()
-            prev_actions_policy = self.prev_actions_policy.clone()
+            if not self.has_joint_state:
+                return
+            np.copyto(self._joint_pos_snapshot_np, self.latest_joint_pos_real_np)
+            np.copyto(self._joint_vel_snapshot_np, self.latest_joint_vel_real_np)
+
+        # CPU snapshots -> GPU tensors once per policy step.
+        self._joint_pos_snapshot[0, :].copy_(
+            torch.from_numpy(self._joint_pos_snapshot_np).to(self.device, non_blocking=True)
+        )
+        self._joint_vel_snapshot[0, :].copy_(
+            torch.from_numpy(self._joint_vel_snapshot_np).to(self.device, non_blocking=True)
+        )
+        if not self.targets_initialized:
+            self.targets_real.copy_(self._joint_pos_snapshot)
+            self.targets_initialized = True
+        self._targets_snapshot.copy_(self.targets_real)
+        self._prev_actions_snapshot.copy_(self.prev_actions_policy)
+        joint_pos_real = self._joint_pos_snapshot
+        joint_vel_real = self._joint_vel_snapshot
+        targets_real = self._targets_snapshot
+        prev_actions_policy = self._prev_actions_snapshot
         t02 = time.perf_counter()    # joint lock and data copy
 
         cur_student_obs = self._compose_student_obs(
@@ -797,15 +872,18 @@ class AuxPolicyNode(Node):
             targets_real=targets_real,
         )
         t1 = time.perf_counter()    # obs collect
-        stacked_obs = torch.cat((cur_student_obs, self.prev_student_obs), dim=-1)
-        self.prev_student_obs = cur_student_obs.detach()
+        self._stacked_obs_buf[:, : self.student_obs_unstacked_space].copy_(cur_student_obs)
+        self._stacked_obs_buf[:, self.student_obs_unstacked_space :].copy_(self.prev_student_obs)
+        self.prev_student_obs.copy_(cur_student_obs)
+        stacked_obs = self._stacked_obs_buf
 
-        obs_clamped = torch.clamp(stacked_obs, -100.0, 100.0)
+        obs_clamped = torch.clamp(stacked_obs, -100.0, 100.0, out=self._obs_clamped_buf)
 
         with torch.inference_mode():
             obs_normed = self.obs_normalizer(obs_clamped)
             actions_policy = self.policy.act_inference(obs_normed, vision_input=depth_t)
         t2 = time.perf_counter()    # policy inference
+        inference_s = t2 - t1
         next_targets_real, ema_actions_policy = compute_targets(
             dt=self.dt,
             actions=actions_policy,
@@ -828,15 +906,14 @@ class AuxPolicyNode(Node):
         msg.name = self.real_joint_names
         msg.position = next_targets_real[0].detach().cpu().tolist()
         self.target_pub.publish(msg)
-        
+
         t_end = time.perf_counter()
-        self.get_logger().info(
-            f"Policy update: \n"
-            f"  vision_lock={t01 - t0:.3f}s, \n"
-            f"  joint_lock={t02 - t01:.3f}s, \n"
-            f"  compose_obs={t1 - t02:.3f}s, \n"
-            f"  inference={t2 - t1:.3f}s, \n"
-            f"  total={t_end - t0:.3f}s\n"
+        self._log_policy_timing(
+            vision_lock_s=t01 - t0,
+            joint_lock_s=t02 - t01,
+            compose_obs_s=t1 - t02,
+            inference_s=inference_s,
+            total_s=t_end - t0,
         )
 
     def destroy_node(self) -> bool:
