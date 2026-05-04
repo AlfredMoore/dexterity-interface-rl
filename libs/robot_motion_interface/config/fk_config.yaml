@@ -1,0 +1,38 @@
+# Forward-kinematics node config.
+#
+# fk_node loads this file to know which frames to evaluate and in what order to
+# pack them into the published PoseArray. aux_policy loads the same file and
+# uses `link_names` to reconstruct a {link_name: pose} dict from the PoseArray,
+# then slices into its FK buffers using its own group definitions
+# (hand_env_cfg.env.robot.linkNames.{finger_tips, hand_palm}).
+#
+# Both ends MUST agree on `link_names`; that single ordered list IS the
+# PoseArray pose order.
+
+fk_rate: 30
+
+# URDF path. If relative, resolved against the libs root (parent of
+# `robot_motion_interface`). Absolute paths are used as-is.
+urdf_path: "robot_description/rl/bimanual_panda_tesollo.urdf"
+
+# header.frame_id stamped on the published PoseArray.
+world_frame_id: "world"
+
+# Topic the PoseArray is published on.
+fk_topic: "/fk/poses"
+
+# Flat ordered list of pinocchio frame names to evaluate. The PoseArray on
+# `fk_topic` will contain exactly these poses, in this order. Must include every
+# frame any consumer (currently aux_policy) needs.
+link_names:
+  # left fingertips
+  - left_F1_TIP_TOP
+  - left_F2_TIP_TOP
+  - left_F3_TIP_TOP
+  # right fingertips
+  - right_F1_TIP_TOP
+  - right_F2_TIP_TOP
+  - right_F3_TIP_TOP
+  # left / right hand palm
+  - left_delto_offset_link
+  - right_delto_offset_link

@@ -8,11 +8,11 @@ from typing import Any
 
 import cv2
 import numpy as np
-import pinocchio as pin
 import pyrealsense2 as rs
 import rclpy
 import torch
 import yaml
+from geometry_msgs.msg import PoseArray
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -30,8 +30,6 @@ spec = importlib.util.find_spec("robot_motion_interface")
 if spec is None or spec.origin is None:
     raise RuntimeError("Cannot locate robot_motion_interface")
 RMI_ROOT = Path(spec.origin).parent.parent.parent
-LIBS_ROOT = RMI_ROOT.parent
-DUAL_CHAIN_URDF_PATH = str((LIBS_ROOT / "robot_description/rl/bimanual_panda_tesollo.urdf").resolve())
 
 
 # ---------------------------------------------------------------------------
@@ -72,14 +70,13 @@ class AuxPolicyNode(Node):
         # -- 3. components --
         self._import_rsl_rl()
         self._build_joint_mappings()
-        self._build_pinocchio()
+        self._read_hand_link_counts()
         self._build_policy_and_normalizer()
         self._init_state_buffers()
         self._setup_realsense_and_da3()
 
         # -- 4. subs & pubs --
         self._init_pub_sub()
-        self._setup_fk()
 
         # -- 5. timer + summary --
         self._init_policy_timer()
@@ -109,6 +106,7 @@ class AuxPolicyNode(Node):
         self.declare_parameter("agent_cfg_path", str((RMI_ROOT / "runtime" / "agent.yaml").resolve()))
         self.declare_parameter("driver_cfg_path", str((RMI_ROOT / "config" / "rl_bimanual_driver_config.yaml").resolve()))
         self.declare_parameter("policy_node_cfg_path", str((RMI_ROOT / "config" / "rl_policy_node_config.yaml").resolve()))
+        self.declare_parameter("fk_cfg_path", str((RMI_ROOT / "config" / "fk_config.yaml").resolve()))
         self.declare_parameter("rsl_rl_root", str((RMI_ROOT / "dep" / "rsl_rl-HAND").resolve()))
 
         self.checkpoint_path = Path(self.get_parameter("checkpoint_path").value)
@@ -118,6 +116,7 @@ class AuxPolicyNode(Node):
         self.agent_cfg_path = Path(self.get_parameter("agent_cfg_path").value)
         self.driver_cfg_path = Path(self.get_parameter("driver_cfg_path").value)
         self.policy_node_cfg_path = Path(self.get_parameter("policy_node_cfg_path").value)
+        self.fk_cfg_path = Path(self.get_parameter("fk_cfg_path").value)
         self.rsl_rl_root = Path(self.get_parameter("rsl_rl_root").value)
 
     def _load_configs(self) -> None:
@@ -128,6 +127,7 @@ class AuxPolicyNode(Node):
         self.agent_cfg = _load_yaml(self.agent_cfg_path)
         self.driver_cfg = _load_yaml(self.driver_cfg_path)
         self.policy_node_cfg = _load_yaml(self.policy_node_cfg_path)
+        self.fk_cfg = _load_yaml(self.fk_cfg_path)
 
         self.get_logger().info("#### Aux policy node configs: ####")
         self.get_logger().info(f"runtime_cfg_path:     {self.runtime_cfg_path}")
@@ -136,6 +136,7 @@ class AuxPolicyNode(Node):
         self.get_logger().info(f"agent_cfg_path:       {self.agent_cfg_path}")
         self.get_logger().info(f"driver_cfg_path:      {self.driver_cfg_path}")
         self.get_logger().info(f"policy_node_cfg_path: {self.policy_node_cfg_path}")
+        self.get_logger().info(f"fk_cfg_path:          {self.fk_cfg_path}")
         self.get_logger().info(f"checkpoint_path:      {self.checkpoint_path}")
 
     def _init_device(self) -> None:
@@ -226,21 +227,27 @@ class AuxPolicyNode(Node):
         self.left_vel_limit = vel_limit_left.unsqueeze(0)
         self.right_vel_limit = vel_limit_right.unsqueeze(0)
 
-    def _build_pinocchio(self) -> None:
-        self.pin_model = pin.buildModelFromUrdf(DUAL_CHAIN_URDF_PATH)
-        self.pin_data = self.pin_model.createData()
-        if self.pin_model.nq != self.action_num:
-            raise ValueError(
-                f"Pinocchio nq mismatch: nq={self.pin_model.nq}, action_num={self.action_num}"
-            )
+    def _read_hand_link_counts(self) -> None:
+        """Resolve fk topic + per-group prefixed link names used to look up
+        positions inside fk_pose_dict during compose_obs.
 
+        FK itself runs in the external fk_node. fk_cfg.link_names is the source
+        of truth for both the published PoseArray order and the fk_pose_dict
+        keys.
+        """
         hand_link_dict = self.hand_env_cfg["env"]["robot"]["linkNames"]
-        finger_tip_links = hand_link_dict["finger_tips"]
-        hand_palm_links = hand_link_dict["hand_palm"]
-        self.left_fingertip_ids = [self.pin_model.getFrameId(f"left_{n}") for n in finger_tip_links]
-        self.right_fingertip_ids = [self.pin_model.getFrameId(f"right_{n}") for n in finger_tip_links]
-        self.left_hand_base_ids = [self.pin_model.getFrameId(f"left_{n}") for n in hand_palm_links]
-        self.right_hand_base_ids = [self.pin_model.getFrameId(f"right_{n}") for n in hand_palm_links]
+        finger_tip_links = list(hand_link_dict["finger_tips"])
+        hand_palm_links = list(hand_link_dict["hand_palm"])
+
+        # Prefixed names matching pinocchio frames in fk_node / fk_cfg.link_names.
+        self.left_fingertip_names = [f"left_{n}" for n in finger_tip_links]
+        self.right_fingertip_names = [f"right_{n}" for n in finger_tip_links]
+        self.left_hand_base_names = [f"left_{n}" for n in hand_palm_links]
+        self.right_hand_base_names = [f"right_{n}" for n in hand_palm_links]
+
+        self.fk_link_names = list(self.fk_cfg["link_names"])
+        self.fk_n_links = len(self.fk_link_names)
+        self.fk_topic = str(self.fk_cfg["fk_topic"])
 
     def _build_policy_and_normalizer(self) -> None:
         policy_cfg = self.agent_cfg["policy"]
@@ -360,19 +367,13 @@ class AuxPolicyNode(Node):
         self._stacked_obs_buf: torch.Tensor = torch.zeros((1, self.obs_dim), dtype=torch.float32, device=self.device)
         self._obs_clamped_buf: torch.Tensor = torch.zeros((1, self.obs_dim), dtype=torch.float32, device=self.device)
 
-        # FK results: CPU numpy. Pre-allocated; FK loop writes via np.copyto under fk_lock.
-        # Compose_obs takes its own snapshot copy (also via np.copyto) before doing H2D.
-        n_palm = len(self.left_hand_base_ids)
-        n_tips = len(self.left_fingertip_ids)
-        self.latest_left_hand_base_np = np.zeros((n_palm, 3), dtype=np.float32)
-        self.latest_right_hand_base_np = np.zeros((n_palm, 3), dtype=np.float32)
-        self.latest_left_fingertips_np = np.zeros((n_tips, 3), dtype=np.float32)
-        self.latest_right_fingertips_np = np.zeros((n_tips, 3), dtype=np.float32)
-        # Snapshots used by compose_obs to copy FK out of the shared buffers.
-        self._fk_l_hb_snapshot_np = np.zeros((n_palm, 3), dtype=np.float32)
-        self._fk_r_hb_snapshot_np = np.zeros((n_palm, 3), dtype=np.float32)
-        self._fk_l_ft_snapshot_np = np.zeros((n_tips, 3), dtype=np.float32)
-        self._fk_r_ft_snapshot_np = np.zeros((n_tips, 3), dtype=np.float32)
+        # FK results: a single dict keyed by "<linkname>_pos" (xyz, float32[3]) and
+        # "<linkname>_wxyz" (float32[4]). Pre-allocated in fk_cfg.link_names order;
+        # the fk_topic subscriber np.copyto's into these arrays under fk_lock.
+        self.fk_pose_dict: dict[str, np.ndarray] = {}
+        for name in self.fk_link_names:
+            self.fk_pose_dict[name + "_pos"] = np.zeros(3, dtype=np.float32)
+            self.fk_pose_dict[name + "_wxyz"] = np.zeros(4, dtype=np.float32)
         self.has_fk: bool = False
 
         # Vision (color frame on CPU; depth tensor on GPU).
@@ -385,8 +386,6 @@ class AuxPolicyNode(Node):
         self._capture_thread: threading.Thread | None = None
         self._da3_running: bool = False
         self._da3_thread: threading.Thread | None = None
-        self._fk_running: bool = False
-        self._fk_thread: threading.Thread | None = None
 
     def _setup_realsense_and_da3(self) -> None:
         """Start RealSense color stream + DA3 depth inference.
@@ -432,6 +431,16 @@ class AuxPolicyNode(Node):
         # -- DA3 depth inference --
         self.get_logger().info(f"DA3 compilation started.")
         self.da3 = DA3Inference.from_dict(da3_cfg)
+        if bool(da3_cfg["compile"]["enabled"]):
+            self.get_logger().info("DA3 compile warmup started (zero image).")
+            warmup_rgb = torch.zeros(
+                (1, self.rs_height, self.rs_width, 3),
+                dtype=torch.uint8,
+                device=self.device,
+            )
+            _ = self.da3.infer_no_chunk(warmup_rgb)
+            torch.cuda.synchronize(self.device)
+            self.get_logger().info("DA3 compile warmup finished.")
         self._da3_running = True
         self._da3_thread = threading.Thread(target=self._da3_loop, daemon=True, name="aux_da3")
         self._da3_thread.start()
@@ -498,7 +507,6 @@ class AuxPolicyNode(Node):
                     rclpy.shutdown()
                     return
 
-                infer_start = time.perf_counter()
                 color_rgb_t = torch.from_numpy(color_rgb).to(self.device, non_blocking=True).unsqueeze(0)
                 depth_t = self.da3.infer_no_chunk(color_rgb_t)
                 if depth_t.dim() == 2:
@@ -533,64 +541,10 @@ class AuxPolicyNode(Node):
                 )
 
     # ------------------------------------------------------------------
-    # Step 3.5: FK background loop
-    # ------------------------------------------------------------------
-    def _setup_fk(self) -> None:
-        """Spawn the FK background thread.
-
-        FK runs at policy_node_cfg.fk_rate (independent of policy / da3 / capture)
-        and produces fingertip + palm positions on GPU for the policy loop to read.
-        The thread itself waits for /joint_states to populate before producing FK.
-        """
-        self.fk_hz = float(self.policy_node_cfg["fk_rate"])
-        self._fk_running = True
-        self._fk_thread = threading.Thread(target=self._fk_loop, daemon=True, name="aux_fk")
-        self._fk_thread.start()
-        self.get_logger().info(f"FK loop started @ {self.fk_hz}Hz")
-
-    def _fk_loop(self) -> None:
-        """Read latest joint_pos, run pinocchio FK, push results to GPU under fk_lock."""
-        period = 1.0 / max(self.fk_hz, 1e-3)
-        q_local = np.zeros((self.action_num,), dtype=np.float32)
-        while self._fk_running:
-            loop_start = time.perf_counter()
-
-            # Snapshot latest joint_pos out of joint_lock fast.
-            ready = False
-            with self.joint_lock:
-                if self.has_joint_state:
-                    np.copyto(q_local, self.latest_joint_pos_real_np)
-                    ready = True
-            if not ready:
-                time.sleep(period)
-                continue
-
-            # CPU-only FK; H2D is deferred to the policy step (avoids wasted
-            # transfers when fk_hz > policy_hz).
-            l_hb_np, l_ft_np, r_hb_np, r_ft_np = self._pinocchio_fk(q_local)
-
-            # Copy into pre-allocated shared buffers under fk_lock (zero alloc).
-            with self.fk_lock:
-                np.copyto(self.latest_left_hand_base_np, l_hb_np)
-                np.copyto(self.latest_right_hand_base_np, r_hb_np)
-                np.copyto(self.latest_left_fingertips_np, l_ft_np)
-                np.copyto(self.latest_right_fingertips_np, r_ft_np)
-                self.has_fk = True
-
-            elapsed = time.perf_counter() - loop_start
-            sleep_s = period - elapsed
-            if sleep_s > 0.0:
-                time.sleep(sleep_s)
-            else:
-                self.get_logger().warn(
-                    f"[SLOW_FK] total={elapsed:.4f}s, target_period={period:.4f}s"
-                )
-
-    # ------------------------------------------------------------------
     # Step 4: subs & pubs
     # ------------------------------------------------------------------
     def _init_pub_sub(self) -> None:
-        """Wire ROS I/O: subscribe to /joint_states, publish /target_joint_states."""
+        """Wire ROS I/O: subscribe to /joint_states + fk_topic, publish /target_joint_states."""
         self.target_pub = self.create_publisher(
             JointState, "/target_joint_states", HIGH_RELIA_QOS
         )
@@ -601,6 +555,43 @@ class AuxPolicyNode(Node):
             HIGH_PERF_QOS,
             callback_group=self.obs_mutex_grp,
         )
+        # Single FK PoseArray from fk_node. Pose order matches fk_cfg.link_names.
+        self.create_subscription(
+            PoseArray,
+            self.fk_topic,
+            self._sub_fk_cb,
+            HIGH_PERF_QOS,
+            callback_group=self.obs_mutex_grp,
+        )
+
+    def _sub_fk_cb(self, msg: PoseArray) -> None:
+        """Write the inbound PoseArray into fk_pose_dict in fk_cfg.link_names order.
+
+        Per link, two entries are stored:
+          - "<linkname>_pos":  float32[3]  (x, y, z)
+          - "<linkname>_wxyz": float32[4]  (w, x, y, z)
+        fk_lock protects writers vs the compose_obs reader.
+        """
+        if len(msg.poses) != self.fk_n_links:
+            self.get_logger().error(
+                f"{self.fk_topic} pose count mismatch: {len(msg.poses)} vs "
+                f"expected {self.fk_n_links} (fk_cfg.link_names)"
+            )
+            rclpy.shutdown()
+            return
+
+        with self.fk_lock:
+            for name, p in zip(self.fk_link_names, msg.poses):
+                pos = self.fk_pose_dict[name + "_pos"]
+                pos[0] = p.position.x
+                pos[1] = p.position.y
+                pos[2] = p.position.z
+                wxyz = self.fk_pose_dict[name + "_wxyz"]
+                wxyz[0] = p.orientation.w
+                wxyz[1] = p.orientation.x
+                wxyz[2] = p.orientation.y
+                wxyz[3] = p.orientation.z
+            self.has_fk = True
 
     def _sub_joint_state_cb(self, msg: JointState) -> None:
         """Snapshot the latest joint state into pre-allocated CPU buffers."""
@@ -648,26 +639,6 @@ class AuxPolicyNode(Node):
             f"Policy timer started @ {self.policy_hz:.3f}Hz (period={timer_dt:.6f}s)."
         )
 
-    def _pinocchio_fk(self, q_real_np: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Forward kinematics on the bimanual chain.
-
-        Args:
-            q_real_np: (A,) joint positions in real driver order.
-
-        Returns:
-            (left_hand_base, left_fingertips, right_hand_base, right_fingertips), each
-            (n_links, 3) float32 in world frame.
-        """
-        q = q_real_np.astype(np.float64, copy=False)
-        pin.forwardKinematics(self.pin_model, self.pin_data, q)
-        pin.updateFramePlacements(self.pin_model, self.pin_data)
-        oMf = self.pin_data.oMf
-        left_hand_base = np.array([oMf[i].translation for i in self.left_hand_base_ids], dtype=np.float32)
-        right_hand_base = np.array([oMf[i].translation for i in self.right_hand_base_ids], dtype=np.float32)
-        left_fingertips = np.array([oMf[i].translation for i in self.left_fingertip_ids], dtype=np.float32)
-        right_fingertips = np.array([oMf[i].translation for i in self.right_fingertip_ids], dtype=np.float32)
-        return left_hand_base, left_fingertips, right_hand_base, right_fingertips
-
     def _compose_student_obs(
         self,
         joint_pos_policy: torch.Tensor,  # [1, A] policy order
@@ -691,17 +662,19 @@ class AuxPolicyNode(Node):
         left_jv_s = left_jv / self.left_vel_limit
         right_jv_s = right_jv / self.right_vel_limit
 
-        # Snapshot FK out of shared buffers (np.copyto under fk_lock), then H2D
-        # outside the lock. This is the only FK transfer per policy step.
+        # Snapshot FK positions out of fk_pose_dict (concatenate into a flat
+        # ndarray under fk_lock), then H2D outside the lock. The lookups go
+        # through "<linkname>_pos" keys; orientation entries are written by the
+        # callback but unused here (positions only feed the policy).
         with self.fk_lock:
-            np.copyto(self._fk_l_hb_snapshot_np, self.latest_left_hand_base_np)
-            np.copyto(self._fk_r_hb_snapshot_np, self.latest_right_hand_base_np)
-            np.copyto(self._fk_l_ft_snapshot_np, self.latest_left_fingertips_np)
-            np.copyto(self._fk_r_ft_snapshot_np, self.latest_right_fingertips_np)
-        l_hb = torch.from_numpy(self._fk_l_hb_snapshot_np.reshape(1, -1)).to(self.device, non_blocking=True)
-        r_hb = torch.from_numpy(self._fk_r_hb_snapshot_np.reshape(1, -1)).to(self.device, non_blocking=True)
-        l_ft = torch.from_numpy(self._fk_l_ft_snapshot_np.reshape(1, -1)).to(self.device, non_blocking=True)
-        r_ft = torch.from_numpy(self._fk_r_ft_snapshot_np.reshape(1, -1)).to(self.device, non_blocking=True)
+            l_ft_np = np.concatenate([self.fk_pose_dict[n + "_pos"] for n in self.left_fingertip_names])
+            r_ft_np = np.concatenate([self.fk_pose_dict[n + "_pos"] for n in self.right_fingertip_names])
+            l_hb_np = np.concatenate([self.fk_pose_dict[n + "_pos"] for n in self.left_hand_base_names])
+            r_hb_np = np.concatenate([self.fk_pose_dict[n + "_pos"] for n in self.right_hand_base_names])
+        l_ft = torch.from_numpy(l_ft_np).unsqueeze(0).to(self.device, non_blocking=True)
+        r_ft = torch.from_numpy(r_ft_np).unsqueeze(0).to(self.device, non_blocking=True)
+        l_hb = torch.from_numpy(l_hb_np).unsqueeze(0).to(self.device, non_blocking=True)
+        r_hb = torch.from_numpy(r_hb_np).unsqueeze(0).to(self.device, non_blocking=True)
 
         full_obs = {
             "leftJointPosScaled": left_jp_s,
@@ -796,11 +769,9 @@ class AuxPolicyNode(Node):
             np.copyto(self._joint_vel_snapshot_np, self.latest_joint_vel_real_np)
         t02 = time.perf_counter()
 
-        # 3) Wait until FK loop has produced at least one sample.
-        # with self.fk_lock:
-        #     fk_ready = self.has_fk
-        # if not fk_ready:
-        #     return
+        # 3) Wait until fk_node has produced at least one sample for all four groups.
+        if not self.has_fk:
+            return
 
         # 4) CPU snapshots -> GPU tensors, then real->policy reorder.
         joint_pos_real_t = torch.from_numpy(self._joint_pos_snapshot_np).to(self.device, non_blocking=True)
@@ -875,12 +846,12 @@ class AuxPolicyNode(Node):
                 "agent_cfg_path": str(self.agent_cfg_path),
                 "driver_cfg_path": str(self.driver_cfg_path),
                 "policy_node_cfg_path": str(self.policy_node_cfg_path),
+                "fk_cfg_path": str(self.fk_cfg_path),
                 "rsl_rl_root": str(self.rsl_rl_root),
             },
             "rates_hz": {
                 "capture_hz": float(self.capture_hz),
                 "da3_hz": float(self.da3_hz),
-                "fk_hz": float(self.fk_hz),
                 "policy_hz": float(self.policy_hz),
             },
             "runtime": {
@@ -918,7 +889,6 @@ class AuxPolicyNode(Node):
         """Stop background workers and sensors before destroying the ROS node."""
         self._capture_running = False
         self._da3_running = False
-        self._fk_running = False
 
         if hasattr(self, "policy_timer") and self.policy_timer is not None:
             self.policy_timer.cancel()
@@ -927,8 +897,6 @@ class AuxPolicyNode(Node):
             self._capture_thread.join(timeout=1.0)
         if self._da3_thread is not None and self._da3_thread.is_alive():
             self._da3_thread.join(timeout=1.0)
-        if self._fk_thread is not None and self._fk_thread.is_alive():
-            self._fk_thread.join(timeout=1.0)
 
         if hasattr(self, "rs_pipeline") and self.rs_pipeline is not None:
             try:

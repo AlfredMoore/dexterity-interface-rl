@@ -1,5 +1,5 @@
 # TODO: Align with RL HandEnv.yaml
-fk_rate: 60
+fk_rate: 30
 infer_rate: 30
 
 policy_run_dir: "<rsl-rl run folder path>"
@@ -91,8 +91,8 @@ da3_cfg:
 
   # aux_policy_v2: process_res <- env_cfg["da3_process_res"]
   # aux_policy:    process_res <- env_cfg.get("da3_process_res", 308)
-  # current runtime/env.yaml is 308
-  process_res: 308
+  # should aligned with runtime/env.yaml
+  process_res: 224
   process_res_method: "upper_bound_resize"
 
   chunk_size: 1
