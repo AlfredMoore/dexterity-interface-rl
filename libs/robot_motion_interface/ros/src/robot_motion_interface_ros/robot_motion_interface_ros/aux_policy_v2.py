@@ -18,7 +18,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 
-from robot_motion_interface.utils.da3_trt_utils import DA3Inference
+from robot_motion_interface.utils.da3_compile_utils import DA3Inference
 from robot_motion_interface.utils.qos import HIGH_PERF_QOS, HIGH_RELIA_QOS
 from robot_motion_interface.utils.sim2real import joint_mapping
 
@@ -264,7 +264,6 @@ class AuxPolicyNode(Node):
         self.student_obs_unstacked_space = int(self.env_cfg["student_obs_unstacked_space"])
         self.obs_dim = int(self.env_cfg["observation_space"])
         self.state_dim = int(self.env_cfg["state_space"])
-        self.da3_process_res = int(self.env_cfg["da3_process_res"])
 
         # cfg-internal sanity: stacked obs dim must equal observation_space,
         # and obs_DOF summed over student keys must equal the unstacked dim.
@@ -396,6 +395,14 @@ class AuxPolicyNode(Node):
         """
         realsense_cfg = self.policy_node_cfg["realsense"]
         da3_cfg = self.policy_node_cfg["da3_cfg"]
+        env_process_res = int(self.env_cfg["da3_process_res"])
+        da3_process_res = int(da3_cfg["process_res"])
+        if env_process_res != da3_process_res:
+            raise ValueError(
+                "process_res mismatch between env_cfg and da3_cfg: "
+                f"env_cfg.da3_process_res={env_process_res}, "
+                f"da3_cfg.process_res={da3_process_res}"
+            )
         color_intrinsics = realsense_cfg["color_intrinsics"]
         sensor_settings = realsense_cfg.get("sensor_settings", {})
 
@@ -429,7 +436,7 @@ class AuxPolicyNode(Node):
         self._da3_thread = threading.Thread(target=self._da3_loop, daemon=True, name="aux_da3")
         self._da3_thread.start()
         self.get_logger().info(
-            f"DA3 ready: model={self.da3.model_name}, process_res={self.da3_process_res}, rate={self.da3_hz}Hz"
+            f"DA3 ready: model={self.da3.model_name}, process_res={self.da3.process_res}, rate={self.da3_hz}Hz"
         )
 
     def _apply_sensor_settings(self, rs_profile, sensor_settings: dict[str, Any]) -> None:
@@ -903,7 +910,7 @@ class AuxPolicyNode(Node):
                 "height": int(self.rs_height),
             },
             "da3": {
-                "process_res": int(self.da3_process_res),
+                "process_res": int(self.da3.process_res),
             },
         }
 

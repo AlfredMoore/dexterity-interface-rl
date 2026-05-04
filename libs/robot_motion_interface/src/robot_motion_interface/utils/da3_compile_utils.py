@@ -4,7 +4,7 @@ General DA3 inference utility shared across HAND and dex rl workflows.
 Design constraints:
 - No config-source fallback: YAML must contain top-level `da3_cfg`.
 - No import fallback: depth_anything_3 must be importable via installed package path.
-- No engine fallback: TensorRT path either loads/compiles successfully or raises.
+- No runtime fallback: compile path is explicit and controlled by config.
 - Two explicit inference entrypoints:
   - infer_chunked(...): HAND-style chunked dispatch
   - infer_no_chunk(...): dex-rl style batch_size=1 dispatch
@@ -15,7 +15,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-import hashlib
 import json
 
 import cv2
@@ -24,9 +23,6 @@ import torch
 import yaml
 from PIL import Image
 
-
-_DA3_UTILS_FILE = Path(__file__).resolve()
-_DA3_REPO_ROOT = _DA3_UTILS_FILE.parent
 from depth_anything_3.api import DepthAnything3
 
 
@@ -46,101 +42,36 @@ def _require_keys(raw: dict[str, Any], required: tuple[str, ...], scope: str) ->
 
 
 @dataclass(frozen=True)
-class TRTCompileConfig:
+class CompileConfig:
     enabled: bool = False
-    precision: str = "fp16"  # fp16 | fp32
-    min_block_size: int = 1
-    workspace_size: int = 0
-    max_aux_streams: int | None = None
-    optimization_level: int | None = None
-    require_full_compilation: bool = True
-    pass_through_build_failures: bool = True
-
-    use_dynamic_batch: bool = False
-    batch_size: int = 1
-    min_batch_size: int = 1
-    opt_batch_size: int = 1
-    max_batch_size: int = 1
-
-    input_height: int = 240
-    input_width: int = 320
-    engine_dir: str = "models/da3/trt_engines"
+    backend: str = "inductor"
+    fullgraph: bool = False
+    dynamic: bool = False
 
     @staticmethod
-    def from_dict(raw: dict[str, Any]) -> "TRTCompileConfig":
+    def from_dict(raw: dict[str, Any]) -> "CompileConfig":
         _require_keys(
             raw,
             (
                 "enabled",
-                "precision",
-                "min_block_size",
-                "workspace_size",
-                "max_aux_streams",
-                "optimization_level",
-                "require_full_compilation",
-                "pass_through_build_failures",
-                "use_dynamic_batch",
-                "batch_size",
-                "min_batch_size",
-                "opt_batch_size",
-                "max_batch_size",
-                "input_height",
-                "input_width",
-                "engine_dir",
+                "backend",
+                "fullgraph",
+                "dynamic",
             ),
-            "da3_cfg.trt",
+            "da3_cfg.compile",
         )
-        cfg = TRTCompileConfig(
+        cfg = CompileConfig(
             enabled=bool(raw["enabled"]),
-            precision=str(raw["precision"]).lower(),
-            min_block_size=int(raw["min_block_size"]),
-            workspace_size=int(raw["workspace_size"]),
-            max_aux_streams=(None if raw["max_aux_streams"] is None else int(raw["max_aux_streams"])),
-            optimization_level=(
-                None if raw["optimization_level"] is None else int(raw["optimization_level"])
-            ),
-            require_full_compilation=bool(raw["require_full_compilation"]),
-            pass_through_build_failures=bool(raw["pass_through_build_failures"]),
-            use_dynamic_batch=bool(raw["use_dynamic_batch"]),
-            batch_size=int(raw["batch_size"]),
-            min_batch_size=int(raw["min_batch_size"]),
-            opt_batch_size=int(raw["opt_batch_size"]),
-            max_batch_size=int(raw["max_batch_size"]),
-            input_height=int(raw["input_height"]),
-            input_width=int(raw["input_width"]),
-            engine_dir=str(raw["engine_dir"]),
+            backend=str(raw["backend"]),
+            fullgraph=bool(raw["fullgraph"]),
+            dynamic=bool(raw["dynamic"]),
         )
         cfg.validate()
         return cfg
 
     def validate(self) -> None:
-        if self.precision not in {"fp16", "fp32"}:
-            raise ValueError(f"Unsupported trt.precision: {self.precision}")
-        if self.min_block_size <= 0:
-            raise ValueError(f"trt.min_block_size must be positive, got {self.min_block_size}")
-        if self.workspace_size < 0:
-            raise ValueError(f"trt.workspace_size must be >= 0, got {self.workspace_size}")
-        if self.input_height <= 0 or self.input_width <= 0:
-            raise ValueError(
-                "trt.input_height and trt.input_width must be positive, "
-                f"got ({self.input_height}, {self.input_width})"
-            )
-        engine_dir_path = Path(self.engine_dir).expanduser()
-        if not engine_dir_path.is_absolute():
-            raise ValueError(
-                "da3_cfg.trt.engine_dir must be an absolute path. "
-                f"Got: {self.engine_dir}"
-            )
-
-        if self.use_dynamic_batch:
-            if not (1 <= self.min_batch_size <= self.opt_batch_size <= self.max_batch_size):
-                raise ValueError(
-                    "Dynamic batch profile must satisfy "
-                    "1 <= min_batch_size <= opt_batch_size <= max_batch_size"
-                )
-        else:
-            if self.batch_size <= 0:
-                raise ValueError(f"trt.batch_size must be positive, got {self.batch_size}")
+        if not self.backend.strip():
+            raise ValueError("da3_cfg.compile.backend cannot be empty")
 
 
 @dataclass(frozen=True)
@@ -158,7 +89,7 @@ class DA3Config:
     cy: float | None = None
 
     cache_dir: str = "models/da3"
-    trt: TRTCompileConfig = field(default_factory=TRTCompileConfig)
+    compile: CompileConfig = field(default_factory=CompileConfig)
 
     @staticmethod
     def from_dict(raw: dict[str, Any]) -> "DA3Config":
@@ -179,7 +110,7 @@ class DA3Config:
                 "cx",
                 "cy",
                 "cache_dir",
-                "trt",
+                "compile",
             ),
             "da3_cfg",
         )
@@ -197,11 +128,11 @@ class DA3Config:
                 f"Expected one of {sorted(_VALID_PROCESS_RES_METHODS)}"
             )
 
-        trt_raw = raw["trt"]
-        if trt_raw is None:
-            raise ValueError("da3_cfg.trt cannot be null")
-        if not isinstance(trt_raw, dict):
-            raise TypeError(f"da3_cfg.trt must be dict, got {type(trt_raw)}")
+        compile_raw = raw["compile"]
+        if compile_raw is None:
+            raise ValueError("da3_cfg.compile cannot be null")
+        if not isinstance(compile_raw, dict):
+            raise TypeError(f"da3_cfg.compile must be dict, got {type(compile_raw)}")
 
         cfg = DA3Config(
             model=model,
@@ -215,7 +146,7 @@ class DA3Config:
             cx=(None if raw["cx"] is None else float(raw["cx"])),
             cy=(None if raw["cy"] is None else float(raw["cy"])),
             cache_dir=str(raw["cache_dir"]),
-            trt=TRTCompileConfig.from_dict(trt_raw),
+            compile=CompileConfig.from_dict(compile_raw),
         )
         cfg.validate()
         return cfg
@@ -250,56 +181,40 @@ def load_da3_cfg_from_yaml(yaml_path: str | Path) -> DA3Config:
     return DA3Config.from_dict(payload["da3_cfg"])
 
 
-class _DA3TRTWrapper(torch.nn.Module):
-    """Wrap DepthAnything3.inference_torch(image=...) into a single-input module."""
+class _DA3CompileWrapper(torch.nn.Module):
+    """Wrap DA3 forward path only (preprocessing stays outside torch.compile)."""
 
     def __init__(
         self,
         da3_model: DepthAnything3,
-        process_res: int,
-        process_res_method: str,
-        intrinsics_torch: torch.Tensor | None,
         is_metric_model: bool,
         focal: float | None,
     ):
         super().__init__()
         self.da3_model = da3_model
-        self.process_res = int(process_res)
-        self.process_res_method = process_res_method
         self.is_metric_model = bool(is_metric_model)
         self.focal = None if focal is None else float(focal)
 
-        if intrinsics_torch is None:
-            intrinsics_torch = torch.empty((0, 3, 3), dtype=torch.float32)
-        else:
-            intrinsics_torch = intrinsics_torch.detach().to(dtype=torch.float32)
-        self.register_buffer("intrinsics_torch", intrinsics_torch, persistent=False)
-
-    def _expand_intrinsics(self, batch_size: int, device: torch.device) -> torch.Tensor | None:
-        if self.intrinsics_torch.numel() == 0:
-            return None
-        intrinsics = self.intrinsics_torch
-        if intrinsics.device != device:
-            intrinsics = intrinsics.to(device=device, dtype=torch.float32)
-
-        if intrinsics.shape[0] == 1:
-            return intrinsics.expand(batch_size, -1, -1)
-        if intrinsics.shape[0] == batch_size:
-            return intrinsics
-        raise ValueError(
-            "intrinsics batch dimension mismatch: "
-            f"intrinsics.shape[0]={intrinsics.shape[0]}, batch_size={batch_size}"
-        )
-
-    def forward(self, image: torch.Tensor) -> torch.Tensor:
-        intrinsics = self._expand_intrinsics(image.shape[0], image.device)
-        outputs = self.da3_model.inference_torch(
-            image=image,
-            intrinsics=intrinsics,
-            process_res=self.process_res,
-            process_res_method=self.process_res_method,
+    def forward(self, preprocessed_nchw: torch.Tensor) -> torch.Tensor:
+        imgs = preprocessed_nchw[:, None]  # (N, 1, 3, H, W)
+        outputs = self.da3_model.forward(
+            imgs,
+            None,
+            None,
+            [],
+            False,
+            False,
+            "saddle_balanced",
         )
         depth = outputs["depth"]
+        if depth.dim() > 1 and depth.shape[1] == 1:
+            depth = depth.squeeze(1)
+        if depth.dim() > 0 and depth.shape[0] == 1:
+            depth = depth.squeeze(0)
+        if depth.dim() == 4 and depth.shape[-1] == 1:
+            depth = depth.squeeze(-1)
+        if depth.dim() == 4 and depth.shape[1] == 1:
+            depth = depth.squeeze(1)
         if self.is_metric_model and self.focal is not None:
             depth = self.focal * depth / 300.0
         return depth
@@ -343,11 +258,11 @@ class DA3Inference:
 
         self.model = DepthAnything3.from_pretrained(self.model_name, cache_dir=str(cache_dir))
         self.model = self.model.to(device=self.device).eval()
+        self.model.device = self.device
 
-        self._trt_runner: torch.nn.Module | None = None
-        self._trt_engine_path: Path | None = None
-        if self.cfg.trt.enabled:
-            self._trt_runner, self._trt_engine_path = self._build_or_load_trt_runner()
+        self._compiled_runner: torch.nn.Module | None = None
+        if self.cfg.compile.enabled:
+            self._compiled_runner = self._build_torch_compile_runner()
 
     @staticmethod
     def from_yaml(yaml_path: str | Path) -> "DA3Inference":
@@ -357,115 +272,18 @@ class DA3Inference:
     def from_dict(raw: dict[str, Any]) -> "DA3Inference":
         return DA3Inference(DA3Config.from_dict(raw))
 
-    def _sanitize_model_for_filename(self) -> str:
-        return self.model_name.replace("/", "--").replace(".", "_")
-
-    def _engine_basename(self) -> str:
-        trt = self.cfg.trt
-        batch_tag = (
-            f"dynb{trt.min_batch_size}-{trt.opt_batch_size}-{trt.max_batch_size}"
-            if trt.use_dynamic_batch
-            else f"b{trt.batch_size}"
-        )
-        stem = (
-            f"{self._sanitize_model_for_filename()}"
-            f"_res{self.process_res}_{self.process_res_method}"
-            f"_h{trt.input_height}_w{trt.input_width}_{batch_tag}_{trt.precision}"
-        )
-        digest = hashlib.sha1(stem.encode("utf-8")).hexdigest()[:12]
-        return f"{stem}_{digest}.ep"
-
-    def _get_engine_path(self) -> Path:
-        trt = self.cfg.trt
-        engine_dir = Path(trt.engine_dir).expanduser().resolve()
-        engine_dir.mkdir(parents=True, exist_ok=True)
-        return engine_dir / self._engine_basename()
-
-    def _trt_precision_set(self) -> set[torch.dtype]:
-        if self.cfg.trt.precision == "fp16":
-            return {torch.float16}
-        if self.cfg.trt.precision == "fp32":
-            return {torch.float32}
-        raise ValueError(f"Unsupported TRT precision: {self.cfg.trt.precision}")
-
-    def _trt_input_spec(self, torch_tensorrt: Any) -> list[Any]:
-        trt = self.cfg.trt
-        shape_hwc = (trt.input_height, trt.input_width, 3)
-
-        if trt.use_dynamic_batch:
-            return [
-                torch_tensorrt.Input(
-                    min_shape=(trt.min_batch_size, *shape_hwc),
-                    opt_shape=(trt.opt_batch_size, *shape_hwc),
-                    max_shape=(trt.max_batch_size, *shape_hwc),
-                    dtype=torch.float32,
-                    format=torch.contiguous_format,
-                )
-            ]
-
-        return [
-            torch_tensorrt.Input(
-                shape=(trt.batch_size, *shape_hwc),
-                dtype=torch.float32,
-                format=torch.contiguous_format,
-            )
-        ]
-
-    def _unwrap_loaded_trt_module(self, loaded: Any) -> torch.nn.Module:
-        if hasattr(loaded, "module") and callable(loaded.module):
-            mod = loaded.module()
-            if not isinstance(mod, torch.nn.Module):
-                raise TypeError(f"torch_tensorrt.load(...).module() returned {type(mod)}")
-            return mod
-        if isinstance(loaded, torch.nn.Module):
-            return loaded
-        raise TypeError(f"Unsupported object type from torch_tensorrt.load: {type(loaded)}")
-
-    def _build_or_load_trt_runner(self) -> tuple[torch.nn.Module, Path]:
-        try:
-            import torch_tensorrt
-        except ImportError as exc:
-            raise ImportError(
-                "TRT compile requested (da3_cfg.trt.enabled=true), but torch_tensorrt is not installed"
-            ) from exc
-
-        engine_path = self._get_engine_path()
-        input_specs = self._trt_input_spec(torch_tensorrt)
-
-        if engine_path.exists():
-            loaded = torch_tensorrt.load(str(engine_path))
-            runner = self._unwrap_loaded_trt_module(loaded).to(self.device).eval()
-            return runner, engine_path
-
-        wrapper = _DA3TRTWrapper(
+    def _build_torch_compile_runner(self) -> torch.nn.Module:
+        wrapper = _DA3CompileWrapper(
             da3_model=self.model,
-            process_res=self.process_res,
-            process_res_method=self.process_res_method,
-            intrinsics_torch=self._intrinsics_torch,
             is_metric_model=self._is_metric_model,
             focal=self.focal,
         ).to(self.device).eval()
-
-        compile_kwargs: dict[str, Any] = {
-            "ir": "dynamo",
-            "arg_inputs": input_specs,
-            "enabled_precisions": self._trt_precision_set(),
-            "min_block_size": self.cfg.trt.min_block_size,
-            "workspace_size": self.cfg.trt.workspace_size,
-            "require_full_compilation": self.cfg.trt.require_full_compilation,
-            "pass_through_build_failures": self.cfg.trt.pass_through_build_failures,
-            "use_python_runtime": False,
-        }
-        if self.cfg.trt.max_aux_streams is not None:
-            compile_kwargs["max_aux_streams"] = self.cfg.trt.max_aux_streams
-        if self.cfg.trt.optimization_level is not None:
-            compile_kwargs["optimization_level"] = self.cfg.trt.optimization_level
-
-        trt_gm = torch_tensorrt.compile(wrapper, **compile_kwargs)
-        torch_tensorrt.save(trt_gm, str(engine_path), arg_inputs=input_specs)
-        loaded = torch_tensorrt.load(str(engine_path))
-        runner = self._unwrap_loaded_trt_module(loaded).to(self.device).eval()
-        return runner, engine_path
+        return torch.compile(
+            wrapper,
+            backend=self.cfg.compile.backend,
+            fullgraph=self.cfg.compile.fullgraph,
+            dynamic=self.cfg.compile.dynamic,
+        )
 
     def _validate_rgb_tensor(self, rgb: torch.Tensor) -> None:
         if not isinstance(rgb, torch.Tensor):
@@ -533,6 +351,23 @@ class DA3Inference:
         return depth
 
     @torch.inference_mode()
+    def infer_rgb(self, rgb: np.ndarray, process_res_method: str | None = None) -> np.ndarray:
+        method = self.process_res_method if process_res_method is None else process_res_method
+        if method not in _VALID_PROCESS_RES_METHODS:
+            raise ValueError(f"Unsupported process_res_method: {method}")
+        
+        prediction = self.model.inference(
+            [rgb],
+            intrinsics=self._intrinsics_np,
+            process_res=self.process_res,
+            process_res_method=method,
+        )
+        depth = prediction.depth[0]
+        if self._is_metric_model and self.focal is not None:
+            depth = self.focal * depth / 300.0
+        return depth
+
+    @torch.inference_mode()
     def infer_torch_batched(
         self,
         rgb: torch.Tensor,
@@ -583,15 +418,31 @@ class DA3Inference:
 
     @torch.inference_mode()
     def _infer_one_batch(self, rgb_chunk: torch.Tensor, process_res_method: str) -> torch.Tensor:
-        if self._trt_runner is not None:
-            depth = self._trt_runner(rgb_chunk)
+        if self._compiled_runner is not None:
+            if process_res_method != self.process_res_method:
+                raise ValueError(
+                    "Compiled runner was built with "
+                    f"process_res_method={self.process_res_method}, "
+                    f"but got {process_res_method}."
+                )
+
+            imgs, _, _ = self.model._preprocess_inputs_torch(
+                image=rgb_chunk,
+                extrinsics=None,
+                intrinsics=None,
+                process_res=self.process_res,
+                process_res_method=process_res_method,
+                device=self.device,
+            )
+            depth = self._compiled_runner(imgs)
             if not isinstance(depth, torch.Tensor):
-                raise TypeError(f"TRT runner output must be torch.Tensor, got {type(depth)}")
+                raise TypeError(f"Compiled runner output must be torch.Tensor, got {type(depth)}")
             return depth
 
         intrinsics_t = self._expand_intrinsics_torch(rgb_chunk.shape[0], rgb_chunk.device)
         outputs = self.model.inference_torch(
             image=rgb_chunk,
+            device=self.device,
             intrinsics=intrinsics_t,
             process_res=self.process_res,
             process_res_method=process_res_method,
@@ -602,29 +453,21 @@ class DA3Inference:
         return depth
 
     def export_runtime_summary(self) -> dict[str, Any]:
-        trt = self.cfg.trt
+        compile_cfg = self.cfg.compile
         return {
             "model": self.model_name,
             "device": str(self.device),
             "process_res": self.process_res,
             "process_res_method": self.process_res_method,
             "chunk_size": self.chunk_size,
-            "trt_enabled": trt.enabled,
-            "trt_engine_path": None if self._trt_engine_path is None else str(self._trt_engine_path),
-            "trt_precision": trt.precision,
-            "trt_dynamic_batch": trt.use_dynamic_batch,
-            "trt_profile": {
-                "batch_size": trt.batch_size,
-                "min_batch_size": trt.min_batch_size,
-                "opt_batch_size": trt.opt_batch_size,
-                "max_batch_size": trt.max_batch_size,
-                "input_height": trt.input_height,
-                "input_width": trt.input_width,
-            },
+            "compile_enabled": compile_cfg.enabled,
+            "compile_backend": compile_cfg.backend,
+            "compile_fullgraph": compile_cfg.fullgraph,
+            "compile_dynamic": compile_cfg.dynamic,
             "strict_mode": {
                 "no_cfg_fallback": True,
                 "no_import_fallback": True,
-                "no_engine_fallback": True,
+                "no_runtime_fallback": True,
             },
         }
 
