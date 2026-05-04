@@ -92,8 +92,13 @@ class AuxPolicyNode(Node):
     # Step 1: params & cfgs
     # ------------------------------------------------------------------
     def _init_callback_mutex_groups(self) -> None:
-        self.obs_mutex_grp = MutuallyExclusiveCallbackGroup()
-        self.infer_mutex_grp = MutuallyExclusiveCallbackGroup()
+        # Three independent mutex groups so /joint_states, fk_topic, and the
+        # policy timer don't serialize each other at the executor level. Each
+        # callback's own lock (joint_lock / fk_lock) still protects shared
+        # state vs the timer reader.
+        self.js_grp = MutuallyExclusiveCallbackGroup()
+        self.fk_grp = MutuallyExclusiveCallbackGroup()
+        self.infer_grp = MutuallyExclusiveCallbackGroup()
 
     def _declare_parameters(self) -> None:
         """Declare ROS parameters: paths + da3 model override only.
@@ -141,6 +146,7 @@ class AuxPolicyNode(Node):
         self.get_logger().info(f"agent_cfg_path:       {self.agent_cfg_path}")
         self.get_logger().info(f"driver_cfg_path:      {self.driver_cfg_path}")
         self.get_logger().info(f"policy_node_cfg_path: {self.policy_node_cfg_path}")
+        self.get_logger().info(f"da3_cfg_path:         {self.da3_cfg_path}")
         self.get_logger().info(f"fk_cfg_path:          {self.fk_cfg_path}")
         self.get_logger().info(f"checkpoint_path:      {self.checkpoint_path}")
 
@@ -373,7 +379,6 @@ class AuxPolicyNode(Node):
 
         # FK results: a single dict keyed by "<linkname>_pos" (xyz, float32[3]) and
         # "<linkname>_wxyz" (float32[4]). Pre-allocated in fk_cfg.link_names order;
-        # the fk_topic subscriber np.copyto's into these arrays under fk_lock.
         self.fk_pose_dict: dict[str, np.ndarray] = {}
         for name in self.fk_link_names:
             self.fk_pose_dict[name + "_pos"] = np.zeros(3, dtype=np.float32)
@@ -384,6 +389,7 @@ class AuxPolicyNode(Node):
         # Filled by _fetch_depth_handle(); read directly by the policy loop with
         # no lock — tearing is rare and the cost of a torn read is negligible.
         self.latest_depth: torch.Tensor | None = None
+        # self._depth_snapshot_t: torch.Tensor | None = None
 
     def _fetch_depth_handle(self) -> None:
         """One-shot: call cam_node's service, decode the CUDA IPC handle, and
@@ -395,8 +401,7 @@ class AuxPolicyNode(Node):
         memory via copy_, so latest_depth always reflects the most recent
         completed inference. Torn reads are possible but rare and tolerated.
         """
-        ipc_cfg = self.da3_full_cfg["ipc"] if hasattr(self, "da3_full_cfg") else {}
-        service_name = str(ipc_cfg["handle_service_name"])
+        service_name = str(self.da3_full_cfg["ipc"]["handle_service_name"])
 
         client = self.create_client(Trigger, service_name)
         self.get_logger().info(f"Waiting for cam_node service: {service_name}")
@@ -423,6 +428,11 @@ class AuxPolicyNode(Node):
             raise RuntimeError(f"IPC depth tensor is not on CUDA: {depth_view.device}")
 
         self.latest_depth = depth_view
+        # Local pre-allocated snapshot. Each policy step copy_'s the IPC tensor
+        # into this buffer once, then consumes the snapshot for the rest of the
+        # step. This bounds any tearing window to a single D2D copy (~10us)
+        # instead of spanning the full inference (~ms).
+        self._depth_snapshot_t = torch.empty_like(depth_view)
         self.get_logger().info(
             f"Depth IPC handle received: shape={tuple(depth_view.shape)} "
             f"dtype={depth_view.dtype} device={depth_view.device}"
@@ -441,7 +451,7 @@ class AuxPolicyNode(Node):
             "/joint_states",
             self._sub_joint_state_cb,
             HIGH_PERF_QOS,
-            callback_group=self.obs_mutex_grp,
+            callback_group=self.js_grp,
         )
         # Single FK PoseArray from fk_node. Pose order matches fk_cfg.link_names.
         self.create_subscription(
@@ -449,7 +459,7 @@ class AuxPolicyNode(Node):
             self.fk_topic,
             self._sub_fk_cb,
             HIGH_PERF_QOS,
-            callback_group=self.obs_mutex_grp,
+            callback_group=self.fk_grp,
         )
 
     def _sub_fk_cb(self, msg: PoseArray) -> None:
@@ -521,7 +531,7 @@ class AuxPolicyNode(Node):
         self.policy_timer = self.create_timer(
             timer_dt,
             self._policy_update_loop,
-            callback_group=self.infer_mutex_grp,
+            callback_group=self.infer_grp,
         )
         self.get_logger().info(
             f"Policy timer started @ {self.policy_hz:.3f}Hz (period={timer_dt:.6f}s)."
@@ -633,14 +643,17 @@ class AuxPolicyNode(Node):
         if not self.has_joint_state:
             return
 
-        # 1) Read the IPC-shared depth tensor directly. cam_node writes via
-        # copy_ into this same GPU memory, so latest_depth always points to
-        # the freshest completed inference. No lock, no clone — torn reads
-        # are tolerated.
-        depth_t = self.latest_depth
-        if depth_t is None:
+        # 1) Snapshot the IPC-shared depth tensor into a pre-allocated local
+        # buffer. cam_node writes the IPC tensor in-place via copy_; taking a
+        # local D2D copy here pins the depth for the rest of this step, so a
+        # multi-millisecond inference can't observe a torn frame mid-flight.
+        # No lock — the worst case is a torn copy itself, which is a ~10us
+        # window and acceptable per design.
+        if self.latest_depth is None:
             self.get_logger().error("Depth IPC handle not yet attached.")
             return
+        self._depth_snapshot_t.copy_(self.latest_depth, non_blocking=True)
+        depth_t = self._depth_snapshot_t
         if depth_t.ndim != 3 or depth_t.shape[0] != 1:
             self.get_logger().error(
                 f"Unexpected cached depth shape: {tuple(depth_t.shape)}; expected [1, H, W]"
@@ -781,7 +794,7 @@ class AuxPolicyNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = AuxPolicyNode()
-    executor = MultiThreadedExecutor(num_threads=8)
+    executor = MultiThreadedExecutor(num_threads=3)
     try:
         executor.add_node(node)
         executor.spin()

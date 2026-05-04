@@ -9,7 +9,7 @@
 # Both ends MUST agree on `link_names`; that single ordered list IS the
 # PoseArray pose order.
 
-fk_rate: 30
+fk_rate: 100.0
 
 # URDF path. If relative, resolved against the libs root (parent of
 # `robot_motion_interface`). Absolute paths are used as-is.

@@ -69,9 +69,9 @@ def _encode_cuda_ipc(tensor: torch.Tensor) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-class CamNode(Node):
+class DepthNode(Node):
     def __init__(self) -> None:
-        super().__init__("cam_node")
+        super().__init__("depth_node")
 
         self._declare_parameters()
         self._load_configs()
@@ -89,7 +89,7 @@ class CamNode(Node):
         self._init_handle_service()
 
         self.get_logger().info(
-            f"CamNode ready: rs={self.rs_width}x{self.rs_height}@{int(self.capture_hz)}Hz, "
+            f"DepthNode ready: rs={self.rs_width}x{self.rs_height}@{int(self.capture_hz)}Hz, "
             f"da3_rate={self.da3_hz}Hz, depth_buf={tuple(self.depth_buf.shape)} "
             f"{self.depth_buf.dtype}, service={self.handle_service_name}"
         )
@@ -98,10 +98,10 @@ class CamNode(Node):
     # init
     # ------------------------------------------------------------------
     def _declare_parameters(self) -> None:
-        self.declare_parameter(
-            "policy_node_cfg_path",
-            str((RMI_ROOT / "config" / "rl_policy_node_config.yaml").resolve()),
-        )
+        # self.declare_parameter(
+        #     "policy_node_cfg_path",
+        #     str((RMI_ROOT / "config" / "rl_policy_node_config.yaml").resolve()),
+        # )
         self.declare_parameter(
             "da3_cfg_path",
             str((RMI_ROOT / "config" / "da3_compile_config.yaml").resolve()),
@@ -111,12 +111,12 @@ class CamNode(Node):
             str((RMI_ROOT / "runtime" / "env.yaml").resolve()),
         )
 
-        self.policy_node_cfg_path = Path(self.get_parameter("policy_node_cfg_path").value)
+        # self.policy_node_cfg_path = Path(self.get_parameter("policy_node_cfg_path").value)
         self.da3_cfg_path = Path(self.get_parameter("da3_cfg_path").value)
         self.env_cfg_path = Path(self.get_parameter("env_cfg_path").value)
 
     def _load_configs(self) -> None:
-        self.policy_node_cfg = _load_yaml(self.policy_node_cfg_path)
+        # self.policy_node_cfg = _load_yaml(self.policy_node_cfg_path)
         self.da3_full_cfg = _load_yaml(self.da3_cfg_path)
         self.env_cfg = _load_yaml(self.env_cfg_path)
 
@@ -135,7 +135,7 @@ class CamNode(Node):
         ipc_cfg = self.da3_full_cfg["ipc"]
         self.handle_service_name = str(ipc_cfg["handle_service_name"])
 
-        realsense_cfg = self.policy_node_cfg["realsense"]
+        realsense_cfg = self.da3_cfg["realsense"]
         self.realsense_cfg = realsense_cfg
         color_intrinsics = realsense_cfg["color_intrinsics"]
         self.rs_width = int(color_intrinsics["width"])
@@ -257,12 +257,12 @@ class CamNode(Node):
         try:
             color_rgb_t = torch.from_numpy(color_rgb).to(self.device, non_blocking=True).unsqueeze(0)
             depth_t = self._normalize_depth_shape(self.da3.infer_no_chunk(color_rgb_t))
-            depth_clamped = depth_t.to(dtype=torch.float32).clamp(
-                min=self.depth_clip_min, max=self.depth_clip_max
-            )
             # In-place into the IPC-shared buffer; consumers read this same
             # GPU memory. Auto-casts to float16 because depth_buf is float16.
-            self.depth_buf.copy_(depth_clamped, non_blocking=True)
+            self.depth_buf.copy_(
+                depth_t.to(dtype=torch.float32).clamp(
+                    min=self.depth_clip_min, 
+                    max=self.depth_clip_max), non_blocking=True)
         except Exception as exc:
             self.get_logger().error(f"DA3 inference failed: {exc}")
             rclpy.shutdown()

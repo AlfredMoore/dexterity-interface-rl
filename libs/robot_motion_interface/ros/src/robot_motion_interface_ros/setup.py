@@ -27,7 +27,7 @@ setup(
             'aux_policy = robot_motion_interface_ros.aux_policy:main',
             'aux_policy_2 = robot_motion_interface_ros.aux_policy_v2:main',
             'fk_node = robot_motion_interface_ros.fk_node:main',
-            'cam_node = robot_motion_interface_ros.cam_node:main',
+            'depth_node = robot_motion_interface_ros.depth_node:main',
             'cv_node = robot_motion_interface_ros.cv_node:main',
             'test_pre_grasp = robot_motion_interface_ros.test_node_pre_grasp:main',
             'test_curobo = robot_motion_interface_ros.test_node_for_curobo:main',
