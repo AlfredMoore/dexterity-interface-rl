@@ -135,7 +135,7 @@ class DepthNode(Node):
         ipc_cfg = self.da3_full_cfg["ipc"]
         self.handle_service_name = str(ipc_cfg["handle_service_name"])
 
-        realsense_cfg = self.da3_cfg["realsense"]
+        realsense_cfg = self.da3_full_cfg["realsense"]
         self.realsense_cfg = realsense_cfg
         color_intrinsics = realsense_cfg["color_intrinsics"]
         self.rs_width = int(color_intrinsics["width"])
@@ -158,7 +158,22 @@ class DepthNode(Node):
             rs.stream.color, self.rs_width, self.rs_height, rs.format.bgr8, int(self.capture_hz)
         )
         rs_profile = self.rs_pipeline.start(rs_config)
+        # for sp in rs_profile.get_streams():
+        #     vsp = sp.as_video_stream_profile()
+        #     self.get_logger().info(
+        #         "RealSense active profile: "
+        #         f"stream={sp.stream_type()} "
+        #         f"format={sp.format()} "
+        #         f"{vsp.width()}x{vsp.height()}@{vsp.fps()}Hz"
+        #     )
         self._apply_sensor_settings(rs_profile, self.realsense_cfg.get("sensor_settings", {}))
+        # for sensor in rs_profile.get_device().query_sensors():
+        #     if sensor.supports(rs.option.exposure):
+        #         r = sensor.get_option_range(rs.option.exposure)
+        #         self.get_logger().info(
+        #             f"{sensor.get_info(rs.camera_info.name)} exposure="
+        #             f"{sensor.get_option(rs.option.exposure)} range=({r.min}, {r.max}, step={r.step})"
+        #         )
         self.get_logger().info(
             f"RealSense capture started: {self.rs_width}x{self.rs_height}@{int(self.capture_hz)}Hz"
         )
@@ -193,7 +208,13 @@ class DepthNode(Node):
             loop_start = time.perf_counter()
             try:
                 frames = self.rs_pipeline.wait_for_frames(timeout_ms=1000)
+                # waiting = time.perf_counter() - loop_start
+                # self.get_logger().info(f"RealSense wait time: {waiting:.4f}s")
                 color_frame = frames.get_color_frame()
+                # self.get_logger().info(
+                #     f"frame={color_frame.get_frame_number()} "
+                #     f"ts={color_frame.get_timestamp():.3f}"
+                # )
                 color_rgb = cv2.cvtColor(
                     np.asanyarray(color_frame.get_data()), cv2.COLOR_BGR2RGB
                 )
@@ -269,11 +290,49 @@ class DepthNode(Node):
             return
 
         elapsed = time.perf_counter() - loop_start
+        self.get_logger().info(f"DA3 step time: {elapsed:.4f}s")
         period = 1.0 / max(self.da3_hz, 1e-3)
         if elapsed > period:
             self.get_logger().warn(
                 f"[SLOW_DA3] total={elapsed:.4f}s, target_period={period:.4f}s"
             )
+            
+        # d = depth_t.detach().float()
+        # finite = torch.isfinite(d)
+        # self.get_logger().info(
+        #     f"DA3 raw depth: finite={finite.sum().item()}/{d.numel()} "
+        #     f"min={d[finite].min().item():.4f} "
+        #     f"max={d[finite].max().item():.4f} "
+        #     f"mean={d[finite].mean().item():.4f}"
+        # )
+
+        if self.da3_cfg.get("debug_vis", False):
+            depth_vis = depth_t.detach()
+            if depth_vis.dim() == 3:
+                depth_vis = depth_vis[0]
+
+            depth_np = depth_vis.float().clamp(
+                min=self.depth_clip_min,
+                max=self.depth_clip_max,
+            ).cpu().numpy()
+
+            depth_norm = (depth_np - self.depth_clip_min) / (
+                self.depth_clip_max - self.depth_clip_min + 1e-6
+            )
+            depth_u8 = (depth_norm * 255.0).astype(np.uint8)
+            depth_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_INFERNO)
+            color_bgr = cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR)
+            if depth_color.shape[:2] != color_bgr.shape[:2]:
+                depth_color = cv2.resize(
+                    depth_color,
+                    (color_bgr.shape[1], color_bgr.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            vis = np.concatenate([color_bgr, depth_color], axis=1)
+
+            cv2.imshow("da3_rgb_depth", vis)
+            cv2.waitKey(1)
+
 
     # ------------------------------------------------------------------
     # IPC handle service
@@ -308,7 +367,7 @@ class DepthNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = CamNode()
+    node = DepthNode()
     executor = SingleThreadedExecutor()
     try:
         executor.add_node(node)

@@ -130,6 +130,7 @@ class FKNode(Node):
     # callbacks
     # ------------------------------------------------------------------
     def _joint_state_cb(self, msg: JointState) -> None:
+        # self.get_logger().info("Received joint state update")
         if len(msg.position) != self.action_num:
             self.get_logger().error(
                 f"/joint_states DoF mismatch: {len(msg.position)} vs pinocchio nq={self.action_num}"
@@ -146,7 +147,9 @@ class FKNode(Node):
 
         with self.joint_lock:
             if not self.has_joint_state:
+                self.get_logger().warn("No joint state available")
                 return
+            # self.get_logger().info("Joint state available")
             np.copyto(self._q_snapshot, self.latest_q)
 
         pin.forwardKinematics(self.pin_model, self.pin_data, self._q_snapshot)
@@ -174,6 +177,9 @@ class FKNode(Node):
         self.fk_pub.publish(msg)
 
         elapsed = time.perf_counter() - loop_start
+        # self.get_logger().info(
+        #         f"total={elapsed:.4f}s"
+        #     )
         period = 1.0 / self.fk_hz
         if elapsed > period:
             self.get_logger().warn(

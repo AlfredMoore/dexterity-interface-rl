@@ -6,6 +6,8 @@ da3_cfg:
   device: "cuda"
   rate: 30
 
+  debug_vis: false
+
   # aux_policy_v2: process_res <- env_cfg["da3_process_res"]
   # aux_policy:    process_res <- env_cfg.get("da3_process_res", 308)
   # should aligned with runtime/env.yaml
@@ -38,7 +40,7 @@ da3_cfg:
   # policy module's depth_clip_* in agent.yaml — duplicated because cam_node
   # owns the post-processing path and is decoupled from the policy module.
   depth_clip_min: 0.1
-  depth_clip_max: 2.0
+  depth_clip_max: 1.5
 
 # CUDA IPC service config: cam_node publishes the persistent depth tensor's
 # IPC handle on this service; aux_policy calls it once at init.
@@ -89,5 +91,5 @@ realsense:
   # exposure units are microseconds.
   sensor_settings:
     auto_exposure: false
-    exposure: 350
+    exposure: 150
     gain: 16
