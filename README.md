@@ -58,12 +58,22 @@ docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/work
 
 Dependencies
 ```bash
+pip install torch==2.7.0 torch-tensorrt tensorrt --extra-index-url https://download.pytorch.org/whl/cu128
+
 cd /workspace/dep
 pip install -r requirements.txt
 cd /workspace
 
 cd /workspace/dep/rsl_rl-HAND
 pip install -e .
+cd /workspace
+```
+
+Depth-Anything-3-HAND
+```bash
+cd /workspace/dep
+git clone -b gpu https://github.com/AlfredMoore/Depth-Anything-3-HAND.git
+pip install -e Depth-Anything-3-HAND
 cd /workspace
 ```
 

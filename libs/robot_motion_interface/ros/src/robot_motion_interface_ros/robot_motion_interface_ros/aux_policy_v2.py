@@ -18,7 +18,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 
-from robot_motion_interface.utils.da3_utils import DA3Inference, DEFAULT_DA3_MODEL
+from robot_motion_interface.utils.da3_trt_utils import DA3Inference
 from robot_motion_interface.utils.qos import HIGH_PERF_QOS, HIGH_RELIA_QOS
 from robot_motion_interface.utils.sim2real import joint_mapping
 
@@ -395,7 +395,7 @@ class AuxPolicyNode(Node):
         Both are mandatory; the policy loop blocks on `latest_depth` being available.
         """
         realsense_cfg = self.policy_node_cfg["realsense"]
-        da3_cfg = self.policy_node_cfg["cv_model"]["da3"]
+        da3_cfg = self.policy_node_cfg["da3_cfg"]
         color_intrinsics = realsense_cfg["color_intrinsics"]
         sensor_settings = realsense_cfg.get("sensor_settings", {})
 
@@ -423,22 +423,13 @@ class AuxPolicyNode(Node):
         time.sleep(0.5)
 
         # -- DA3 depth inference --
-        model_name = da3_cfg["model"] or DEFAULT_DA3_MODEL
-        self.da3 = DA3Inference(
-            model=model_name,
-            focal=0.5 * (float(color_intrinsics["fx"]) + float(color_intrinsics["fy"])),
-            fx=float(color_intrinsics["fx"]),
-            fy=float(color_intrinsics["fy"]),
-            cx=float(color_intrinsics["cx"]),
-            cy=float(color_intrinsics["cy"]),
-            device=self.device,
-            process_res=self.da3_process_res,
-        )
+        self.get_logger().info(f"DA3 compilation started.")
+        self.da3 = DA3Inference.from_dict(da3_cfg)
         self._da3_running = True
         self._da3_thread = threading.Thread(target=self._da3_loop, daemon=True, name="aux_da3")
         self._da3_thread.start()
         self.get_logger().info(
-            f"DA3 ready: model={model_name}, process_res={self.da3_process_res}, rate={self.da3_hz}Hz"
+            f"DA3 ready: model={self.da3.model_name}, process_res={self.da3_process_res}, rate={self.da3_hz}Hz"
         )
 
     def _apply_sensor_settings(self, rs_profile, sensor_settings: dict[str, Any]) -> None:
@@ -502,7 +493,7 @@ class AuxPolicyNode(Node):
 
                 infer_start = time.perf_counter()
                 color_rgb_t = torch.from_numpy(color_rgb).to(self.device, non_blocking=True).unsqueeze(0)
-                depth_t = self.da3.infer_torch_batched(color_rgb_t)
+                depth_t = self.da3.infer_no_chunk(color_rgb_t)
                 if depth_t.dim() == 2:
                     depth_t = depth_t.unsqueeze(0)
                 elif depth_t.dim() == 3 and depth_t.shape[0] == 1:
