@@ -32,3 +32,15 @@ da3_cfg:
     backend: "inductor"
     fullgraph: false
     dynamic: false
+
+  # cam_node clamps the DA3 output to [depth_clip_min, depth_clip_max] before
+  # writing into the IPC-shared float16 depth buffer. These should match the
+  # policy module's depth_clip_* in agent.yaml — duplicated because cam_node
+  # owns the post-processing path and is decoupled from the policy module.
+  depth_clip_min: 0.1
+  depth_clip_max: 2.0
+
+# CUDA IPC service config: cam_node publishes the persistent depth tensor's
+# IPC handle on this service; aux_policy calls it once at init.
+ipc:
+  handle_service_name: "/cam_node/get_depth_handle"

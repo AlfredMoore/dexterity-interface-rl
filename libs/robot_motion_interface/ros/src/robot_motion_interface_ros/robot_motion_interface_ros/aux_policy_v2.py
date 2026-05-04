@@ -6,19 +6,21 @@ import time
 from pathlib import Path
 from typing import Any
 
-import cv2
+import base64
+import io
+import pickle
 import numpy as np
-import pyrealsense2 as rs
 import rclpy
 import torch
+import torch.multiprocessing  # noqa: F401  # registers CUDA IPC reducers in ForkingPickler
 import yaml
 from geometry_msgs.msg import PoseArray
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from std_srvs.srv import Trigger
 
-from robot_motion_interface.utils.da3_compile_utils import DA3Inference
 from robot_motion_interface.utils.qos import HIGH_PERF_QOS, HIGH_RELIA_QOS
 from robot_motion_interface.utils.sim2real import joint_mapping
 
@@ -73,7 +75,7 @@ class AuxPolicyNode(Node):
         self._read_hand_link_counts()
         self._build_policy_and_normalizer()
         self._init_state_buffers()
-        self._setup_realsense_and_da3()
+        self._fetch_depth_handle()
 
         # -- 4. subs & pubs --
         self._init_pub_sub()
@@ -107,6 +109,7 @@ class AuxPolicyNode(Node):
         self.declare_parameter("driver_cfg_path", str((RMI_ROOT / "config" / "rl_bimanual_driver_config.yaml").resolve()))
         self.declare_parameter("policy_node_cfg_path", str((RMI_ROOT / "config" / "rl_policy_node_config.yaml").resolve()))
         self.declare_parameter("fk_cfg_path", str((RMI_ROOT / "config" / "fk_config.yaml").resolve()))
+        self.declare_parameter("da3_cfg_path", str((RMI_ROOT / "config" / "da3_compile_config.yaml").resolve()))
         self.declare_parameter("rsl_rl_root", str((RMI_ROOT / "dep" / "rsl_rl-HAND").resolve()))
 
         self.checkpoint_path = Path(self.get_parameter("checkpoint_path").value)
@@ -117,6 +120,7 @@ class AuxPolicyNode(Node):
         self.driver_cfg_path = Path(self.get_parameter("driver_cfg_path").value)
         self.policy_node_cfg_path = Path(self.get_parameter("policy_node_cfg_path").value)
         self.fk_cfg_path = Path(self.get_parameter("fk_cfg_path").value)
+        self.da3_cfg_path = Path(self.get_parameter("da3_cfg_path").value)
         self.rsl_rl_root = Path(self.get_parameter("rsl_rl_root").value)
 
     def _load_configs(self) -> None:
@@ -128,6 +132,7 @@ class AuxPolicyNode(Node):
         self.driver_cfg = _load_yaml(self.driver_cfg_path)
         self.policy_node_cfg = _load_yaml(self.policy_node_cfg_path)
         self.fk_cfg = _load_yaml(self.fk_cfg_path)
+        self.da3_full_cfg = _load_yaml(self.da3_cfg_path)
 
         self.get_logger().info("#### Aux policy node configs: ####")
         self.get_logger().info(f"runtime_cfg_path:     {self.runtime_cfg_path}")
@@ -150,7 +155,6 @@ class AuxPolicyNode(Node):
     # ------------------------------------------------------------------
     def _init_threading_locks(self) -> None:
         self.joint_lock = threading.Lock()
-        self.vision_lock = threading.Lock()
         self.fk_lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -376,169 +380,53 @@ class AuxPolicyNode(Node):
             self.fk_pose_dict[name + "_wxyz"] = np.zeros(4, dtype=np.float32)
         self.has_fk: bool = False
 
-        # Vision (color frame on CPU; depth tensor on GPU).
-        self.latest_color_rgb: np.ndarray | None = None
+        # Depth tensor: a CUDA IPC view onto cam_node's persistent depth buffer.
+        # Filled by _fetch_depth_handle(); read directly by the policy loop with
+        # no lock — tearing is rare and the cost of a torn read is negligible.
         self.latest_depth: torch.Tensor | None = None
-        self.latest_depth_stamp: float = 0.0
 
-        # Background thread handles + run flags (set up by _setup_realsense_and_da3 / _setup_fk).
-        self._capture_running: bool = False
-        self._capture_thread: threading.Thread | None = None
-        self._da3_running: bool = False
-        self._da3_thread: threading.Thread | None = None
+    def _fetch_depth_handle(self) -> None:
+        """One-shot: call cam_node's service, decode the CUDA IPC handle, and
+        attach self.latest_depth to cam_node's persistent depth buffer.
 
-    def _setup_realsense_and_da3(self) -> None:
-        """Start RealSense color stream + DA3 depth inference.
-
-        Both are mandatory; the policy loop blocks on `latest_depth` being available.
+        Blocks until cam_node advertises the service; afterwards reads of
+        self.latest_depth are direct GPU reads of the IPC-shared tensor — no
+        lock, no clone. Cam_node's DA3 timer keeps writing into that same
+        memory via copy_, so latest_depth always reflects the most recent
+        completed inference. Torn reads are possible but rare and tolerated.
         """
-        realsense_cfg = self.policy_node_cfg["realsense"]
-        da3_cfg = self.policy_node_cfg["da3_cfg"]
-        env_process_res = int(self.env_cfg["da3_process_res"])
-        da3_process_res = int(da3_cfg["process_res"])
-        if env_process_res != da3_process_res:
-            raise ValueError(
-                "process_res mismatch between env_cfg and da3_cfg: "
-                f"env_cfg.da3_process_res={env_process_res}, "
-                f"da3_cfg.process_res={da3_process_res}"
-            )
-        color_intrinsics = realsense_cfg["color_intrinsics"]
-        sensor_settings = realsense_cfg.get("sensor_settings", {})
+        ipc_cfg = self.da3_full_cfg["ipc"] if hasattr(self, "da3_full_cfg") else {}
+        service_name = str(ipc_cfg["handle_service_name"])
 
-        self.capture_hz = float(realsense_cfg["rs_fps"])
-        self.da3_hz = float(da3_cfg["rate"])
-        self.rs_width = int(color_intrinsics["width"])
-        self.rs_height = int(color_intrinsics["height"])
+        client = self.create_client(Trigger, service_name)
+        self.get_logger().info(f"Waiting for cam_node service: {service_name}")
+        while not client.wait_for_service(timeout_sec=1.0):
+            if not rclpy.ok():
+                raise RuntimeError("rclpy shutting down while waiting for cam_node service")
+            self.get_logger().info(f"...still waiting for {service_name}")
 
-        # -- RealSense color pipeline --
-        self.rs_pipeline = rs.pipeline()
-        rs_config = rs.config()
-        rs_config.enable_stream(
-            rs.stream.color, self.rs_width, self.rs_height, rs.format.bgr8, int(self.capture_hz)
-        )
-        rs_profile = self.rs_pipeline.start(rs_config)
-        self._apply_sensor_settings(rs_profile, sensor_settings)
-        self._capture_running = True
-        self._capture_thread = threading.Thread(
-            target=self._cam_capture_loop, daemon=True, name="aux_rs_capture"
-        )
-        self._capture_thread.start()
+        future = client.call_async(Trigger.Request())
+        rclpy.spin_until_future_complete(self, future)
+        resp = future.result()
+        if resp is None or not resp.success:
+            raise RuntimeError(f"cam_node service call failed: {resp}")
+
+        # Decode and import the CUDA IPC handle. torch.multiprocessing was
+        # imported at module load so reduce_tensor / rebuild_cuda_tensor are
+        # registered and pickle.loads can rebuild a tensor that aliases
+        # cam_node's GPU memory.
+        payload = base64.b64decode(resp.message.encode("ascii"))
+        depth_view = pickle.loads(payload)
+        if not isinstance(depth_view, torch.Tensor):
+            raise TypeError(f"IPC payload did not unpickle to torch.Tensor: {type(depth_view)}")
+        if depth_view.device.type != "cuda":
+            raise RuntimeError(f"IPC depth tensor is not on CUDA: {depth_view.device}")
+
+        self.latest_depth = depth_view
         self.get_logger().info(
-            f"RealSense capture started: {self.rs_width}x{self.rs_height}@{int(self.capture_hz)}Hz"
+            f"Depth IPC handle received: shape={tuple(depth_view.shape)} "
+            f"dtype={depth_view.dtype} device={depth_view.device}"
         )
-        time.sleep(0.5)
-
-        # -- DA3 depth inference --
-        self.get_logger().info(f"DA3 compilation started.")
-        self.da3 = DA3Inference.from_dict(da3_cfg)
-        if bool(da3_cfg["compile"]["enabled"]):
-            self.get_logger().info("DA3 compile warmup started (zero image).")
-            warmup_rgb = torch.zeros(
-                (1, self.rs_height, self.rs_width, 3),
-                dtype=torch.uint8,
-                device=self.device,
-            )
-            _ = self.da3.infer_no_chunk(warmup_rgb)
-            torch.cuda.synchronize(self.device)
-            self.get_logger().info("DA3 compile warmup finished.")
-        self._da3_running = True
-        self._da3_thread = threading.Thread(target=self._da3_loop, daemon=True, name="aux_da3")
-        self._da3_thread.start()
-        self.get_logger().info(
-            f"DA3 ready: model={self.da3.model_name}, process_res={self.da3.process_res}, rate={self.da3_hz}Hz"
-        )
-
-    def _apply_sensor_settings(self, rs_profile, sensor_settings: dict[str, Any]) -> None:
-        """Apply optional RealSense sensor settings (auto_exposure / exposure / gain)."""
-        if not sensor_settings:
-            return
-        sensors = rs_profile.get_device().query_sensors()
-        auto_exposure = sensor_settings.get("auto_exposure", False)
-        exposure = sensor_settings.get("exposure")
-        gain = sensor_settings.get("gain")
-        for sensor in sensors:
-            if sensor.supports(rs.option.enable_auto_exposure):
-                sensor.set_option(rs.option.enable_auto_exposure, 1.0 if auto_exposure else 0.0)
-            if not auto_exposure:
-                if exposure is not None and sensor.supports(rs.option.exposure):
-                    sensor.set_option(rs.option.exposure, float(exposure))
-                if gain is not None and sensor.supports(rs.option.gain):
-                    sensor.set_option(rs.option.gain, float(gain))
-
-    def _cam_capture_loop(self) -> None:
-        """RealSense color-frame capture; writes BGR ndarray under vision_lock."""
-        period = 1.0 / max(self.capture_hz, 1e-3)
-        while self._capture_running:
-            loop_start = time.perf_counter()
-            try:
-                frames = self.rs_pipeline.wait_for_frames(timeout_ms=1000)
-                color_frame = frames.get_color_frame()
-
-                # cvtColor allocates a fresh ndarray, also detaching from
-                # librealsense's internal buffer (recycled next iteration).
-                color_rgb = cv2.cvtColor(
-                    np.asanyarray(color_frame.get_data()), cv2.COLOR_BGR2RGB
-                )
-                with self.vision_lock:
-                    self.latest_color_rgb = color_rgb
-                    
-            except Exception as exc:
-                self.get_logger().warn(f"RealSense capture error: {exc}")
-                self._capture_running = False
-                rclpy.shutdown()
-                return
-
-            elapsed = time.perf_counter() - loop_start
-            sleep_s = period - elapsed
-            if sleep_s > 0:
-                time.sleep(sleep_s)
-
-    def _da3_loop(self) -> None:
-        """Run DA3 depth inference on the latest color frame; writes depth tensor under vision_lock."""
-        period = 1.0 / max(self.da3_hz, 1e-3)
-        while self._da3_running:
-            loop_start = time.perf_counter()
-            try:
-                with self.vision_lock:
-                    color_rgb = self.latest_color_rgb.copy() if self.latest_color_rgb is not None else None
-                if color_rgb is None:
-                    self.get_logger().error("DA3 loop: no color frame, shutting down node.")
-                    self._da3_running = False
-                    rclpy.shutdown()
-                    return
-
-                color_rgb_t = torch.from_numpy(color_rgb).to(self.device, non_blocking=True).unsqueeze(0)
-                depth_t = self.da3.infer_no_chunk(color_rgb_t)
-                if depth_t.dim() == 2:
-                    depth_t = depth_t.unsqueeze(0)
-                elif depth_t.dim() == 3 and depth_t.shape[0] == 1:
-                    pass
-                else:
-                    raise ValueError(f"Unexpected DA3 depth shape: {tuple(depth_t.shape)}")
-                depth_t = depth_t.to(dtype=torch.float32).clamp(
-                    min=self.depth_clip_min, max=self.depth_clip_max
-                ).to(torch.float16)
-                
-                with self.vision_lock:
-                    self.latest_depth = depth_t
-                    self.latest_depth_stamp = time.time()
-                    
-            except Exception as exc:
-                self.get_logger().warn(f"DA3 inference failed: {exc}")
-                self._da3_running = False
-                rclpy.shutdown()
-                return
-
-            elapsed = time.perf_counter() - loop_start
-            
-            sleep_s = period - elapsed
-            if sleep_s > 0.0:
-                time.sleep(sleep_s)
-            else:
-                self.get_logger().warn(
-                    f"[SLOW_DA3] total={elapsed:.4f}s, "
-                    f"target_period={period:.4f}s"
-                )
 
     # ------------------------------------------------------------------
     # Step 4: subs & pubs
@@ -716,7 +604,6 @@ class AuxPolicyNode(Node):
 
     def _log_policy_timing(
         self,
-        vision_lock_s: float,
         joint_lock_s: float,
         compose_obs_s: float,
         inference_s: float,
@@ -726,7 +613,6 @@ class AuxPolicyNode(Node):
         stage_threshold_s = 0.01
         total_threshold_s = 0.02
         stages = {
-            "vision_lock": vision_lock_s,
             "joint_lock": joint_lock_s,
             "compose_obs": compose_obs_s,
             "inference": inference_s,
@@ -747,12 +633,13 @@ class AuxPolicyNode(Node):
         if not self.has_joint_state:
             return
 
-        # 1) Snapshot latest depth ref quickly under vision_lock.
-        with self.vision_lock:
-            depth_t = self.latest_depth.clone() if self.latest_depth is not None else None
-        t01 = time.perf_counter()
+        # 1) Read the IPC-shared depth tensor directly. cam_node writes via
+        # copy_ into this same GPU memory, so latest_depth always points to
+        # the freshest completed inference. No lock, no clone — torn reads
+        # are tolerated.
+        depth_t = self.latest_depth
         if depth_t is None:
-            self.get_logger().error("No latest depth available.")
+            self.get_logger().error("Depth IPC handle not yet attached.")
             return
         if depth_t.ndim != 3 or depth_t.shape[0] != 1:
             self.get_logger().error(
@@ -828,8 +715,7 @@ class AuxPolicyNode(Node):
 
         t_end = time.perf_counter()
         self._log_policy_timing(
-            vision_lock_s=t01 - t0,
-            joint_lock_s=t02 - t01,
+            joint_lock_s=t02 - t0,
             compose_obs_s=t1 - t02,
             inference_s=t2 - t1,
             total_s=t_end - t0,
@@ -847,12 +733,15 @@ class AuxPolicyNode(Node):
                 "driver_cfg_path": str(self.driver_cfg_path),
                 "policy_node_cfg_path": str(self.policy_node_cfg_path),
                 "fk_cfg_path": str(self.fk_cfg_path),
+                "da3_cfg_path": str(self.da3_cfg_path),
                 "rsl_rl_root": str(self.rsl_rl_root),
             },
             "rates_hz": {
-                "capture_hz": float(self.capture_hz),
-                "da3_hz": float(self.da3_hz),
                 "policy_hz": float(self.policy_hz),
+            },
+            "depth_ipc": {
+                "shape": list(self.latest_depth.shape) if self.latest_depth is not None else None,
+                "dtype": str(self.latest_depth.dtype) if self.latest_depth is not None else None,
             },
             "runtime": {
                 "dt": float(self.dt),
@@ -876,34 +765,16 @@ class AuxPolicyNode(Node):
                 "depth_clip_min": float(self.depth_clip_min),
                 "depth_clip_max": float(self.depth_clip_max),
             },
-            "realsense": {
-                "width": int(self.rs_width),
-                "height": int(self.rs_height),
-            },
-            "da3": {
-                "process_res": int(self.da3.process_res),
-            },
         }
 
     def destroy_node(self) -> bool:
-        """Stop background workers and sensors before destroying the ROS node."""
-        self._capture_running = False
-        self._da3_running = False
+        """Cancel the policy timer before destroying the ROS node.
 
+        RealSense / DA3 / FK live in cam_node + fk_node; nothing to clean up
+        here besides the timer.
+        """
         if hasattr(self, "policy_timer") and self.policy_timer is not None:
             self.policy_timer.cancel()
-
-        if self._capture_thread is not None and self._capture_thread.is_alive():
-            self._capture_thread.join(timeout=1.0)
-        if self._da3_thread is not None and self._da3_thread.is_alive():
-            self._da3_thread.join(timeout=1.0)
-
-        if hasattr(self, "rs_pipeline") and self.rs_pipeline is not None:
-            try:
-                self.rs_pipeline.stop()
-            except Exception as exc:
-                self.get_logger().error(f"Error stopping RealSense pipeline: {exc}")
-
         return super().destroy_node()
 
 
