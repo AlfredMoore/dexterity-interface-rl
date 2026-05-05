@@ -775,7 +775,7 @@ class AuxPolicyNode(Node):
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name = self.real_joint_names
         msg.position = next_targets_real[0].detach().cpu().tolist()
-        # self.target_pub.publish(msg)
+        self.target_pub.publish(msg)
         # torch.cuda.synchronize()
         t_end = time.perf_counter()
         self._log_policy_timing(
