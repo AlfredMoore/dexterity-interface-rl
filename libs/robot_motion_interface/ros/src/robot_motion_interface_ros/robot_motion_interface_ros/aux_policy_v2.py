@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import base64
+import cv2
 import io
 import pickle
 import numpy as np
@@ -16,9 +17,9 @@ import torch.multiprocessing  # noqa: F401  # registers CUDA IPC reducers in For
 import yaml
 from geometry_msgs.msg import PoseArray
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.executors import MultiThreadedExecutor, SingleThreadedExecutor
 from rclpy.node import Node
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import JointState, Image
 from std_srvs.srv import Trigger
 
 from robot_motion_interface.utils.qos import HIGH_PERF_QOS, HIGH_RELIA_QOS
@@ -115,7 +116,7 @@ class AuxPolicyNode(Node):
         self.declare_parameter("policy_node_cfg_path", str((RMI_ROOT / "config" / "rl_policy_node_config.yaml").resolve()))
         self.declare_parameter("fk_cfg_path", str((RMI_ROOT / "config" / "fk_config.yaml").resolve()))
         self.declare_parameter("da3_cfg_path", str((RMI_ROOT / "config" / "da3_compile_config.yaml").resolve()))
-        self.declare_parameter("rsl_rl_root", str((RMI_ROOT / "dep" / "rsl_rl-HAND").resolve()))
+        # self.declare_parameter("rsl_rl_root", str((RMI_ROOT / "dep" / "rsl_rl-HAND").resolve()))
 
         self.checkpoint_path = Path(self.get_parameter("checkpoint_path").value)
         self.runtime_cfg_path = Path(self.get_parameter("runtime_cfg_path").value)
@@ -126,7 +127,7 @@ class AuxPolicyNode(Node):
         self.policy_node_cfg_path = Path(self.get_parameter("policy_node_cfg_path").value)
         self.fk_cfg_path = Path(self.get_parameter("fk_cfg_path").value)
         self.da3_cfg_path = Path(self.get_parameter("da3_cfg_path").value)
-        self.rsl_rl_root = Path(self.get_parameter("rsl_rl_root").value)
+        # self.rsl_rl_root = Path(self.get_parameter("rsl_rl_root").value)
 
     def _load_configs(self) -> None:
         """Load all YAML cfgs. Missing files raise FileNotFoundError naturally."""
@@ -175,7 +176,7 @@ class AuxPolicyNode(Node):
             from rsl_rl.modules.student_teacher_aux import StudentTeacherAux
         except Exception as exc:
             raise ImportError(
-                f"Failed to import rsl_rl modules from {self.rsl_rl_root}"
+                f"Failed to import rsl_rl modules"
             ) from exc
         self.EmpiricalNormalization = EmpiricalNormalization
         self.StudentTeacherAux = StudentTeacherAux
@@ -461,6 +462,8 @@ class AuxPolicyNode(Node):
             HIGH_PERF_QOS,
             callback_group=self.fk_grp,
         )
+        
+        self.depth_vis_pub = self.create_publisher(Image, "/depth_vis", HIGH_RELIA_QOS)
 
     def _sub_fk_cb(self, msg: PoseArray) -> None:
         """Write the inbound PoseArray into fk_pose_dict in fk_cfg.link_names order.
@@ -614,19 +617,26 @@ class AuxPolicyNode(Node):
 
     def _log_policy_timing(
         self,
-        joint_lock_s: float,
-        compose_obs_s: float,
-        inference_s: float,
+        depth_copy_s: float,
+        js_lock_s: float,
+        prev_var_s: float,
+        fk_compose_obs_s: float,
+        policy_inference_s: float,
+        policy_inference_sync_s: float,
         total_s: float,
     ) -> None:
         """Warn when the policy step blows past per-stage / total budgets."""
         stage_threshold_s = 0.01
         total_threshold_s = 0.02
         stages = {
-            "joint_lock": joint_lock_s,
-            "compose_obs": compose_obs_s,
-            "inference": inference_s,
+            "depth_copy": depth_copy_s,
+            "js_lock": js_lock_s,
+            "prev_var": prev_var_s,
+            "fk_lock_compose_obs": fk_compose_obs_s,
+            "policy_inference": policy_inference_s,
+            "policy_inference_sync": policy_inference_sync_s,
         }
+        timing = ", ".join(f"{n}={v:.4f}s" for n, v in stages.items())
         slow_stages = [f"{n}={v:.4f}s" for n, v in stages.items() if v > stage_threshold_s]
         total_slow = total_s > total_threshold_s
         if total_slow or slow_stages:
@@ -635,7 +645,10 @@ class AuxPolicyNode(Node):
                 parts.append(f"total={total_s:.4f}s>{total_threshold_s:.3f}s")
             if slow_stages:
                 parts.append(f"stages>{stage_threshold_s:.3f}s: " + ", ".join(slow_stages))
+            parts.append(timing)
             self.get_logger().warn("[SLOW_POLICY] " + " | ".join(parts))
+        else:
+            self.get_logger().debug(f"[POLICY_TIMING] total={total_s:.4f}s | {timing}")
 
     def _policy_update_loop(self) -> None:
         """Single policy step: snapshot sensors, run inference, integrate targets, publish."""
@@ -654,6 +667,8 @@ class AuxPolicyNode(Node):
             return
         self._depth_snapshot_t.copy_(self.latest_depth, non_blocking=True)
         depth_t = self._depth_snapshot_t
+        # torch.cuda.synchronize()
+        t01 = time.perf_counter()
         if depth_t.ndim != 3 or depth_t.shape[0] != 1:
             self.get_logger().error(
                 f"Unexpected cached depth shape: {tuple(depth_t.shape)}; expected [1, H, W]"
@@ -661,12 +676,44 @@ class AuxPolicyNode(Node):
             rclpy.shutdown()
             return
 
+        if self.policy_node_cfg["debug_vis"]:
+            depth_vis = depth_t.detach()
+            if depth_vis.dim() == 3:
+                depth_vis = depth_vis[0]
+
+            depth_np = depth_vis.float().clamp(
+                min=self.depth_clip_min,
+                max=self.depth_clip_max,
+            ).cpu().numpy()
+            
+            self.get_logger().info(
+                "depth_color stats: "
+                f"min={depth_np.min()}, max={depth_np.max()}, mean={depth_np.mean():.2f}"
+            )
+
+            depth_norm = (depth_np - self.depth_clip_min) / (
+                self.depth_clip_max - self.depth_clip_min + 1e-6
+            )
+            depth_u8 = (depth_norm * 255.0).astype(np.uint8)
+            depth_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_INFERNO)
+            
+            depth_color = np.ascontiguousarray(depth_color)
+            
+            msg = Image()
+            msg.height = depth_color.shape[0]
+            msg.width = depth_color.shape[1]
+            msg.encoding = "bgr8"
+            msg.step = depth_color.shape[1] * 3
+            msg.data = depth_color.tobytes()
+            self.depth_vis_pub.publish(msg)
+
         # 2) Snapshot latest joint arrays (real order) under joint_lock.
         with self.joint_lock:
             if not self.has_joint_state:
                 return
             np.copyto(self._joint_pos_snapshot_np, self.latest_joint_pos_real_np)
             np.copyto(self._joint_vel_snapshot_np, self.latest_joint_vel_real_np)
+        # torch.cuda.synchronize()
         t02 = time.perf_counter()
 
         # 3) Wait until fk_node has produced at least one sample for all four groups.
@@ -684,13 +731,15 @@ class AuxPolicyNode(Node):
             self.targets_initialized = True
         self._targets_snapshot_t.copy_(self.targets_policy)
         self._prev_actions_snapshot_t.copy_(self.prev_actions_policy)
-
+        # torch.cuda.synchronize()
+        t03 = time.perf_counter()
         # 5) Compose obs (policy order), build stacked obs, run policy.
         cur_student_obs = self._compose_student_obs(
             joint_pos_policy=self._joint_pos_policy_t,
             joint_vel_policy=self._joint_vel_policy_t,
             targets_policy=self._targets_snapshot_t,
         )
+        # torch.cuda.synchronize()
         t1 = time.perf_counter()
 
         if self.n_stack_frame == 1:
@@ -708,6 +757,8 @@ class AuxPolicyNode(Node):
         with torch.inference_mode():
             obs_normed = self.obs_normalizer(obs_clamped)
             actions_policy = self.policy.act_inference(obs_normed, vision_input=depth_t)
+        
+        # torch.cuda.synchronize()
         t2 = time.perf_counter()
 
         # 6) Integrate and publish (convert policy->real only at publish boundary).
@@ -724,13 +775,16 @@ class AuxPolicyNode(Node):
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.name = self.real_joint_names
         msg.position = next_targets_real[0].detach().cpu().tolist()
-        self.target_pub.publish(msg)
-
+        # self.target_pub.publish(msg)
+        # torch.cuda.synchronize()
         t_end = time.perf_counter()
         self._log_policy_timing(
-            joint_lock_s=t02 - t0,
-            compose_obs_s=t1 - t02,
-            inference_s=t2 - t1,
+            depth_copy_s=t01 - t0,
+            js_lock_s=t02 - t01,
+            prev_var_s=t03 - t02,
+            fk_compose_obs_s=t1 - t03,
+            policy_inference_s=t2 - t1,
+            policy_inference_sync_s=t_end - t2,
             total_s=t_end - t0,
         )
 
@@ -747,7 +801,7 @@ class AuxPolicyNode(Node):
                 "policy_node_cfg_path": str(self.policy_node_cfg_path),
                 "fk_cfg_path": str(self.fk_cfg_path),
                 "da3_cfg_path": str(self.da3_cfg_path),
-                "rsl_rl_root": str(self.rsl_rl_root),
+                # "rsl_rl_root": str(self.rsl_rl_root),
             },
             "rates_hz": {
                 "policy_hz": float(self.policy_hz),
@@ -794,7 +848,8 @@ class AuxPolicyNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = AuxPolicyNode()
-    executor = MultiThreadedExecutor(num_threads=3)
+    # executor = MultiThreadedExecutor(num_threads=3)
+    executor = SingleThreadedExecutor()
     try:
         executor.add_node(node)
         executor.spin()

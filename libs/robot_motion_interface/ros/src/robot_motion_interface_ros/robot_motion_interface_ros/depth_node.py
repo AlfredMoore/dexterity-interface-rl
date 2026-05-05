@@ -290,7 +290,7 @@ class DepthNode(Node):
             return
 
         elapsed = time.perf_counter() - loop_start
-        self.get_logger().info(f"DA3 step time: {elapsed:.4f}s")
+        # self.get_logger().info(f"DA3 step time: {elapsed:.4f}s")
         period = 1.0 / max(self.da3_hz, 1e-3)
         if elapsed > period:
             self.get_logger().warn(
@@ -315,6 +315,11 @@ class DepthNode(Node):
                 min=self.depth_clip_min,
                 max=self.depth_clip_max,
             ).cpu().numpy()
+            
+            self.get_logger().info(
+                "depth_color stats: "
+                f"min={depth_np.min()}, max={depth_np.max()}, mean={depth_np.mean():.2f}"
+            )
 
             depth_norm = (depth_np - self.depth_clip_min) / (
                 self.depth_clip_max - self.depth_clip_min + 1e-6

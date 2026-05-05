@@ -3,6 +3,8 @@
 infer_rate: 30
 
 policy_run_dir: "<rsl-rl run folder path>"
+
+debug_vis: false
 # cv_verbose: false              # node-level info logs; warnings/errors still print
 
 # cv_model:
