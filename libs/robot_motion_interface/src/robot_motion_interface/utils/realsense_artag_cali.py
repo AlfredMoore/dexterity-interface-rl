@@ -44,9 +44,6 @@ AXIS_THICKNESS = 3                        # line thickness for drawn axes
 DEFAULT_PRINT_EVERY_N = 30                # print every N loops to throttle stdout
 DEFAULT_WORLD_TAG_Z_ROT_DEG = 180.0
 
-# Default depth clip range (m) and output render size copied from existing IsaacSim configs.
-# These are user-defined and not present in the RealSense profile, so we keep sane defaults.
-DEFAULT_DEPTH_CLIP   = [0.2, 2.0]
 DEFAULT_OUTPUT_SCALE = 0.5  # output_w/h = scale * native_w/h
 
 # IsaacSim/IsaacLab camera-frame conventions used downstream.
@@ -652,7 +649,6 @@ def _save_extrinsics(T_cam_tag: np.ndarray, T_tag_cam: np.ndarray, tag_id: int,
         "height": int(_rs_color_intr["height"]),
         "output_width":  int(round(_rs_color_intr["width"]  * DEFAULT_OUTPUT_SCALE)),
         "output_height": int(round(_rs_color_intr["height"] * DEFAULT_OUTPUT_SCALE)),
-        "clip": list(DEFAULT_DEPTH_CLIP),
         "depth_scale": float(_depth_scale),
         "pose": {
             "pos": list(pos_xyz),
