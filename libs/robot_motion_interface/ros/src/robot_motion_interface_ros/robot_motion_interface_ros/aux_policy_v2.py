@@ -568,14 +568,22 @@ class AuxPolicyNode(Node):
         # through "<linkname>_pos" keys; orientation entries are written by the
         # callback but unused here (positions only feed the policy).
         with self.fk_lock:
-            l_ft_np = np.concatenate([self.fk_pose_dict[n + "_pos"] for n in self.left_fingertip_names])
-            r_ft_np = np.concatenate([self.fk_pose_dict[n + "_pos"] for n in self.right_fingertip_names])
-            l_hb_np = np.concatenate([self.fk_pose_dict[n + "_pos"] for n in self.left_hand_base_names])
-            r_hb_np = np.concatenate([self.fk_pose_dict[n + "_pos"] for n in self.right_hand_base_names])
-        l_ft = torch.from_numpy(l_ft_np).unsqueeze(0).to(self.device, non_blocking=True)
-        r_ft = torch.from_numpy(r_ft_np).unsqueeze(0).to(self.device, non_blocking=True)
-        l_hb = torch.from_numpy(l_hb_np).unsqueeze(0).to(self.device, non_blocking=True)
-        r_hb = torch.from_numpy(r_hb_np).unsqueeze(0).to(self.device, non_blocking=True)
+            l_ft_pos_np = np.concatenate([self.fk_pose_dict[n + "_pos"] for n in self.left_fingertip_names])
+            l_ft_qual_np = np.concatenate([self.fk_pose_dict[n + "_wxyz"] for n in self.left_fingertip_names])
+            r_ft_pos_np = np.concatenate([self.fk_pose_dict[n + "_pos"] for n in self.right_fingertip_names])
+            r_ft_qual_np = np.concatenate([self.fk_pose_dict[n + "_wxyz"] for n in self.right_fingertip_names])
+            l_hb_pos_np = np.concatenate([self.fk_pose_dict[n + "_pos"] for n in self.left_hand_base_names])
+            l_hb_qual_np = np.concatenate([self.fk_pose_dict[n + "_wxyz"] for n in self.left_hand_base_names])
+            r_hb_pos_np = np.concatenate([self.fk_pose_dict[n + "_pos"] for n in self.right_hand_base_names])
+            r_hb_qual_np = np.concatenate([self.fk_pose_dict[n + "_wxyz"] for n in self.right_hand_base_names])
+        l_ft_pos = torch.from_numpy(l_ft_pos_np).unsqueeze(0).to(self.device, non_blocking=True)
+        l_ft_qual = torch.from_numpy(l_ft_qual_np).unsqueeze(0).to(self.device, non_blocking=True)
+        r_ft_pos = torch.from_numpy(r_ft_pos_np).unsqueeze(0).to(self.device, non_blocking=True)
+        r_ft_qual = torch.from_numpy(r_ft_qual_np).unsqueeze(0).to(self.device, non_blocking=True)
+        l_hb_pos = torch.from_numpy(l_hb_pos_np).unsqueeze(0).to(self.device, non_blocking=True)
+        l_hb_qual = torch.from_numpy(l_hb_qual_np).unsqueeze(0).to(self.device, non_blocking=True)
+        r_hb_pos = torch.from_numpy(r_hb_pos_np).unsqueeze(0).to(self.device, non_blocking=True)
+        r_hb_qual = torch.from_numpy(r_hb_qual_np).unsqueeze(0).to(self.device, non_blocking=True)
 
         full_obs = {
             "leftJointPosScaled": left_jp_s,
@@ -584,10 +592,14 @@ class AuxPolicyNode(Node):
             "rightJointVelScaled": right_jv_s,
             "leftTargets": left_tgt,
             "rightTargets": right_tgt,
-            "leftFingerTipsPos": l_ft,
-            "rightFingerTipsPos": r_ft,
-            "leftHandBasePos": l_hb,
-            "rightHandBasePos": r_hb,
+            "leftFingerTipsPos": l_ft_pos,
+            "leftFingerTipsRot": l_ft_qual,
+            "rightFingerTipsPos": r_ft_pos,
+            "rightFingerTipsRot": r_ft_qual,
+            "leftHandBasePos": l_hb_pos,
+            "leftHandBaseRot": l_hb_qual,
+            "rightHandBasePos": r_hb_pos,
+            "rightHandBaseRot": r_hb_qual,
         }
         student_obs = torch.cat([full_obs[k] for k in self.student_obs_keys], dim=-1)
         if int(student_obs.shape[-1]) != self.student_obs_unstacked_space:
