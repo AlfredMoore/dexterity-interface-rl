@@ -1,332 +1,252 @@
 """
-Ultralytics YOLO-World + ByteTrack wrapper for open-vocabulary bbox detection
-and persistent object tracking.
+Ultralytics YOLO26 wrapper for bbox-based depth masking.
 
-Designed to feed SAM2 with per-object bbox prompts:
-    tracker = UltralyticsTracker(classes=None)  # full detection
-    detections = tracker.infer(bgr_frame)
-    for det in detections:
-        boxes, scores, logits = sam2.infer(bgr_frame, box=det.box)
+Detects a target class (default: "bottle") on the RGB frame, then zeros out
+every depth pixel outside the detected bbox. Used as a lightweight semantic
+prior for sim2real depth pipelines — only the bottle's depth survives, the
+background and (most of) the manipulator hand are masked out.
 
-Available YOLO-World v2 variants (auto-downloaded by ultralytics on first use):
-    yolov8s-worldv2.pt  -- Small,  ~15ms  (~67 Hz)  [default]
-    yolov8m-worldv2.pt  -- Medium, ~22ms  (~45 Hz)
-    yolov8l-worldv2.pt  -- Large,  ~35ms  (~29 Hz)
-    yolov8x-worldv2.pt  -- XLarge, ~60ms  (~17 Hz)
+Model weights are stored under `models/ultralytics/` relative to the repo
+root and auto-downloaded by ultralytics on first use.
 
-Benchmark:
+Benchmark (synthetic frames):
     python -m robot_motion_interface.utils.ultralytics_utils
-    python -m robot_motion_interface.utils.ultralytics_utils --variant m
 
-Run on folder:
+Run on a recorded RealSense session:
     python -m robot_motion_interface.utils.ultralytics_utils \
-        --frames_dir models/data_examples/hand_setup_frames \
-        --classes "robot arm. cup."
+        --frames_dir models/data_examples/realsense/rs_record_distant_20260316_053733 \
+        --variant n
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
-
-DEFAULT_ULTRALYTICS_MODEL = "yolov8s-worldv2.pt"
-DEFAULT_ULTRALYTICS_CLASSES: Optional[List[str]] = None
-
-
-@dataclass
-class Detection:
-    """Single tracked object detection."""
-    track_id: int
-    label: str
-    box: np.ndarray   # (4,) float32 xyxy
-    score: float
+import torch
+from ultralytics import YOLO
 
 
-class UltralyticsTracker:
+# Repo root: this file lives at libs/robot_motion_interface/src/robot_motion_interface/utils/
+_REPO_ROOT = Path(__file__).resolve().parents[5]
+_WEIGHTS_DIR = _REPO_ROOT / "models" / "ultralytics"
+
+# YOLO26 weight filenames per size variant. Ultralytics downloads from GitHub
+# releases automatically when YOLO(<absolute_path>) is called with a missing file.
+_VARIANTS = {
+    "n": "yolo26n.pt",   # Nano    fastest
+    "s": "yolo26s.pt",   # Small
+    "m": "yolo26m.pt",   # Medium
+    "l": "yolo26l.pt",   # Large
+    "x": "yolo26x.pt",   # XLarge  most accurate
+}
+
+
+class YOLOBboxDepthMasker:
     """
-    YOLO-World open-vocabulary detector + ByteTrack persistent tracker.
+    Single-step pipeline:  (bgr, depth) ──► masked_depth, bbox
 
-    If classes is None, it runs in full-class detection mode. If classes
-    is provided, YOLO-World text classes are restricted to that list.
-
-    Each infer() call runs detection + tracking on a single BGR frame and
-    returns a list of Detection objects with stable track IDs across frames.
-
-    Usage:
-        tracker = UltralyticsTracker(
-            model_path="yolov8s-worldv2.pt",
-            classes=None,  # full detection
-            device="cuda",
-        )
-        detections = tracker.infer(bgr_frame)
-        for det in detections:
-            print(det.track_id, det.label, det.box, det.score)
+    Outside-bbox depth pixels are replaced with `fill_value`. If no detection
+    passes `conf_threshold`, the whole depth frame is zeroed and bbox=None.
     """
 
     def __init__(
         self,
-        model_path: str = DEFAULT_ULTRALYTICS_MODEL,
-        classes: Optional[List[str]] = None,
+        variant: str = "n",
+        target_class: str = "bottle",
         device: str = "cuda",
-        conf: float = 0.3,
-        iou: float = 0.5,
-    ) -> None:
-        from ultralytics import YOLO
-        self.model = YOLO(model_path)
-        self.model.to(device)
-        self._classes = [c for c in (classes or []) if c] or None
-        if self._classes is not None:
-            self.model.set_classes(self._classes)
-        self.conf = conf
-        self.iou  = iou
+        conf_threshold: float = 0.25,
+        padding_ratio: float = 0.10,
+        fill_value: float = 0.0,
+    ):
+        if variant not in _VARIANTS:
+            raise ValueError(f"variant must be one of {list(_VARIANTS)}, got {variant!r}")
 
-    def set_classes(self, classes: List[str]) -> None:
-        """Update detection classes (re-encodes text embeddings)."""
-        cls = [c for c in classes if c]
-        if not cls:
-            raise ValueError(
-                "classes cannot be empty; initialize UltralyticsTracker(classes=None) for full detection."
-            )
-        self._classes = cls
-        self.model.set_classes(cls)
+        self.device = device
+        self.conf_threshold = float(conf_threshold)
+        self.padding_ratio = float(padding_ratio)
+        self.fill_value = float(fill_value)
 
-    def infer(self, bgr: np.ndarray) -> List[Detection]:
+        # Make sure weights dir exists; ultralytics downloads here on miss.
+        _WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+        weights_path = _WEIGHTS_DIR / _VARIANTS[variant]
+        self.model = YOLO(str(weights_path)).to(self.device)
+
+        # Resolve target class name to its integer id used by this model.
+        name_to_id = {n.lower(): i for i, n in self.model.names.items()}
+        key = target_class.lower()
+        if key not in name_to_id:
+            sample = list(self.model.names.values())[:10]
+            raise ValueError(f"target_class {target_class!r} not in model classes; first 10: {sample}")
+        self.target_class_id = name_to_id[key]
+        self.target_class_name = key
+
+    def mask_depth(
+        self, bgr: np.ndarray, depth: np.ndarray
+    ) -> Tuple[np.ndarray, Optional[Tuple[int, int, int, int]]]:
         """
-        Run detection + tracking on a single BGR frame.
-
         Args:
-            bgr: (H, W, 3) uint8 BGR frame.
+            bgr:   (H, W, 3) uint8  BGR colour frame
+            depth: (H, W) or (H, W, 1)  aligned depth frame (any numeric dtype)
 
         Returns:
-            List of Detection, one per tracked object.
-            Empty list if nothing detected or tracker has no IDs yet.
+            masked_depth: same shape & dtype as `depth`; pixels outside the bbox
+                          replaced with `fill_value`. All-zeros when no detection.
+            bbox:         (x1, y1, x2, y2) integer pixel coords, padded and clipped;
+                          None when no detection passes the confidence threshold.
         """
-        results = self.model.track(
+        h, w = depth.shape[:2]
+
+        # 1. Detect — keep only top-1 detection of the target class.
+        results = self.model.predict(
             bgr,
-            persist=True,
+            conf=self.conf_threshold,
+            classes=[self.target_class_id],
+            device=self.device,
             verbose=False,
-            conf=self.conf,
-            iou=self.iou,
         )
-        r = results[0]
-        if r.boxes is None or r.boxes.id is None:
-            return []
+        boxes = results[0].boxes if results else None
+        if boxes is None or len(boxes) == 0:
+            return np.full_like(depth, self.fill_value), None
 
-        boxes      = r.boxes.xyxy.cpu().numpy().astype(np.float32)   # (N, 4)
-        track_ids  = r.boxes.id.int().cpu().numpy()                  # (N,)
-        cls_ids    = r.boxes.cls.int().cpu().numpy()                  # (N,)
-        scores     = r.boxes.conf.cpu().numpy().astype(np.float32)   # (N,)
+        confs = boxes.conf.detach().cpu().numpy()
+        x1, y1, x2, y2 = boxes.xyxy[int(np.argmax(confs))].detach().cpu().numpy()
 
-        detections = []
-        for box, tid, cid, score in zip(boxes, track_ids, cls_ids, scores):
-            if self._classes is None:
-                label = self._label_from_result(r, int(cid))
-            else:
-                label = self._classes[int(cid)] if int(cid) < len(self._classes) else f"class_{int(cid)}"
-            detections.append(Detection(
-                track_id=int(tid),
-                label=label,
-                box=box,
-                score=float(score),
-            ))
-        return detections
+        # 2. Pad bbox by padding_ratio on each side, then clip to image bounds.
+        pad_x = (x2 - x1) * self.padding_ratio
+        pad_y = (y2 - y1) * self.padding_ratio
+        x1 = int(max(0, np.floor(x1 - pad_x)))
+        y1 = int(max(0, np.floor(y1 - pad_y)))
+        x2 = int(min(w, np.ceil(x2 + pad_x)))
+        y2 = int(min(h, np.ceil(y2 + pad_y)))
+        if x2 <= x1 or y2 <= y1:
+            return np.full_like(depth, self.fill_value), None
 
-    @staticmethod
-    def _label_from_result(result: object, cid: int) -> str:
-        names = getattr(result, "names", None)
-        if isinstance(names, dict):
-            return str(names.get(cid, f"class_{cid}"))
-        if isinstance(names, (list, tuple)) and 0 <= cid < len(names):
-            return str(names[cid])
-        return f"class_{cid}"
-
-    def reset(self) -> None:
-        """Reset tracker state (clears all track IDs)."""
-        self.model.predictor = None
+        # 3. Copy only the inside-bbox slice of depth; rest stays at fill_value.
+        masked = np.full_like(depth, self.fill_value)
+        masked[y1:y2, x1:x2] = depth[y1:y2, x1:x2]
+        return masked, (x1, y1, x2, y2)
+    
 
 
-def _parse_classes(text: str) -> List[str]:
-    """'robot arm. cup.' → ['robot arm', 'cup']"""
-    return [c.strip().rstrip(".") for c in text.split(".") if c.strip()]
-
-
-def _draw_detections(frame: np.ndarray, detections: List[Detection]) -> np.ndarray:
-    vis = frame.copy()
-    palette = [
-        (0,  80, 255),
-        (255, 80,   0),
-        (0,  200,   0),
-        (200,   0, 200),
-        (0,  200, 200),
-    ]
-    for det in detections:
-        color = palette[det.track_id % len(palette)]
-        x1, y1, x2, y2 = det.box.astype(int)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(vis, f"{det.label}#{det.track_id} {det.score:.2f}",
-                    (x1, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
-    return vis
-
-
-# ── Benchmark entry point ──────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
+# Test entry: run on a recorded RealSense session (color/ + depth/), write
+# a sibling folder with [bbox overlay | masked depth colormap] images.
+#
+# Usage:
+#     python -m robot_motion_interface.utils.ultralytics_utils \
+#         --frames_dir data/rs_record_20260508_025509
+#
+# Output (default): <frames_dir>_yolo_masked/000000.jpg, 000001.jpg, ...
+# ────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import argparse
     import time
-    import torch
 
-    _REPO_ROOT = Path(__file__).resolve().parents[5]
-
-    _VARIANTS = {
-        "s": "yolov8s-worldv2.pt",
-        "m": "yolov8m-worldv2.pt",
-        "l": "yolov8l-worldv2.pt",
-        "x": "yolov8x-worldv2.pt",
-    }
-
-    parser = argparse.ArgumentParser(description="Benchmark YOLO-World + ByteTrack throughput")
-    parser.add_argument("--variant",    type=str, default="s", choices=list(_VARIANTS),
-                        help="Model variant: s (default) / m / l / x")
-    parser.add_argument("--model_path", type=str, default=None,
-                        help="Override model path (e.g. local .pt file)")
-    parser.add_argument("--classes",    type=str, default="",
-                        help="Dot-separated class list; empty means full detection")
-    parser.add_argument("--conf",       type=float, default=0.3)
-    parser.add_argument("--iou",        type=float, default=0.5)
-    parser.add_argument("--device",     type=str, default="cuda")
-    parser.add_argument("--width",      type=int, default=640)
-    parser.add_argument("--height",     type=int, default=480)
-    parser.add_argument("--warmup",     type=int, default=3)
-    parser.add_argument("--iters",      type=int, default=50,
-                        help="Timed iterations (single-image mode only)")
-    parser.add_argument("--frames_dir", type=str, default=None,
-                        help="Folder of frames to run sequentially (jpg/png, sorted by name).")
-    parser.add_argument("--out_dir",    type=str, default=None,
-                        help="Save annotated frames here (only with --frames_dir).")
-    parser.add_argument("--video_fps",  type=float, default=30.0,
-                        help="Playback fps of the output video (default: 30).")
+    parser = argparse.ArgumentParser(description="YOLO26 bbox-mask test on a color/+depth/ folder")
+    parser.add_argument("--frames_dir",    type=str,   required=True,
+                        help="Folder containing color/ and depth/ subfolders")
+    parser.add_argument("--out_dir",       type=str,   default=None,
+                        help="Output folder (default: <frames_dir>/yolo_masked)")
+    parser.add_argument("--variant",       choices=list(_VARIANTS), default="n")
+    parser.add_argument("--target_class",  type=str,   default="bottle")
+    parser.add_argument("--conf",          type=float, default=0.25)
+    parser.add_argument("--padding_ratio", type=float, default=0.10)
+    parser.add_argument("--device",        type=str,   default="cuda")
+    parser.add_argument("--depth_scale",   type=float, default=0.001,
+                        help="Metres per raw depth unit (RealSense D-series default: 0.001)")
+    parser.add_argument("--clip",          type=float, nargs=2, default=[0.1, 1.1],
+                        metavar=("NEAR", "FAR"),
+                        help="Fixed [near, far] (metres) for depth colormap normalisation")
     args = parser.parse_args()
 
-    model_path = args.model_path or _VARIANTS[args.variant]
-    classes    = _parse_classes(args.classes)
+    # Resolve paths (relative paths are relative to repo root).
+    frames_dir = Path(args.frames_dir)
+    if not frames_dir.is_absolute():
+        frames_dir = _REPO_ROOT / frames_dir
+    color_dir, depth_dir = frames_dir / "color", frames_dir / "depth"
+    if not color_dir.is_dir() or not depth_dir.is_dir():
+        raise FileNotFoundError(f"Expected color/ and depth/ inside {frames_dir}")
+    color_paths = sorted(p for p in color_dir.iterdir()
+                         if p.suffix.lower() in (".jpg", ".jpeg", ".png"))
+    if not color_paths:
+        raise FileNotFoundError(f"No color frames in {color_dir}")
 
-    # ── Frame list ─────────────────────────────────────────────────────────────
-    if args.frames_dir is not None:
-        frames_dir  = Path(args.frames_dir)
-        frame_paths = sorted(p for p in frames_dir.iterdir()
-                             if p.suffix.lower() in (".jpg", ".jpeg", ".png"))
-        if not frame_paths:
-            raise FileNotFoundError(f"No jpg/png frames in: {frames_dir}")
-        out_dir = Path(args.out_dir) if args.out_dir else \
-                  frames_dir.parent / (frames_dir.name + "_annotated")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        mode = "folder"
-    else:
-        _IMG_PATH   = _REPO_ROOT / "models" / "data_examples" / "image.jpg"
-        _OUT_PATH   = _REPO_ROOT / "models" / "data_examples" / "image-ultralytics.jpg"
-        frame_paths = [_IMG_PATH]
-        mode        = "single"
+    out_dir = Path(args.out_dir) if args.out_dir else frames_dir / "yolo_masked"
+    if not out_dir.is_absolute():
+        out_dir = _REPO_ROOT / out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── GPU info ───────────────────────────────────────────────────────────────
-    if torch.cuda.is_available():
-        _p = torch.cuda.get_device_properties(0)
-        gpu_info = (f"{torch.cuda.get_device_name(0)}  "
-                    f"({_p.total_memory // (1024**2)} MiB)  "
-                    f"sm_{_p.major}{_p.minor}  CUDA {torch.version.cuda}")
-    else:
-        gpu_info = "N/A (CPU only)"
+    print(f"YOLO26 bbox-mask folder test")
+    print(f"  frames_dir   : {frames_dir}  ({len(color_paths)} frames)")
+    print(f"  out_dir      : {out_dir}")
+    print(f"  variant      : yolo26{args.variant}")
+    print(f"  target_class : {args.target_class!r}  conf>={args.conf}  pad={args.padding_ratio*100:.0f}%")
 
-    print("=" * 60)
-    print("  YOLO-World v2 + ByteTrack Benchmark")
-    print("=" * 60)
-    print(f"  GPU        : {gpu_info}")
-    print(f"  model      : {model_path}")
-    print(f"  classes    : {classes}")
-    print(f"  conf={args.conf}  iou={args.iou}  device={args.device}")
-    print(f"  frame size : {args.width}x{args.height}")
-    if mode == "folder":
-        print(f"  frames_dir : {args.frames_dir}  ({len(frame_paths)} frames)")
-        print(f"  out_dir    : {out_dir}")
-    print(f"  warm-up    : {args.warmup}")
-    print("=" * 60)
-
-    t_load = time.time()
-    tracker = UltralyticsTracker(
-        model_path=model_path,
-        classes=classes,
+    masker = YOLOBboxDepthMasker(
+        variant=args.variant,
+        target_class=args.target_class,
         device=args.device,
-        conf=args.conf,
-        iou=args.iou,
+        conf_threshold=args.conf,
+        padding_ratio=args.padding_ratio,
     )
-    print(f"Model loaded in {time.time() - t_load:.2f}s\n")
 
-    # ── Warm-up ────────────────────────────────────────────────────────────────
-    warmup_frame = cv2.imread(str(frame_paths[0]))
-    warmup_frame = cv2.resize(warmup_frame, (args.width, args.height))
-    print(f"Running {args.warmup} warm-up frame(s) ...")
-    for _ in range(args.warmup):
-        tracker.infer(warmup_frame)
-    tracker.reset()   # clear track IDs accumulated during warm-up
-    print("Warm-up done.\n")
-
-    # ── Timed inference ────────────────────────────────────────────────────────
-    n_iters   = len(frame_paths) if mode == "folder" else args.iters
     latencies: list[float] = []
-    last_dets: List[Detection] = []
-
-    for i in range(n_iters):
-        fpath = frame_paths[i % len(frame_paths)]
-        frame = cv2.imread(str(fpath))
-        if frame is None:
-            print(f"  [skip] cannot read {fpath.name}")
+    n_hit = n_miss = 0
+    for color_p in color_paths:
+        depth_p = depth_dir / (color_p.stem + ".png")
+        bgr = cv2.imread(str(color_p))
+        depth = cv2.imread(str(depth_p), cv2.IMREAD_UNCHANGED)
+        if bgr is None or depth is None:
+            print(f"  [skip] cannot read pair {color_p.stem}")
             continue
-        frame = cv2.resize(frame, (args.width, args.height))
 
+        if args.device == "cuda":
+            torch.cuda.synchronize()
         t0 = time.perf_counter()
-        dets = tracker.infer(frame)
-        ms   = (time.perf_counter() - t0) * 1000
-        latencies.append(ms)
-        last_dets = dets
+        masked_depth, bbox = masker.mask_depth(bgr, depth)
+        if args.device == "cuda":
+            torch.cuda.synchronize()
+        latencies.append((time.perf_counter() - t0) * 1000.0)
+        if bbox is None:
+            n_miss += 1
+        else:
+            n_hit += 1
 
-        label = "frame" if mode == "folder" else "iter"
-        det_str = "  ".join(f"{d.label}#{d.track_id}" for d in dets) or "none"
-        print(f"  {label} {i+1:>4d}/{n_iters}: {ms:>7.2f} ms   [{det_str}]")
+        # Left panel: BGR + green bbox.
+        overlay = bgr.copy()
+        if bbox is not None:
+            x1, y1, x2, y2 = bbox
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(overlay, args.target_class, (x1, max(0, y1 - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-        if mode == "folder":
-            vis = _draw_detections(frame, dets)
-            cv2.imwrite(str(out_dir / fpath.name), vis)
+        # Right panel: masked depth → metres → fixed [near, far] clip & normalise.
+        d_m = masked_depth.astype(np.float32) * args.depth_scale
+        near, far = float(args.clip[0]), float(args.clip[1])
+        invalid = d_m <= 0   # bbox-out pixels (fill_value=0) → render as black
+        norm = np.clip((d_m - near) / (far - near + 1e-6), 0, 1)
+        depth_u8 = (norm * 255).astype(np.uint8)
+        depth_u8[invalid] = 0
+        depth_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_INFERNO)
+        depth_color[invalid] = 0   # keep masked-out region cleanly black
+        if depth_color.shape[:2] != overlay.shape[:2]:
+            depth_color = cv2.resize(depth_color, (overlay.shape[1], overlay.shape[0]))
 
-    mean_ms = sum(latencies) / len(latencies)
-    min_ms  = min(latencies)
-    max_ms  = max(latencies)
-    std_ms  = (sum((x - mean_ms) ** 2 for x in latencies) / len(latencies)) ** 0.5
+        stacked = np.hstack([overlay, depth_color])
+        cv2.putText(stacked, f"{color_p.stem}  bbox={'hit' if bbox else 'MISS'}",
+                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.imwrite(str(out_dir / f"{color_p.stem}.jpg"), stacked, [cv2.IMWRITE_JPEG_QUALITY, 90])
 
-    print()
-    print("=" * 60)
-    print(f"  frames     : {len(latencies)}")
-    print(f"  mean  : {mean_ms:>7.2f} ms   ({1000/mean_ms:>5.1f} Hz)")
-    print(f"  min   : {min_ms:>7.2f} ms")
-    print(f"  max   : {max_ms:>7.2f} ms")
-    print(f"  std   : {std_ms:>7.2f} ms")
-    print("=" * 60)
+    total = n_hit + n_miss
+    if total:
+        print(f"\n  hits: {n_hit}  misses: {n_miss}  ({100.0 * n_hit / total:.1f}% detection rate)")
+    if latencies:
+        arr = np.asarray(latencies)
+        print(f"  latency mean={arr.mean():.2f} ms  p50={np.percentile(arr,50):.2f}  p95={np.percentile(arr,95):.2f}  max={arr.max():.2f}")
+    print(f"  written      : {out_dir}")
 
-    if mode == "single":
-        vis = _draw_detections(warmup_frame, last_dets)
-        cv2.imwrite(str(_OUT_PATH), vis)
-        print(f"\n  annotated image saved → {_OUT_PATH}")
-    else:
-        print(f"\n  annotated frames saved → {out_dir}")
-        import subprocess
-        video_path = out_dir.parent / (out_dir.name + ".mp4")
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-framerate", str(args.video_fps),
-            "-pattern_type", "glob", "-i", str(out_dir / "*.jpg"),
-            "-c:v", "libx264", "-pix_fmt", "yuv420p",
-            str(video_path),
-        ], check=True)
-        print(f"  video saved            → {video_path}  ({args.video_fps:.1f} fps)")
+    

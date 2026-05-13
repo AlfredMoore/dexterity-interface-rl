@@ -38,7 +38,8 @@ setup(
             'run_traj = robot_motion_interface_ros.node_run_traj:main',
             'replay_target_pregrasp = robot_motion_interface_ros.replay_target_np:main',
             'replay_target_policy = robot_motion_interface_ros.replay_target_torch:main',
-            'replay_action_torch = robot_motion_interface_ros.replay_action_torch:main'
+            'replay_action_torch = robot_motion_interface_ros.replay_action_torch:main',
+            'yolo_node = robot_motion_interface_ros.yolo_node:main',
         ],
     },
 )

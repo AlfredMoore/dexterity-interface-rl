@@ -83,15 +83,27 @@ def apply_sensor_settings(profile: rs.pipeline_profile, sensor_settings: dict) -
                 sensor.set_option(rs.option.gain, float(gain))
 
 
-def depth_to_colormap(depth_u16: np.ndarray, depth_scale: float) -> np.ndarray:
+def load_depth_clip(rs_cfg: dict) -> tuple[float, float]:
+    clip = rs_cfg.get("clip")
+    if not isinstance(clip, (list, tuple)) or len(clip) != 2:
+        raise ValueError(f"realsense.clip must be [min_m, max_m], got: {clip}")
+
+    clip_min, clip_max = float(clip[0]), float(clip[1])
+    if clip_min >= clip_max:
+        raise ValueError(f"realsense.clip min must be < max, got: {clip}")
+    return clip_min, clip_max
+
+
+def depth_to_colormap(
+    depth_u16: np.ndarray,
+    depth_scale: float,
+    depth_clip: tuple[float, float],
+) -> np.ndarray:
     """Convert raw uint16 depth to a false-colour BGR image for preview."""
     depth_m = depth_u16.astype(np.float32) * depth_scale
-    valid = depth_m > 0
-    if valid.any():
-        lo, hi = np.percentile(depth_m[valid], (2, 98))
-    else:
-        lo, hi = 0.0, 1.0
-    norm = np.clip((depth_m - lo) / (hi - lo + 1e-6), 0, 1)
+    clip_min, clip_max = depth_clip
+    depth_m = np.clip(depth_m, clip_min, clip_max)
+    norm = (depth_m - clip_min) / (clip_max - clip_min)
     return cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
 
 
@@ -144,6 +156,7 @@ def main():
     c_intr   = rs_cfg["color_intrinsics"]
     d_intr   = rs_cfg["depth_intrinsics"]
     sens_set = rs_cfg.get("sensor_settings", {})
+    depth_clip = load_depth_clip(rs_cfg)
 
     show_preview = not args.no_preview and bool(os.environ.get("DISPLAY"))
 
@@ -184,6 +197,7 @@ def main():
         f"  color  : {c_intr['width']}x{c_intr['height']}@{fps}fps\n"
         f"  depth  : {d_intr['width']}x{d_intr['height']}@{fps}fps\n"
         f"  depth_scale : {depth_scale}\n"
+        f"  depth_clip : [{depth_clip[0]}, {depth_clip[1]}] m\n"
         f"  output : {out_dir}\n"
         f"  preview: {'on' if show_preview else 'off'}\n"
         f"  duration: {args.duration}s max\n"
@@ -229,7 +243,7 @@ def main():
                 print(f"[frame {frame_idx:6d}]  t={t_capture:.3f}")
 
             if show_preview:
-                depth_vis = depth_to_colormap(depth, depth_scale)
+                depth_vis = depth_to_colormap(depth, depth_scale, depth_clip)
                 preview   = np.concatenate([color, depth_vis], axis=1)
                 cv2.imshow("Recording: RGB | Depth  (q to stop)", preview)
                 if cv2.waitKey(1) == ord("q"):
@@ -250,6 +264,7 @@ def main():
             "color_intrinsics": c_intr,
             "depth_intrinsics": d_intr,
             "T_color_depth": rs_cfg.get("T_color_depth"),
+            "depth_clip": [float(depth_clip[0]), float(depth_clip[1])],
             "fps": fps,
             "total_frames": frame_idx,
             "frames": timestamps,

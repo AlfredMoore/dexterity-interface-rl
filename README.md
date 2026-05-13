@@ -114,11 +114,6 @@ pip install --force-reinstall --no-deps --no-build-isolation -e .
 cd /workspace
 ```
 
-Import test
-```bash
-python /workspace/init/test_env.py
-```
-
 Realsense Test
 ```bash
 python -m robot_motion_interface.utils.realsense_test.py
@@ -145,10 +140,10 @@ Run Pre-grasp Sampling Modules
 cd /workspace
 # pinocchio and curobo test
 python -m robot_motion_interface.utils.kinematics
-# pre-grasp SE3 poses sampling
-python -m robot_motion_interface.utils.pose_sampler
-# home to a pre-grasp pose traj generation (this takes a long time to filter 50k joint poses)
-python -m robot_motion_interface.utils.traj_sampler
+# # pre-grasp SE3 poses sampling
+# python -m robot_motion_interface.utils.pose_sampler
+# # home to a pre-grasp pose traj generation (this takes a long time to filter 50k joint poses)
+# python -m robot_motion_interface.utils.traj_sampler
 ```
 
 ROS2 Build
@@ -161,7 +156,7 @@ cd /workspace
 
 Test Nodes
 ```bash
-# cv node
+ros2 run robot_motion_interface_ros yolo_node   # yolo masked depth map
 ros2 run robot_motion_interface_ros cv_node
 ```
 
@@ -171,6 +166,13 @@ export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 export ROS_STATIC_PEERS='192.168.4.4'
 ros2 run robot_motion_interface_ros test_curobo
 ```
+
+Play polict
+```bash
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export ROS_STATIC_PEERS='192.168.4.4'
+ros2 run robot_motion_interface_ros replay_target_pregrasp    # go to pre-grasp pose
+ros2 run robot_motion_interface_ros <policy node>
 
 Retargeting Nodes
 ```bash
@@ -185,8 +187,8 @@ Replay Traj
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 export ROS_STATIC_PEERS='192.168.4.4'
 ros2 run robot_motion_interface_ros replay_target_pregrasp    # go to pre-grasp pose
-ros2 run robot_motion_interface_ros replay_target_policy  # replay policy control target
-ros2 run robot_motion_interface_ros replay_action_torch
+ros2 run robot_motion_interface_ros replay_target_policy  # replay target <runtime>/actions_dones_targets.pt
+# ros2 run robot_motion_interface_ros replay_action_torch
 ```
 Attach to Policy Container
 ```bash
