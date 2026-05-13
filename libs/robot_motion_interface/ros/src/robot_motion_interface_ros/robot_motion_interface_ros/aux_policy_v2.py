@@ -523,6 +523,7 @@ class AuxPolicyNode(Node):
         self.dt = float(self.runtime_cfg["dt"])
         self.action_ema = float(self.runtime_cfg["action_EMA"])
         self.action_scale = float(self.runtime_cfg["action_scale"])
+        self.action_scale = 0.25
 
         timer_dt = 1.0 / self.policy_hz
         if abs(timer_dt - self.dt) > 1e-5:
@@ -614,6 +615,8 @@ class AuxPolicyNode(Node):
         actions_policy: torch.Tensor,        # [1, A] policy order
         prev_actions_policy: torch.Tensor,   # [1, A] policy order
         joint_pos_policy: torch.Tensor,      # [1, A] policy order
+        prev_targets_policy: torch.Tensor,
+        alpha: float = 0.5,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """EMA-smooth actions and integrate to next joint targets (policy order), clamped to soft limits."""
         ema_actions = (
@@ -621,7 +624,7 @@ class AuxPolicyNode(Node):
             + prev_actions_policy * (1.0 - self.action_ema)
         )
         next_targets_policy = torch.clamp(
-            joint_pos_policy + ema_actions * self.dt * self.full_scale_policy * self.action_scale,
+            joint_pos_policy * (1.0 - alpha) + prev_targets_policy * alpha + ema_actions * self.dt * self.full_scale_policy * self.action_scale,
             min=self.full_lower_policy,
             max=self.full_upper_policy,
         )
@@ -778,6 +781,7 @@ class AuxPolicyNode(Node):
             actions_policy=actions_policy,
             prev_actions_policy=self._prev_actions_snapshot_t,
             joint_pos_policy=self._joint_pos_policy_t,
+            prev_targets_policy=self._targets_snapshot_t,
         )
         self.targets_policy.copy_(next_targets_policy)
         self.prev_actions_policy.copy_(ema_actions_policy)

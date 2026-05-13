@@ -73,6 +73,14 @@ _DICT_CANDIDATES = [
 ]
 
 
+# ── Config + paths (same pattern as realsense_test.py / realsense_record.py) ─
+spec = importlib.util.find_spec("robot_motion_interface")
+if spec is None or spec.origin is None:
+    raise RuntimeError("Cannot locate robot_motion_interface")
+RMI_ROOT = Path(spec.origin).parent.parent.parent
+DEFAULT_CONFIG_PATH = RMI_ROOT / "config" / "realsense_config.yaml"
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -117,7 +125,39 @@ def _parse_args() -> argparse.Namespace:
         default=DEFAULT_WORLD_TAG_Z_ROT_DEG,
         help=f"World frame = tag frame rotated about +Z by this angle (default: {DEFAULT_WORLD_TAG_Z_ROT_DEG}).",
     )
+    parser.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH.resolve()),
+        help="Path to realsense_config.yaml.",
+    )
     return parser.parse_args()
+
+
+def _require_keys(config: dict, config_path: str) -> None:
+    required_keys = (
+        ("realsense",),
+        ("realsense", "rs_fps"),
+        ("realsense", "sensor_settings"),
+        ("realsense", "sensor_settings", "auto_exposure"),
+        ("realsense", "sensor_settings", "exposure"),
+        ("realsense", "sensor_settings", "gain"),
+        ("realsense", "color_intrinsics"),
+        ("realsense", "color_intrinsics", "width"),
+        ("realsense", "color_intrinsics", "height"),
+        ("realsense", "depth_intrinsics"),
+        ("realsense", "depth_intrinsics", "width"),
+        ("realsense", "depth_intrinsics", "height"),
+    )
+    missing = []
+    for key_path in required_keys:
+        node = config
+        for key in key_path:
+            if not isinstance(node, dict) or key not in node:
+                missing.append(".".join(key_path))
+                break
+            node = node[key]
+    if missing:
+        raise KeyError(f"Missing required key(s) in {config_path}: {', '.join(missing)}")
 
 
 ARGS = _parse_args()
@@ -142,24 +182,29 @@ PRINT_EVERY_N = max(1, int(ARGS.print_every_n))
 # World frame is the AR-tag frame rotated about its own +Z by this angle, then taken as origin.
 WORLD_TAG_Z_ROT_DEG = float(ARGS.world_tag_z_rot_deg)
 
-# ── Config + paths (mirrors realsense_test.py) ──────────────────────────────
-spec = importlib.util.find_spec("robot_motion_interface")
-if spec is None or spec.origin is None:
-    raise RuntimeError("Cannot locate robot_motion_interface")
-RMI_ROOT = Path(spec.origin).parent.parent.parent
-DEFAULT_CONFIG_PATH = RMI_ROOT / "config" / "rl_policy_node_config.yaml"
-
-config_path = str(DEFAULT_CONFIG_PATH.resolve())
+# ── Config ─────────────────────────────────────────────────────────────────
+config_path = str(Path(ARGS.config).expanduser().resolve())
 if not os.path.exists(config_path):
     raise FileNotFoundError(f"Config file not found at: {config_path}")
 with open(config_path, "r") as f:
     config = yaml.safe_load(f)
+if not isinstance(config, dict):
+    raise ValueError(f"Config root must be a dict: {config_path}")
+_require_keys(config, config_path)
 
 _rs_config = config["realsense"]
 _rs_fps = _rs_config["rs_fps"]
 _sensor_settings = _rs_config["sensor_settings"]
 _c_intrinsics = _rs_config["color_intrinsics"]
 _d_intrinsics = _rs_config["depth_intrinsics"]
+
+print(
+    "RealSense config loaded and validated:\n"
+    f"  path={config_path}\n"
+    f"  rs_fps={_rs_fps}\n"
+    f"  color={_c_intrinsics['width']}x{_c_intrinsics['height']}\n"
+    f"  depth={_d_intrinsics['width']}x{_d_intrinsics['height']}"
+)
 
 # ── RealSense init (mirrors realsense_test.py) ──────────────────────────────
 rs_pipeline = rs.pipeline()

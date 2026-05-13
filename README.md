@@ -58,7 +58,7 @@ docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/work
 
 Dependencies
 ```bash
-pip install torch==2.7.0 torch-tensorrt tensorrt --extra-index-url https://download.pytorch.org/whl/cu128
+# pip install torch==2.7.0 torch-tensorrt tensorrt --extra-index-url https://download.pytorch.org/whl/cu128
 
 cd /workspace/dep
 pip install -r requirements.txt

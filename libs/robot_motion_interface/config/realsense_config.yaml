@@ -1,0 +1,46 @@
+realsense:
+  metadata:
+    device: "Realsense"
+    calibration_date: "2026-02-04"
+    notes: "Factory intrinsics/extrinsics from RealSense SDK at 640x480@30fps."
+
+  # Frame ID for the RGB-D camera (used in RGBDFrame.frame_id)
+  frame_id: "realsense_optical_frame"
+
+  rs_fps: 30
+
+  color_intrinsics:
+    width: 640
+    height: 480
+    fx: 616.4124755859375
+    fy: 616.6586303710938
+    cx: 323.9004821777344
+    cy: 243.82867431640625
+    distortion: [0.0, 0.0, 0.0, 0.0, 0.0]
+    model: "distortion.inverse_brown_conrady"
+
+  depth_intrinsics:
+    width: 640
+    height: 480
+    fx: 384.34686279296875
+    fy: 384.34686279296875
+    cx: 319.1385192871094
+    cy: 245.74462890625
+    distortion: [0.0, 0.0, 0.0, 0.0, 0.0]
+    model: "distortion.brown_conrady"
+
+  # T_color_depth maps points from depth optical frame -> color optical frame
+  # 
+  T_color_depth:
+    - [0.9999594688415527, 0.008984118700027466, -0.0005908943712711334, 0.014804759062826633]
+    - [-0.008981939405202866, 0.9999532103538513, 0.003593327710404992, 0.00021137029398232698]
+    - [0.0006231495644897223, -0.003587874583899975, 0.9999933838844299, 0.0001671701029408723]
+    - [0.0, 0.0, 0.0, 1.0]
+
+  # Optional RealSense sensor settings (applied after pipeline start).
+  # exposure/gain are only applied when auto_exposure is false.
+  # exposure units are microseconds.
+  sensor_settings:
+    auto_exposure: false
+    exposure: 150
+    gain: 32

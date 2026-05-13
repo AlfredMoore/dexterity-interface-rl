@@ -28,7 +28,34 @@ if spec is None or spec.origin is None:
 RMI_ROOT     = Path(spec.origin).parent.parent.parent   # libs/robot_motion_interface/
 PROJECT_ROOT = RMI_ROOT.parent.parent                   # dexterity-interface-rl/
 
-DEFAULT_CONFIG_PATH = RMI_ROOT / "config" / "rl_policy_node_config.yaml"
+DEFAULT_CONFIG_PATH = RMI_ROOT / "config" / "realsense_config.yaml"
+
+
+def _require_keys(config: dict, config_path: str) -> None:
+    required_keys = (
+        ("realsense",),
+        ("realsense", "rs_fps"),
+        ("realsense", "sensor_settings"),
+        ("realsense", "sensor_settings", "auto_exposure"),
+        ("realsense", "sensor_settings", "exposure"),
+        ("realsense", "sensor_settings", "gain"),
+        ("realsense", "color_intrinsics"),
+        ("realsense", "color_intrinsics", "width"),
+        ("realsense", "color_intrinsics", "height"),
+        ("realsense", "depth_intrinsics"),
+        ("realsense", "depth_intrinsics", "width"),
+        ("realsense", "depth_intrinsics", "height"),
+    )
+    missing = []
+    for key_path in required_keys:
+        node = config
+        for key in key_path:
+            if not isinstance(node, dict) or key not in node:
+                missing.append(".".join(key_path))
+                break
+            node = node[key]
+    if missing:
+        raise KeyError(f"Missing required key(s) in {config_path}: {', '.join(missing)}")
 
 
 config_path: str = str(DEFAULT_CONFIG_PATH.resolve())
@@ -36,13 +63,23 @@ if not os.path.exists(config_path):
     raise FileNotFoundError(f"Config file not found at: {config_path}")
 with open(config_path, "r") as f:
     config = yaml.safe_load(f)
+if not isinstance(config, dict):
+    raise ValueError(f"Config root must be a dict: {config_path}")
+_require_keys(config, config_path)
 
-_infer_rate = config['infer_rate']
 _rs_config = config['realsense']
 _rs_fps = _rs_config['rs_fps']
 _sensor_settings = _rs_config['sensor_settings']
 _c_intrinsics = _rs_config['color_intrinsics']
 _d_intrinsics = _rs_config['depth_intrinsics']
+
+print(
+    "RealSense config loaded and validated:\n"
+    f"  path={config_path}\n"
+    f"  rs_fps={_rs_fps}\n"
+    f"  color={_c_intrinsics['width']}x{_c_intrinsics['height']}\n"
+    f"  depth={_d_intrinsics['width']}x{_d_intrinsics['height']}"
+)
 
 # RealSense
 rs_pipeline = rs.pipeline()

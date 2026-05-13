@@ -45,9 +45,9 @@ spec = importlib.util.find_spec("robot_motion_interface")
 if spec is None or spec.origin is None:
     raise RuntimeError("Cannot locate robot_motion_interface package")
 RMI_ROOT = Path(spec.origin).parent.parent.parent   # libs/robot_motion_interface/
-DEFAULT_CONFIG_PATH = RMI_ROOT / "config" / "rl_policy_node_config.yaml"
+DEFAULT_CONFIG_PATH = RMI_ROOT / "config" / "realsense_config.yaml"
 REPO_ROOT = RMI_ROOT.parent.parent   # root of the whole repository
-MODELS_ROOT = REPO_ROOT / "models"
+DATA_ROOT = REPO_ROOT / "data"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -104,12 +104,12 @@ def main():
     parser.add_argument(
         "--output", "-o",
         default=None,
-        help="Output directory. Defaults to /tmp/rs_record/<timestamp>.",
+        help="Output directory. Defaults to data/rs_record_<timestamp>.",
     )
     parser.add_argument(
         "--config",
         default=str(DEFAULT_CONFIG_PATH.resolve()),
-        help="Path to rl_policy_node_config.yaml",
+        help="Path to realsense_config.yaml",
     )
     parser.add_argument(
         "--no-preview",
@@ -128,7 +128,7 @@ def main():
     # Output directory
     if args.output is None:
         run_ts = time.strftime("%Y%m%d_%H%M%S")
-        out_dir = MODELS_ROOT / "data_examples" / "realsense" / f"rs_record_{run_ts}"
+        out_dir = DATA_ROOT / f"rs_record_{run_ts}"
     else:
         out_dir = Path(args.output)
 
