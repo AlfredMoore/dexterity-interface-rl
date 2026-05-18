@@ -16,10 +16,8 @@ Runs inside the handrl-policy docker. Press 'q' in the preview window or
 Ctrl-C in the terminal to stop.
 """
 
-import importlib.util
 import os
 import threading
-from pathlib import Path
 
 import cv2
 import numpy as np
@@ -31,27 +29,22 @@ from rclpy.node import Node
 from robot_motion_interface.utils.ultralytics_utils import YOLOBboxDepthMasker
 
 
-spec = importlib.util.find_spec("robot_motion_interface")
-if spec is None or spec.origin is None:
-    raise RuntimeError("Cannot locate robot_motion_interface package")
-RMI_ROOT = Path(spec.origin).parent.parent.parent
-DEFAULT_CONFIG_PATH = RMI_ROOT / "config" / "realsense_config.yaml"
+REALSENSE_CONFIG_PATH = "/workspace/libs/robot_motion_interface/config/realsense_config.yaml"
 
 
-class YoloNode(Node):
+class YoloNodeBBox(Node):
     def __init__(self):
-        super().__init__("yolo_node")
+        super().__init__("yolo_node_bbox_depth")
 
         # ── ROS parameters ──────────────────────────────────────────────────
-        self.declare_parameter("config_path", str(DEFAULT_CONFIG_PATH.resolve()))
         self.declare_parameter("variant", "n")
         self.declare_parameter("target_class", "bottle")
-        self.declare_parameter("conf", 0.25)
+        self.declare_parameter("conf", 0.10)
         self.declare_parameter("padding_ratio", 0.10)
         self.declare_parameter("clip_near", 0.1)
         self.declare_parameter("clip_far",  1.1)
 
-        config_path   = str(self.get_parameter("config_path").value)
+        config_path   = REALSENSE_CONFIG_PATH
         variant       = str(self.get_parameter("variant").value)
         target_class  = str(self.get_parameter("target_class").value)
         conf          = float(self.get_parameter("conf").value)
@@ -112,7 +105,7 @@ class YoloNode(Node):
         )
 
         self.get_logger().info(
-            f"YoloNode ready: rs={c_intr['width']}x{c_intr['height']}@{fps}fps  "
+            f"YoloNodeBBox ready: rs={c_intr['width']}x{c_intr['height']}@{fps}fps  "
             f"yolo26{variant}  target={target_class!r}  clip=[{self.clip_near}, {self.clip_far}]m"
         )
 
@@ -176,7 +169,7 @@ class YoloNode(Node):
 
 def main():
     rclpy.init()
-    node = YoloNode()
+    node = YoloNodeBBox()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

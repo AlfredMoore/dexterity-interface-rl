@@ -67,6 +67,10 @@ cd /workspace
 cd /workspace/dep/rsl_rl-HAND
 pip install -e .
 cd /workspace
+
+cd /workspace/dep/Grounded-SAM-2
+pip install -e .
+cd /workspace
 ```
 
 Depth-Anything-3-HAND

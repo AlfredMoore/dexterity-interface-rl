@@ -1,0 +1,17 @@
+gsam2:
+  prompt: "bottle."
+  sam2_variant: "s"                 # "t" | "s" | "b" | "l"
+  sam2_ckpt_path: "models/sam2/sam2.1_hiera_small.pt"
+  sam2_cache_dir: ""
+  grounding_model_id: "IDEA-Research/grounding-dino-tiny"
+  grounding_cache_dir: ""
+  device: "cuda"
+  detection_interval: 20
+  box_threshold: 0.25
+  text_threshold: 0.25
+  fill_value: 0.0
+  mask_dilation: 0
+
+preview:
+  clip_near: 0.1
+  clip_far: 1.1
