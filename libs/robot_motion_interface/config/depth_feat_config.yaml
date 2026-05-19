@@ -137,3 +137,7 @@ display:
 # is base64(pickle.dumps(tensor)). Mirrors cam_node's depth IPC pattern.
 ipc:
   handle_service_name: "/depth_feat_node/get_feature_handle"
+
+# Note: error on
+#   Cap pos:  x: 0.01 m, y: 0.04 m
+#   Body pos: x: 0.07 m, y: 0.02 m
