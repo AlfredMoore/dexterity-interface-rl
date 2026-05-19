@@ -22,11 +22,19 @@
 # Args feed directly into YOLOSegDepthMasker(__init__) in
 # robot_motion_interface/utils/ultralytics_utils.py.
 yolo_seg:
-  variant: "n"               # YOLO26-seg variant: n / s / m / l / x
+  variant: "s"               # YOLO26-seg variant: n / s / m / l / x
   target_class: "bottle"     # COCO class kept after segmentation
   conf: 0.05                 # detection confidence threshold
   mask_threshold: 0.5        # binarisation threshold on the soft mask
   mask_dilation: 0           # px; >0 to grow mask after binarisation
+
+
+# Pressure test on RTX 4090:
+#     n: 620MB VRAM, 6% utl, Det: Worst
+#     s: 680MB VRAM, 8% utl, Det: Good
+#     m: 820MB VRAM, 13% utl, Det: Mid
+#     l: 840MB VRAM, 16% utl, Det: Best
+#     x: 1.1GB VRAM, 23% utl, Det: Good
 
 # ---------------------------------------------------------------------------
 # Depth-feature network (inference)

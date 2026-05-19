@@ -53,6 +53,13 @@ RealSense settings (resolution / fps / intrinsics / exposure) are read from
 YOLO + DepthFeatureExtractor + FK link selection + IPC service name +
 inference_rate are read from
 `libs/robot_motion_interface/config/depth_feat_config.yaml`.
+
+Pressure test on RTX 4090
+    n: 625MB VRAM, 7%
+    s: 700MB VRAM, 9%
+    m: 850MB VRAM, 14%
+    l: 860MB VRAM, 18%
+    x: 1.1GB VRAM, 25%
 """
 
 from __future__ import annotations

@@ -13,10 +13,10 @@ RealSense settings (resolution / fps / intrinsics / exposure) are read from
 `libs/robot_motion_interface/config/realsense_config.yaml`.
 
 Pressure test on RTX 4090:
-    n: 620MB VRAM, 6% utl
-    s: 680MB VRAM, 8% utl
-    m: 820MB VRAM, 13% utl
-    l: 840MB VRAM, 16% utl
+    n: 620MB VRAM, 6% utl   Worst
+    s: 680MB VRAM, 8% utl   Good
+    m: 820MB VRAM, 13% utl  Mid
+    l: 840MB VRAM, 16% utl  Best
     x: 1.1GB VRAM, 23% utl
 
 Runs inside the handrl-policy docker. Press 'q' in the preview window or
