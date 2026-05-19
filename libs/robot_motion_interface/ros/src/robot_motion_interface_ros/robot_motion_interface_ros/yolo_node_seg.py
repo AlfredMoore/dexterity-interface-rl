@@ -79,12 +79,15 @@ class YoloNodeSeg(Node):
         profile = self.pipeline.start(rs_config)
         self.align = rs.align(rs.stream.color)
 
-        # Exposure / gain settings.
+        # Exposure / gain / emitter / laser_power.
         if sens_set:
-            auto_exposure = sens_set.get("auto_exposure", False)
-            exposure      = sens_set.get("exposure", 350)
-            gain          = sens_set.get("gain", 16)
+            auto_exposure   = sens_set.get("auto_exposure", False)
+            exposure        = sens_set.get("exposure", 350)
+            gain            = sens_set.get("gain", 16)
+            emitter_enabled = sens_set.get("emitter_enabled", None)
+            laser_power     = sens_set.get("laser_power", None)
             for sensor in profile.get_device().query_sensors():
+                sensor_name = sensor.get_info(rs.camera_info.name)
                 if sensor.supports(rs.option.enable_auto_exposure):
                     sensor.set_option(rs.option.enable_auto_exposure, 1.0 if auto_exposure else 0.0)
                 if not auto_exposure:
@@ -92,6 +95,25 @@ class YoloNodeSeg(Node):
                         sensor.set_option(rs.option.exposure, float(exposure))
                     if gain is not None and sensor.supports(rs.option.gain):
                         sensor.set_option(rs.option.gain, float(gain))
+                # Emitter / laser power live on the stereo sensor only;
+                # supports() filters color sensor automatically. laser_power
+                # is clamped to the sensor's reported range so the same yaml
+                # value works across D435 (max=360) / D405 (max=100) etc.
+                if emitter_enabled is not None and sensor.supports(rs.option.emitter_enabled):
+                    sensor.set_option(rs.option.emitter_enabled, float(emitter_enabled))
+                    self.get_logger().info(
+                        f"[{sensor_name}] emitter_enabled -> "
+                        f"{sensor.get_option(rs.option.emitter_enabled)}"
+                    )
+                if laser_power is not None and sensor.supports(rs.option.laser_power):
+                    lp_range = sensor.get_option_range(rs.option.laser_power)
+                    clamped = max(lp_range.min, min(float(laser_power), lp_range.max))
+                    sensor.set_option(rs.option.laser_power, clamped)
+                    self.get_logger().info(
+                        f"[{sensor_name}] laser_power -> "
+                        f"{sensor.get_option(rs.option.laser_power)} mW "
+                        f"(yaml={laser_power}, range {lp_range.min}..{lp_range.max})"
+                    )
 
         try:
             self.depth_scale = float(profile.get_device().first_depth_sensor().get_depth_scale())

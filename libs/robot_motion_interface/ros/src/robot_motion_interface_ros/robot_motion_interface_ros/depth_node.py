@@ -186,7 +186,10 @@ class DepthNode(Node):
         auto_exposure = sensor_settings.get("auto_exposure", False)
         exposure = sensor_settings.get("exposure")
         gain = sensor_settings.get("gain")
+        emitter_enabled = sensor_settings.get("emitter_enabled", None)
+        laser_power = sensor_settings.get("laser_power", None)
         for sensor in sensors:
+            sensor_name = sensor.get_info(rs.camera_info.name)
             if sensor.supports(rs.option.enable_auto_exposure):
                 sensor.set_option(rs.option.enable_auto_exposure, 1.0 if auto_exposure else 0.0)
             if not auto_exposure:
@@ -194,6 +197,25 @@ class DepthNode(Node):
                     sensor.set_option(rs.option.exposure, float(exposure))
                 if gain is not None and sensor.supports(rs.option.gain):
                     sensor.set_option(rs.option.gain, float(gain))
+            # Emitter / laser power live on the stereo sensor only; supports()
+            # filters color sensor automatically. laser_power is clamped to
+            # the sensor's reported range so the same yaml value works across
+            # D435 (max=360) / D405 (max=100) / L515 (max=200).
+            if emitter_enabled is not None and sensor.supports(rs.option.emitter_enabled):
+                sensor.set_option(rs.option.emitter_enabled, float(emitter_enabled))
+                self.get_logger().info(
+                    f"[{sensor_name}] emitter_enabled -> "
+                    f"{sensor.get_option(rs.option.emitter_enabled)}"
+                )
+            if laser_power is not None and sensor.supports(rs.option.laser_power):
+                lp_range = sensor.get_option_range(rs.option.laser_power)
+                clamped = max(lp_range.min, min(float(laser_power), lp_range.max))
+                sensor.set_option(rs.option.laser_power, clamped)
+                self.get_logger().info(
+                    f"[{sensor_name}] laser_power -> "
+                    f"{sensor.get_option(rs.option.laser_power)} mW "
+                    f"(yaml={laser_power}, range {lp_range.min}..{lp_range.max})"
+                )
 
     def _start_capture_thread(self) -> None:
         self._capture_running = True

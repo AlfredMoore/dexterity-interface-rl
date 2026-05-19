@@ -7,7 +7,7 @@ realsense:
   # Frame ID for the RGB-D camera (used in RGBDFrame.frame_id)
   frame_id: "realsense_optical_frame"
 
-  rs_fps: 30
+  rs_fps: 30  # 60hz is noisy at night, 30hz needs max emitter at night
 
   clip: [0.1, 1.1]
 
@@ -42,7 +42,16 @@ realsense:
   # Optional RealSense sensor settings (applied after pipeline start).
   # exposure/gain are only applied when auto_exposure is false.
   # exposure units are microseconds.
+  # emitter_enabled: 1 = IR laser projector on (mandatory for low-light /
+  #                     low-texture scenes — without it stereo matching has
+  #                     nothing to match against and depth noise explodes).
+  #                  0 = pure passive IR stereo.
+  # laser_power: mW. Clamped at runtime to the sensor's get_option_range
+  #              (D435 max=360, D405 max=100, L515 max=200) so the same value
+  #              is portable across hardware. 360 = max for our D4xx fleet.
   sensor_settings:
     auto_exposure: false
     exposure: 150
-    gain: 32
+    gain: 16
+    emitter_enabled: 1
+    laser_power: 360
