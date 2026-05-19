@@ -144,9 +144,6 @@ class DepthFeatNode(Node):
         self.fk_lock = threading.Lock()
         self.latest_color_bgr: np.ndarray | None = None
         self.latest_depth_u16: np.ndarray | None = None
-        # Throttle clock for the "YOLO target not detected" warn. Raw 30Hz
-        # spam would drown ros2 logs, so we rate-limit to ~1Hz.
-        self._last_miss_warn_ts = 0.0
 
         self._setup_realsense()
         self._setup_yolo()
@@ -576,14 +573,10 @@ class DepthFeatNode(Node):
             # Feeding that to DepthFeatureNetFiLM would produce a meaningless
             # pred and silently overwrite the IPC buffer; instead leave the
             # previous good feature in place so the policy can keep going.
-            # Throttled warn so 30Hz misses don't spam the log.
-            now = time.perf_counter()
-            if now - self._last_miss_warn_ts > 1.0:
-                self.get_logger().warn(
-                    "YOLO target not detected this frame — skipping depth-feature "
-                    "update; policy continues to consume the last good feature."
-                )
-                self._last_miss_warn_ts = now
+            self.get_logger().warn(
+                "YOLO target not detected this frame — skipping depth-feature "
+                "update; policy continues to consume the last good feature."
+            )
             # Still emit viz so the operator can see the all-black mask.
             if self.depth_vis_pub is not None:
                 self._publish_masked_depth(masked_depth)
@@ -591,7 +584,12 @@ class DepthFeatNode(Node):
 
         fk_t = self._assemble_fk_vector()
         if fk_t is None:
-            self._publish_masked_depth(masked_depth)
+            self.get_logger().warn(
+                f"No FK PoseArray received yet on '{self.fk_topic}' — "
+                f"skipping depth-feature update. Is fk_node running?"
+            )
+            if self.depth_vis_pub is not None:
+                self._publish_masked_depth(masked_depth)
             return
 
         try:

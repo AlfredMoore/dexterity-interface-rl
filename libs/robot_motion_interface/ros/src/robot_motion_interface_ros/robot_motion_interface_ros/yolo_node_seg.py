@@ -12,6 +12,13 @@ Pipeline (matches realsense_record.py order — filter THEN align):
 RealSense settings (resolution / fps / intrinsics / exposure) are read from
 `libs/robot_motion_interface/config/realsense_config.yaml`.
 
+Pressure test on RTX 4090:
+    n: 620MB VRAM, 6% utl
+    s: 680MB VRAM, 8% utl
+    m: 820MB VRAM, 13% utl
+    l: 840MB VRAM, 16% utl
+    x: 1.1GB VRAM, 23% utl
+
 Runs inside the handrl-policy docker. Press 'q' in the preview window or
 Ctrl-C in the terminal to stop.
 """
@@ -37,7 +44,7 @@ class YoloNodeSeg(Node):
         super().__init__("yolo_node_seg_depth")
 
         # ── ROS parameters ──────────────────────────────────────────────────
-        self.declare_parameter("variant", "n")
+        self.declare_parameter("variant", "s")
         self.declare_parameter("target_class", "bottle")
         self.declare_parameter("conf", 0.05)
         self.declare_parameter("mask_threshold", 0.5)

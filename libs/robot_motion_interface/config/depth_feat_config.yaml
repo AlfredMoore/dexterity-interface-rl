@@ -115,7 +115,7 @@ runtime:
 #                      data[i] subfield).
 display:
   publish_masked_depth: true                # Image vis toggle
-  masked_depth_topic: "/depth_feat_node/depth"   # Image topic for the preview
+  masked_depth_topic: "/depth_feat_node/masked_depth"   # Image topic for the preview
   publish_bottle_poses: true                # PoseArray vis toggle
   bottle_poses_topic: "/depth_feat_node/bottle_pose"  # PoseArray topic for body/cap pred
   publish_bottle_geom: true                 # Float32MultiArray vis toggle
