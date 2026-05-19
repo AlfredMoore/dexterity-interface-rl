@@ -1,0 +1,131 @@
+# Config for depth_feat_node.py — the combined YOLO segmentation + depth-feature
+# inference node. Two independent sub-systems live here:
+#
+#   yolo_seg       : runs YOLO26-seg on the live RealSense color frame, returns
+#                    a boolean mask of the target class. The mask is applied to
+#                    the aligned depth before depth-feature inference.
+#
+#   depth_feature  : runs DepthFeatureNetFiLM (see
+#                    libs/robot_motion_interface/src/robot_motion_interface/
+#                    utils/depth_feature.py) in inference mode on the masked
+#                    depth + FK conditioning vector. Output (10-d) is exposed
+#                    over CUDA IPC to depth_feat_policy_node via the trigger
+#                    service named in `ipc.handle_service_name`.
+#
+# The realsense pipeline / camera intrinsics still come from realsense_config.yaml
+# next to this file; the FK PoseArray topic + link order still comes from
+# fk_config.yaml. This file is only for the two pieces unique to this node.
+
+# ---------------------------------------------------------------------------
+# YOLO segmentation
+# ---------------------------------------------------------------------------
+# Args feed directly into YOLOSegDepthMasker(__init__) in
+# robot_motion_interface/utils/ultralytics_utils.py.
+yolo_seg:
+  variant: "n"               # YOLO26-seg variant: n / s / m / l / x
+  target_class: "bottle"     # COCO class kept after segmentation
+  conf: 0.05                 # detection confidence threshold
+  mask_threshold: 0.5        # binarisation threshold on the soft mask
+  mask_dilation: 0           # px; >0 to grow mask after binarisation
+
+# ---------------------------------------------------------------------------
+# Depth-feature network (inference)
+# ---------------------------------------------------------------------------
+# Must match the arch used at training time (train_depth_predictor.py).
+# The checkpoint (depth_net_*.pth) is picked up by _load_latest_checkpoint as
+# the most-recent .pth in `log_dir` — point it at the training run that
+# produced the deployed weights.
+depth_feature:
+  # network arch (mirror train_depth_predictor.py defaults)
+  backbone: "resnet10"       # resnet10 / resnet8 / resnet18
+  num_keypoints: 64          # # of soft keypoints after 1x1 conv
+  mlp_hidden: 256            # head MLP width
+  use_film: true             # FiLM conditioning on/off (must match training)
+  fk_dim: 24                 # 2 * (3 base + 3 fingers * 3) for 3-finger hand
+  film_hidden: 128           # FiLM generator trunk width
+  fk_embed_dim: 32           # FK late-concat embed dim (0 disables)
+  output_dim: 10             # bottleBodyPos(3) + bottleCapPos(3) + geom(4)
+  # depth preprocessing — must match training (DepthFeatureExtractorCfg.near/far)
+  near: 0.1                  # metres; closer than this -> clipped + ignored
+  far:  1.1                  # metres; farther than this -> clipped + ignored
+  # checkpoint
+  load_checkpoint: true
+  # Workspace-relative by default (resolves against /workspace inside docker,
+  # which is mounted at the dexterity-interface-rl repo root). Absolute host
+  # paths pass through unchanged — override here when the checkpoint lives
+  # outside the repo, e.g. on a mounted training output dir.
+  log_dir: "models/depth_predictor/latest"
+  # Optional pin to a specific .pth file. When set, takes precedence over the
+  # log_dir latest-pick logic (which selects best_val.pth in inference mode,
+  # or the largest-step file otherwise). Same resolution rules as log_dir —
+  # workspace-relative or absolute. Default null = scan log_dir.
+  checkpoint_path: null
+
+# ---------------------------------------------------------------------------
+# FK link selection
+# ---------------------------------------------------------------------------
+# The depth_feature net was trained with the FK vector laid out as
+#   [leftHandBasePos(3), rightHandBasePos(3),
+#    leftFingerTipsPos(F*3), rightFingerTipsPos(F*3)]
+# (see train_depth_predictor.py::build_fk). The link names below pick the
+# corresponding poses out of the PoseArray on fk_topic. They MUST be a subset
+# of fk_config.yaml::link_names — the names there carry the (left_/right_)
+# prefix added by fk_node. F per side must equal 3 to match fk_dim=24.
+fk:
+  left_hand_base_links:
+    - "left_delto_offset_link"
+  right_hand_base_links:
+    - "right_delto_offset_link"
+  left_fingertip_links:
+    - "left_F1_TIP_TOP"
+    - "left_F2_TIP_TOP"
+    - "left_F3_TIP_TOP"
+  right_fingertip_links:
+    - "right_F1_TIP_TOP"
+    - "right_F2_TIP_TOP"
+    - "right_F3_TIP_TOP"
+
+# ---------------------------------------------------------------------------
+# Runtime scheduling
+# ---------------------------------------------------------------------------
+# RealSense capture runs in a daemon thread at the camera's native rs_fps
+# (from realsense_config.yaml). The YOLO + DepthFeatureNetFiLM inference path
+# is decoupled onto a ROS timer at `inference_rate`, mirroring depth_node.py's
+# capture/DA3 split. Lowering this is the right knob if YOLO + the net can't
+# keep up with rs_fps.
+runtime:
+  inference_rate: 30.0       # Hz, ROS timer that drives YOLO + depth_feature
+
+# ---------------------------------------------------------------------------
+# Display
+# ---------------------------------------------------------------------------
+# Three debug streams:
+#   * masked_depth   — colormapped sensor_msgs/Image of the YOLO-masked depth,
+#                      viewable with rqt_image_view. Replaces cv2.imshow.
+#   * bottle_poses   — geometry_msgs/PoseArray with the network's two
+#                      predicted positions (body, cap) so RViz can overlay
+#                      them on the FK frames. Order: poses[0]=body, poses[1]=cap.
+#                      Orientation is identity — DepthFeatureNet only predicts
+#                      position; the policy derives 6D rot downstream from
+#                      (cap - body).
+#   * bottle_geom    — std_msgs/Float32MultiArray with the 4 predicted geom
+#                      dims in metres. data order:
+#                      [body_radius, body_height, cap_radius, cap_height].
+#                      Viewable with `ros2 topic echo` or rqt_plot (pick the
+#                      data[i] subfield).
+display:
+  publish_masked_depth: true                # Image vis toggle
+  masked_depth_topic: "/depth_feat_node/depth"   # Image topic for the preview
+  publish_bottle_poses: true                # PoseArray vis toggle
+  bottle_poses_topic: "/depth_feat_node/bottle_pose"  # PoseArray topic for body/cap pred
+  publish_bottle_geom: true                 # Float32MultiArray vis toggle
+  bottle_geom_topic: "/depth_feat_node/bottle_geom"  # Float32MultiArray topic for geom pred
+
+# ---------------------------------------------------------------------------
+# IPC (handed off to depth_feat_policy_node)
+# ---------------------------------------------------------------------------
+# A persistent (1, 10) float CUDA tensor is allocated at node start, updated in
+# place every inference step, and exposed via a Trigger service whose response
+# is base64(pickle.dumps(tensor)). Mirrors cam_node's depth IPC pattern.
+ipc:
+  handle_service_name: "/depth_feat_node/get_feature_handle"

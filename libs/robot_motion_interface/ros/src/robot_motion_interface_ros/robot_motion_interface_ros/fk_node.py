@@ -132,11 +132,15 @@ class FKNode(Node):
     def _joint_state_cb(self, msg: JointState) -> None:
         # self.get_logger().info("Received joint state update")
         if len(msg.position) != self.action_num:
-            self.get_logger().error(
-                f"/joint_states DoF mismatch: {len(msg.position)} vs pinocchio nq={self.action_num}"
+            # Fail loudly: URDF nq must match the driver's joint count, or FK
+            # mapping is wrong everywhere downstream. log+shutdown was too
+            # quiet; raise gives a clean stack trace at the boundary.
+            raise RuntimeError(
+                f"/joint_states DoF mismatch: msg.position has "
+                f"{len(msg.position)} entries, pinocchio nq={self.action_num}. "
+                f"URDF (fk_config.urdf_path) vs driver joint list drift — "
+                f"check rl_bimanual_driver_config.yaml against the URDF."
             )
-            rclpy.shutdown()
-            return
         pos_np = np.asarray(msg.position, dtype=np.float64)
         with self.joint_lock:
             np.copyto(self.latest_q, pos_np)
