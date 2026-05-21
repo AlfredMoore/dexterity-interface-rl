@@ -688,10 +688,13 @@ class BottleAprilTagNodeAllData(Node):
         self._publish_vis(vis)
 
         # ---- Buffer append ----
-        # apriltag_valid=0 for miss/filter-reject; the body/cap zeros are
-        # the explicit "no GT this frame" sentinel for offline pipelines
-        # (do NOT inherit last-good — that would manufacture fake GT).
-        apriltag_row = np.zeros(7, dtype=np.float32)
+        # On miss / filter-reject, body/cap fields are NaN (not zero) so any
+        # offline code that forgets to filter by valid==1 gets NaN-propagated
+        # losses immediately instead of silently training on (0,0,0). The
+        # leading valid flag stays a real number (0 or 1) so a `row[:, 0] == 1`
+        # mask still works for filtering.
+        apriltag_row = np.full(7, np.nan, dtype=np.float32)
+        apriltag_row[0] = 0.0
         if body_world is not None and cap_world is not None:
             apriltag_row[0]   = 1.0
             apriltag_row[1:4] = body_world
@@ -834,7 +837,10 @@ class BottleAprilTagNodeAllData(Node):
                 "fk_topic":             self.fk_topic,
                 "fk_link_names":        list(self.fk_link_names),
                 "apriltag_row_layout":  "[valid, body_x, body_y, body_z, cap_x, cap_y, cap_z]; "
-                                        "valid=0 rows have zero positions (NOT inherited from last-good).",
+                                        "valid=0 rows have NaN positions (NOT inherited from "
+                                        "last-good — NaN propagates so forgetting to filter "
+                                        "by valid==1 crashes the loss instead of silently "
+                                        "training on bad GT).",
                 "saved_at":             datetime.now().isoformat(),
             }
             with meta_path.open("w", encoding="utf-8") as f:

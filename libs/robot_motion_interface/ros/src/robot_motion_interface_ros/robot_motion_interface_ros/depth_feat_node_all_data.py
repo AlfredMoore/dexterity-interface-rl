@@ -890,10 +890,14 @@ class DepthFeatNode(Node):
             return
 
         # depth_feat_row holds the per-frame buffer entry: valid flag + the
-        # 10-d prediction. Stays as zeros (valid=0) when YOLO can't see the
-        # target; populated from a fresh pred otherwise. Same convention as
+        # 10-d prediction. On YOLO miss the pred fields are NaN (not zero) so
+        # any offline code that forgets to filter by valid==1 gets NaN-
+        # propagated losses immediately instead of silently training on
+        # (0,0,0). The leading valid flag stays a real number (0 or 1) so a
+        # `row[:, 0] == 1` mask still works for filtering. Same convention as
         # apriltag_row in bottle_apriltag_node_all_data.
-        depth_feat_row = np.zeros(11, dtype=np.float32)
+        depth_feat_row = np.full(11, np.nan, dtype=np.float32)
+        depth_feat_row[0] = 0.0
         pred_metres: torch.Tensor | None = None
 
         if bbox is None:
@@ -960,14 +964,17 @@ class DepthFeatNode(Node):
             self._publish_bottle_geom(pred_metres)
 
         # ── Cotrain rolling buffer append (after publish, so any inference
-        # / publish failure aborts before bookkeeping). Six aligned deques;
+        # / publish failure aborts before bookkeeping). Seven aligned deques;
         # everything stored is from this exact frame (same RealSense
         # wait_for_frames return). AprilTag is best-effort: a (7,) row
         # `[valid, body_xyz, cap_xyz]` — invalid frames still take a slot
-        # so the four "always-valid" modalities (rgb_hires/rgb_lores/depth/
-        # fk) stay length-aligned with apriltag/timestamp. Offline pipelines
-        # filter by `apriltag[:, 0] == 1` when they need GT-supervised rows.
-        apriltag_row = np.zeros(7, dtype=np.float32)
+        # so the always-valid modalities (rgb_hires/rgb_lores/depth/fk) stay
+        # length-aligned. Misses fill body/cap with NaN (not zero) so any
+        # offline code that forgets to filter by `apriltag[:, 0] == 1` gets
+        # NaN-propagated losses immediately instead of silently training on
+        # (0,0,0). The leading valid flag stays a real number for the mask.
+        apriltag_row = np.full(7, np.nan, dtype=np.float32)
+        apriltag_row[0] = 0.0
         apr_result = self._run_apriltag(color_hires)
         if apr_result is not None:
             body_world, cap_world = apr_result
@@ -1204,11 +1211,14 @@ class DepthFeatNode(Node):
                 "fk_topic":                self.fk_topic,
                 "fk_link_names":           list(self.fk_link_names),
                 "apriltag_row_layout":     "[valid, body_x, body_y, body_z, cap_x, cap_y, cap_z]; "
-                                           "valid=0 rows have zero positions.",
+                                           "valid=0 rows have NaN positions — NaN propagates so "
+                                           "forgetting to filter by valid==1 crashes the loss "
+                                           "instead of silently training on bad GT.",
                 "depth_feat_row_layout":   "[valid, body_x, body_y, body_z, cap_x, cap_y, cap_z, "
                                            "geom_body_r, geom_body_h, geom_cap_r, geom_cap_h]; "
                                            "valid=0 means YOLO missed target on that frame (IPC "
-                                           "buffer retained last-good, but this row is NOT GT).",
+                                           "buffer retained last-good, but this row's preds are "
+                                           "NaN — same propagation contract as apriltag).",
                 "saved_at":                datetime.now().isoformat(),
             }
             with meta_path.open("w", encoding="utf-8") as f:
