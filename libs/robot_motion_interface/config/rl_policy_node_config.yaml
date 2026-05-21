@@ -1,6 +1,6 @@
 # TODO: Align with RL HandEnv.yaml
 # fk_rate: 30
-infer_rate: 30
+infer_rate: 15
 
 policy_run_dir: "<rsl-rl run folder path>"
 

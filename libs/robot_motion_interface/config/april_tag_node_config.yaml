@@ -1,0 +1,93 @@
+# Config for bottle_apriltag_node.py.
+# Independent from depth_feat_config.yaml — the AprilTag node has nothing to
+# do with the depth_feat pipeline (no IPC, no FK, no NN). The RealSense
+# hardware parameters (sensor settings) still live in realsense_config.yaml
+# because they're shared across all camera-consuming nodes; the extrinsics
+# T_world_cam still lives in runtime/rs_config.yaml because it's shared with
+# the artag visualisation / collect scripts.
+
+# ---------------------------------------------------------------------------
+# AprilTag detection
+# ---------------------------------------------------------------------------
+apriltag:
+  dict: "DICT_APRILTAG_36h11"   # OpenCV ArUco dictionary name
+  tag_id: 0                     # Target tag id (single bottle, single id)
+  marker_size_m: 0.030          # Measured edge length (metres). Re-print +
+                                # re-measure with calipers if you change tags.
+
+# ---------------------------------------------------------------------------
+# Geometry — derive (body, cap) world poses from tag pose
+# ---------------------------------------------------------------------------
+# Each frame:
+#   tag_world  = T_world_tag[:3, 3] + pose_bias
+#   tag_z      = T_world_tag[:3, 2]                # bottle principal axis
+#   cap_world  = tag_world - cap_dz  * tag_z
+#   body_world = tag_world - body_dz * tag_z
+# Using tag_z (instead of world +Z) keeps the offsets aligned with the
+# bottle when it's tilted.
+#
+# cap_dz and body_dz are *derived* from bottle_geom (below), assuming the
+# tag is glued flat on the cap top:
+#   cap_dz  = cap_height / 2                  (tag center → cap center)
+#   body_dz = cap_height + body_height / 2    (tag center → body center)
+# Switch bottle_geom and both offsets update automatically — no manual
+# cap_dz / body_dz needed.
+geometry:
+  # World-frame additive bias on the tag position. Applied to tag_world
+  # before deriving cap/body, so cap and body both shift by the same vector.
+  # Use this to compensate for cali tag mounting offset (e.g. cali tag isn't
+  # perfectly flush with the tabletop, or world frame z=0 doesn't land on
+  # the tabletop). Small, calibration-time corrections live here. Units: m.
+  pose_bias_x: 0.0
+  pose_bias_y: 0.0
+  pose_bias_z: 0.02
+
+  # Frame conversion: lift the apriltag world frame (z=0 at tabletop) into
+  # the policy obs frame (z=0 at robot_base + workstation_top/2). This is
+  # a fixed property of the workstation geometry — it does NOT change with
+  # cali tag mounting, so we keep it separate from pose_bias_z for clarity.
+  #   workstation_top_z = 0.9144 + 0.045 / 2 = 0.93690    (see HandEnv.yaml)
+  # cap_world.z and body_world.z each get this constant added after the
+  # cap_dz / body_dz subtraction along tag +z, so cap and body end up in
+  # the same vertical frame the policy was trained in.
+  workstation_top_z: 0.93690
+
+# ---------------------------------------------------------------------------
+# Static bottle geometry override
+# ---------------------------------------------------------------------------
+# Published verbatim every frame on geom_topic. Used by downstream consumers
+# (e.g. policy obs that expects bottleGeomCfg). Bottle dimensions don't
+# change across poses, so a static value beats noisy NN prediction here.
+# Order: [body_radius, body_height, cap_radius, cap_height], metres.
+
+# bottle_geom: [0.04, 0.16, 0.029, 0.02]  # green bottle
+bottle_geom: [0.04, 0.12, 0.04, 0.03]  # 3D bottle
+
+# ---------------------------------------------------------------------------
+# Robustness filters (mirror image / sudden flip)
+# ---------------------------------------------------------------------------
+# Reject a PnP solution when:
+#   * tag_z_world.z < 0           → IPPE_SQUARE mirror artefact
+#   * dot(tag_z, prev_tag_z) < 0  → sudden axis flip vs the last accepted frame
+# Both filters drop the frame silently (a warn is logged); the next valid
+# detection resumes publishing.
+filters:
+  reject_z_below_horizon: true
+  reject_sudden_flip:     true
+
+# ---------------------------------------------------------------------------
+# Output topics + frame
+# ---------------------------------------------------------------------------
+output:
+  world_frame_id: "world"                     # PoseArray header.frame_id
+
+  publish_poses: true
+  poses_topic: "/bottle_apriltag/poses"       # geometry_msgs/PoseArray [body, cap]
+
+  publish_geom: true
+  geom_topic: "/bottle_apriltag/geom"         # std_msgs/Float32MultiArray
+
+  enable_vis: true                            # master switch for the Image vis topic.
+                                              # Pose / geom always publish — only the
+                                              # color+axes preview is gated by this.
+  vis_topic: "/bottle_apriltag/vis"           # sensor_msgs/Image (color + axes)

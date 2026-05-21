@@ -102,6 +102,31 @@ REALSENSE_CONFIG_PATH = "libs/robot_motion_interface/config/realsense_config.yam
 DEPTH_FEAT_CONFIG_PATH = "libs/robot_motion_interface/config/depth_feat_config.yaml"
 FK_CONFIG_PATH = "libs/robot_motion_interface/config/fk_config.yaml"
 
+# # ── LSQ compensation for body/cap (fitted offline, 40 samples) ──────────
+# # corrected_pos = pred_pos @ _LSQ_W + _LSQ_B
+# # Input/output layout: [body_x, body_y, body_z, cap_x, cap_y, cap_z] m,
+# # in the policy obs frame (z=0 at tabletop + workstation_top/2).
+# # Mean residual ≈ 1.88 cm; see libs/.../utils/lsq.py to re-fit when the
+# # bottle / camera mount / training run changes.
+# _LSQ_W = np.array([
+#     [ 0.34887896641805943,  0.5759479808107646,   0.06614204741424203,  0.34887896641805943,  0.575947980810764,    0.06614182648443188 ],
+#     [-0.3973368369406706,   0.8405134497492819,   0.01997501091804399, -0.3973368369406706,   0.8405134497492821,   0.019975154132943485],
+#     [ 2.2356774912943127,   0.2701747221227452,   0.03863010411512774,  2.2356774912943127,   0.270174722122746,    0.03863030075067703 ],
+#     [ 1.499541154062977,   -0.5197405499934648,  -0.03657934233377573,  1.499541154062977,   -0.5197405499934643,  -0.0365791896497728  ],
+#     [ 0.02313018766017715,  0.7080967439829899,  -0.05670362713046395,  0.02313018766017715,  0.7080967439829897,  -0.056703724825511594],
+#     [-1.3527293168223906,   0.6504247049806191,   0.04017506682628019, -1.3527293168223906,   0.650424704980618,    0.040174965768886906],
+# ], dtype=np.float32)
+# _LSQ_B = np.array([
+#     -0.9315139006546089, -0.9493223558367246, 0.8603479782973352,
+#     -0.9315139006546089, -0.9493223558367241, 0.9558478742668937,
+# ], dtype=np.float32)
+
+# # ── Geom override (predictor's geom branch is too noisy in real, override
+# # with the measured value of the specific bottle in use). Order matches
+# # train_depth_predictor.py geom slab:
+# #     [body_radius, body_height, cap_radius, cap_height]  metres
+# _GEOM_OVERRIDE = np.array([0.04, 0.16, 0.029, 0.02], dtype=np.float32)
+
 
 def _resolve_workspace_path(value: object) -> Path:
     """Resolve relative paths against /workspace; pass absolute paths through."""
@@ -423,6 +448,12 @@ class DepthFeatNode(Node):
         self.extractor = DepthFeatureExtractor(
             self._extractor_cfg, output_dim=self.output_dim, device=self.device
         )
+        
+        # # Cache LSQ W/b and geom override on the inference device so the hot
+        # # path is pure tensor math.
+        # self._lsq_W = torch.from_numpy(_LSQ_W).to(self.device)              # (6, 6)
+        # self._lsq_B = torch.from_numpy(_LSQ_B).to(self.device)              # (6,)
+        # self._geom_override = torch.from_numpy(_GEOM_OVERRIDE).to(self.device)  # (4,)
 
     def _setup_fk_state(self) -> None:
         fk_sel = self._cfg["fk"]
@@ -620,6 +651,13 @@ class DepthFeatNode(Node):
             # Un-normalize the geom slab so the IPC buffer is uniformly in metres.
             pred_metres = pred.clone()
             pred_metres[..., 6:10] = self.extractor.un_preprocess_geom(pred[..., 6:10])
+
+            # # (a) LSQ-compensate body+cap (6-d affine fitted from real apriltag data).
+            # pred_metres[..., 0:6] = pred_metres[..., 0:6] @ self._lsq_W + self._lsq_B
+
+            # # (b) Override the geom slab — predictor's geom branch is too noisy in real.
+            # # Broadcast (4,) into (1, 4) row. If pred has batch > 1 this also broadcasts.
+            # pred_metres[..., 6:10] = self._geom_override
             # In-place into the IPC-shared buffer; consumers read this same
             # GPU memory.
             self.feature_buffer.copy_(pred_metres, non_blocking=True)

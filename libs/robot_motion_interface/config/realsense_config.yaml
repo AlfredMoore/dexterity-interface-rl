@@ -7,13 +7,13 @@ realsense:
   # Frame ID for the RGB-D camera (used in RGBDFrame.frame_id)
   frame_id: "realsense_optical_frame"
 
-  rs_fps: 30  # 60hz is noisy at night, 30hz needs max emitter at night
+  rs_fps: 60  # 60hz is noisy at night, 30hz needs max emitter at night
 
   clip: [0.1, 1.1]
 
   color_intrinsics:
-    width: 320 # 640
-    height: 240 # 480
+    width: 640
+    height: 480
     fx: 616.4124755859375
     fy: 616.6586303710938
     cx: 323.9004821777344
