@@ -66,10 +66,12 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import sys
 import threading
 import time
 from collections import deque
+from datetime import datetime
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import Any
@@ -106,57 +108,40 @@ FK_CONFIG_PATH = "libs/robot_motion_interface/config/fk_config.yaml"
 APRILTAG_CONFIG_PATH = "libs/robot_motion_interface/config/april_tag_node_config.yaml"
 EXTRINSICS_CONFIG_PATH = "libs/robot_motion_interface/runtime/rs_config.yaml"
 
-# ── Collect-mode constants ─────────────────────────────────────────────────
-# Shared with realsense_apriltag_collect.py — the two scripts append rows
-# alternately to the same data.npy. Same row index in both halves means
-# "same bottle pose" (user is responsible for the ordering).
-_BUFFER_SIZE = 10
-_OUT_NPY = WORKSPACE_ROOT / "data" / "apriltag_depthfeat_collect" / "data.npy"
-_REQUIRED_KEYS = ("depth_feat_body", "depth_feat_cap", "apriltag_body", "apriltag_cap")
+# ── Cotrain collect-mode constants ─────────────────────────────────────────
+# Each "sample" = the last _ROLLING_BUFFER_SIZE frames before the user pressed
+# Enter, dumped to a timestamped subdir of _OUT_DIR. ~10s @ 30 Hz captures
+# enough lead-up + reaction frames for the offline fine-tune pipelines:
+#   * seg model finetune  → uses 640x480 rgb (+ optional 320x240 mask later)
+#   * state estimation finetune → uses 320x240 depth + 320x240 rgb + fk
+#                                  + apriltag world gt
+_ROLLING_BUFFER_SIZE = 300
+_OUT_DIR = WORKSPACE_ROOT / "data" / "cotrain"
 
+# # ── LSQ compensation for body/cap (fitted offline, 40 samples) ──────────
+# # corrected_pos = pred_pos @ _LSQ_W + _LSQ_B
+# # Input/output layout: [body_x, body_y, body_z, cap_x, cap_y, cap_z] m,
+# # in the policy obs frame (z=0 at tabletop + workstation_top/2).
+# # Mean residual ≈ 1.88 cm; see libs/.../utils/lsq.py to re-fit when the
+# # bottle / camera mount / training run changes.
+# _LSQ_W = np.array([
+#     [ 0.34887896641805943,  0.5759479808107646,   0.06614204741424203,  0.34887896641805943,  0.575947980810764,    0.06614182648443188 ],
+#     [-0.3973368369406706,   0.8405134497492819,   0.01997501091804399, -0.3973368369406706,   0.8405134497492821,   0.019975154132943485],
+#     [ 2.2356774912943127,   0.2701747221227452,   0.03863010411512774,  2.2356774912943127,   0.270174722122746,    0.03863030075067703 ],
+#     [ 1.499541154062977,   -0.5197405499934648,  -0.03657934233377573,  1.499541154062977,   -0.5197405499934643,  -0.0365791896497728  ],
+#     [ 0.02313018766017715,  0.7080967439829899,  -0.05670362713046395,  0.02313018766017715,  0.7080967439829897,  -0.056703724825511594],
+#     [-1.3527293168223906,   0.6504247049806191,   0.04017506682628019, -1.3527293168223906,   0.650424704980618,    0.040174965768886906],
+# ], dtype=np.float32)
+# _LSQ_B = np.array([
+#     -0.9315139006546089, -0.9493223558367246, 0.8603479782973352,
+#     -0.9315139006546089, -0.9493223558367241, 0.9558478742668937,
+# ], dtype=np.float32)
 
-def _load_or_init_dataset(path: Path) -> dict[str, np.ndarray]:
-    if path.exists():
-        data = np.load(path, allow_pickle=True).item()
-        for k in _REQUIRED_KEYS:
-            if k not in data:
-                data[k] = np.zeros((0, 3), dtype=np.float32)
-        return data
-    return {k: np.zeros((0, 3), dtype=np.float32) for k in _REQUIRED_KEYS}
-
-
-def _append_row(data: dict[str, np.ndarray], key: str, vec3: np.ndarray) -> None:
-    data[key] = np.vstack([data[key], vec3.reshape(1, 3).astype(np.float32)])
-
-
-def _append_or_override(
-    data: dict[str, np.ndarray],
-    my_keys: tuple[str, str],
-    partner_keys: tuple[str, str],
-    vecs: tuple[np.ndarray, np.ndarray],
-) -> str:
-    """Append (vec[0], vec[1]) to my_keys, or overwrite the last row if my
-    side is already ahead of partner's side. See the matching helper in
-    realsense_apriltag_collect.py for the full alignment rationale.
-    """
-    n_self = len(data[my_keys[0]])
-    n_partner = len(data[partner_keys[0]])
-    if n_self > n_partner:
-        data[my_keys[0]][-1] = vecs[0].reshape(3).astype(np.float32)
-        data[my_keys[1]][-1] = vecs[1].reshape(3).astype(np.float32)
-        return "overwritten"
-    _append_row(data, my_keys[0], vecs[0])
-    _append_row(data, my_keys[1], vecs[1])
-    return "appended"
-
-
-def _save_dataset(path: Path, data: dict[str, np.ndarray]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # np.save accepts a pickled dict at runtime (allow_pickle=True), but the
-    # type stub only types it as ArrayLike — wrap the dict in a 0-d object
-    # array so static checkers are happy. np.load(..., allow_pickle=True).item()
-    # round-trips back to the original dict.
-    np.save(str(path), np.array(data, dtype=object), allow_pickle=True)
+# # ── Geom override (predictor's geom branch is too noisy in real, override
+# # with the measured value of the specific bottle in use). Order matches
+# # train_depth_predictor.py geom slab:
+# #     [body_radius, body_height, cap_radius, cap_height]  metres
+# _GEOM_OVERRIDE = np.array([0.04, 0.16, 0.029, 0.02], dtype=np.float32)
 
 
 def _resolve_workspace_path(value: object) -> Path:
@@ -207,32 +192,41 @@ class DepthFeatNode(Node):
         self.fk_lock = threading.Lock()
         self.latest_color_bgr: np.ndarray | None = None
         self.latest_depth_u16: np.ndarray | None = None
-        # Hires color (capture resolution, e.g. 640x480) — kept around so the
-        # AprilTag detector runs on high-resolution PnP-quality input while
-        # the policy / YOLO / depth_feat use the downsampled 320x240 path.
+        # Hires color (capture resolution, e.g. 640x480) kept around so the
+        # apriltag PnP path and the seg-finetune data collection both get
+        # full-resolution input. Stored alongside the 320x240 policy view
+        # under the same vision_lock so they're guaranteed same-frame.
         self.latest_color_hires: np.ndarray | None = None
 
-        # Collect-mode rolling buffers — filled per inference step *only when
-        # both apriltag detect AND depth_feat predict succeed*, so the two
-        # halves of data.npy stay row-aligned automatically (no need for the
-        # partner sync logic in _append_or_override).
-        self._body_buf: deque = deque(maxlen=_BUFFER_SIZE)
-        self._cap_buf: deque = deque(maxlen=_BUFFER_SIZE)
-        self._apriltag_body_buf: deque = deque(maxlen=_BUFFER_SIZE)
-        self._apriltag_cap_buf: deque = deque(maxlen=_BUFFER_SIZE)
-        # Buffer lock — protects the four collect deques against concurrent
-        # writes (inference_step) and reads-then-clear (stdin enter handler).
-        self._buffer_lock = threading.Lock()
-        # Filter state for apriltag detection (same convention as
-        # bottle_apriltag_node — last accepted tag-z in world frame).
+        # ── Cotrain rolling buffers ────────────────────────────────────
+        # Six aligned deques, one per data stream, all maxlen=300. Every
+        # inference tick appends one entry to *each* deque, so an integer
+        # index i refers to the same physical frame across all six.
+        # On Enter the entire deque content is dumped to a timestamped
+        # subdir of _OUT_DIR — see _handle_save_trigger.
+        self._rolling_lock         = threading.Lock()
+        self._rgb_hires_buf:  deque = deque(maxlen=_ROLLING_BUFFER_SIZE)  # (480,640,3) uint8
+        self._rgb_lores_buf:  deque = deque(maxlen=_ROLLING_BUFFER_SIZE)  # (240,320,3) uint8
+        self._depth_buf:      deque = deque(maxlen=_ROLLING_BUFFER_SIZE)  # (240,320)   uint16
+        self._fk_buf:         deque = deque(maxlen=_ROLLING_BUFFER_SIZE)  # (24,)       float32
+        self._apriltag_buf:   deque = deque(maxlen=_ROLLING_BUFFER_SIZE)  # (7,)        float32 [valid, b.xyz, c.xyz]
+        # depth_feat row layout: [valid, body_xyz(3), cap_xyz(3), geom(4)] —
+        # 11 floats matching the IPC tensor with a leading valid flag. When
+        # YOLO doesn't detect the target, the IPC buffer keeps its last-good
+        # value (so the policy doesn't stutter) but the recorded row here is
+        # zeros with valid=0, so offline pipelines never train on stale preds.
+        self._depth_feat_buf: deque = deque(maxlen=_ROLLING_BUFFER_SIZE)  # (11,)       float32 [valid, body, cap, geom]
+        self._timestamp_buf:  deque = deque(maxlen=_ROLLING_BUFFER_SIZE)  # ()          float64 unix-s
+        # Apriltag filter state (same convention as bottle_apriltag_node).
         self._prev_tag_z_world: np.ndarray | None = None
-
-        # Enter-key triggered save: a daemon thread blocks on stdin; each
-        # newline triggers one dump-then-clear-buffer cycle, so a single
-        # node run can collect many bottle poses without re-launching.
-        # See _stdin_listener_loop / _handle_save_trigger.
+        # Stdin listener: each Enter triggers one full-buffer save. Daemon
+        # thread, no clean shutdown needed (readline can't be interrupted
+        # cross-thread but the process exit terminates it).
         self._stdin_running: bool = True
         self._stdin_thread: threading.Thread | None = None
+        # Monotonically increasing sample counter — used to log "you've saved
+        # N samples so far".
+        self._save_counter: int = 0
 
         self._setup_realsense()
         self._setup_yolo()
@@ -252,7 +246,7 @@ class DepthFeatNode(Node):
         self._init_handle_service()
 
         self.get_logger().info(
-            f"DepthFeatNode ready:\n"
+            f"DepthFeatNode (all_data) ready:\n"
             f"  rs        = {self.rs_color_width}x{self.rs_color_height}@{int(self.capture_hz)}Hz "
             f"-> {self.policy_width}x{self.policy_height} (CPU resize)\n"
             f"  inf_rate  = {self.inference_hz}Hz\n"
@@ -263,21 +257,25 @@ class DepthFeatNode(Node):
             f"  ckpt_dir  = {self._extractor_cfg.log_dir}\n"
             f"  fk_topic  = {self.fk_topic}  ({self.fk_n_links} links)\n"
             f"  ipc_svc   = {self.ipc_service_name}\n"
-            f"  apriltag  = {self.apriltag_dict_name} id={self.target_tag_id} size={self.marker_size_m*1000:.1f}mm "
-            f"(collect-mode parallel detect on hires color)\n"
+            f"  apriltag  = {self.apriltag_dict_name} id={self.target_tag_id} "
+            f"size={self.marker_size_m*1000:.1f}mm "
+            f"(detect on hires color for cotrain dataset)\n"
             f"  apr_offsets = cap-{self.cap_dz*1000:.1f}mm  body-{self.body_dz*1000:.1f}mm "
             f"(derived from bottle_geom)\n"
             f"  apr_z_lift  = pose_bias_z={self.pose_bias[2]*1000:+.1f}mm + "
-            f"workstation_top_z={self.workstation_top_z:+.5f}m  "
-            f"→ apriltag body/cap z already in policy frame"
+            f"workstation_top_z={self.workstation_top_z:+.5f}m\n"
+            f"  cotrain   = rolling buffer {_ROLLING_BUFFER_SIZE} frames "
+            f"(~{_ROLLING_BUFFER_SIZE / max(self.inference_hz, 1e-3):.1f}s @ {self.inference_hz:.0f}Hz), "
+            f"out_dir={_OUT_DIR}"
         )
 
-        # Start the stdin listener LAST so its prompt prints below the ready
-        # banner, not interleaved with setup logs.
+        # Stdin listener LAST so its prompt prints below the ready banner.
         self._start_stdin_listener()
         self.get_logger().info(
-            "[collect] press ENTER to save one sample (buffer mean → data.npy); "
-            "Ctrl-C to exit without saving."
+            "[cotrain] press ENTER to save the last "
+            f"{_ROLLING_BUFFER_SIZE} frames (~380 MB / sample) to "
+            f"{_OUT_DIR}/sample_<timestamp>/data.npz; Ctrl-C to exit "
+            f"(no auto-save on exit)."
         )
 
     # ------------------------------------------------------------------
@@ -326,20 +324,21 @@ class DepthFeatNode(Node):
         self.target_tag_id      = int(at_cfg["tag_id"])
         self.marker_size_m      = float(at_cfg["marker_size_m"])
 
-        # ---- Static bottle geom override (also used to derive cap_dz/body_dz) ----
+        # ---- Static bottle geom (used to derive cap_dz / body_dz) ----
         bg = apriltag_cfg["bottle_geom"]
         if len(bg) != 4:
             raise ValueError(
-                f"bottle_geom must be a 4-element list [body_radius, body_height, "
-                f"cap_radius, cap_height]; got {bg}"
+                f"bottle_geom must be [body_radius, body_height, cap_radius, "
+                f"cap_height]; got {bg}"
             )
         self._apriltag_bottle_geom = np.array(bg, dtype=np.float32)
         body_h = float(self._apriltag_bottle_geom[1])
         cap_h  = float(self._apriltag_bottle_geom[3])
+        # Tag glued flat on cap top → walk along tag +z to reach each center.
         self.cap_dz  = cap_h / 2.0
         self.body_dz = cap_h + body_h / 2.0
 
-        # ---- Geometry offsets / biases ----
+        # ---- Geometry biases ----
         geom_cfg = apriltag_cfg.get("geometry", {})
         self.pose_bias = np.array(
             [
@@ -351,12 +350,12 @@ class DepthFeatNode(Node):
         )
         self.workstation_top_z = float(geom_cfg.get("workstation_top_z", 0.0))
 
-        # ---- Filters ----
+        # ---- Apriltag filters ----
         filt_cfg = apriltag_cfg.get("filters", {})
         self.reject_z_below_horizon = bool(filt_cfg.get("reject_z_below_horizon", True))
         self.reject_sudden_flip     = bool(filt_cfg.get("reject_sudden_flip",     True))
 
-        # ---- Extrinsics (T_world_cam) ----
+        # ---- Extrinsics ----
         if "T_world_cam" not in ext_cfg:
             raise KeyError(
                 f"{self.extrinsics_config_path} has no T_world_cam — re-run "
@@ -451,9 +450,8 @@ class DepthFeatNode(Node):
                 f"data at the new scale or pick a sensor with depth_scale=1e-3."
             )
 
-        # AprilTag PnP needs camera intrinsics K (and distortion). Take them
-        # live from the device — they match whatever resolution we actually
-        # configured the color stream at (capture res, not policy res).
+        # Apriltag PnP intrinsics K + distortion — taken live from the device
+        # so they match the actual capture stream (hires, e.g. 640x480).
         color_profile = rs_profile.get_stream(rs.stream.color).as_video_stream_profile()
         intr = color_profile.get_intrinsics()
         self._K = np.array(
@@ -542,13 +540,10 @@ class DepthFeatNode(Node):
 
             # SDK gave us frames at capture resolution (e.g. 640x480) — that
             # high pixel count was needed by decimation / hole_filling / align
-            # above. Stash a hires color copy for AprilTag PnP (it needs the
-            # extra pixels), then downsample to the policy input size for
-            # YOLO + depth_feat.
+            # above, and we keep an owned copy for the apriltag PnP path +
+            # the cotrain seg-finetune dataset.
             color_hires_view = np.asanyarray(color_frame.get_data())
             depth_hires_view = np.asanyarray(depth_frame.get_data())
-            # Always materialise an owned copy of hires color so AprilTag can
-            # read it after the SDK frame is released.
             color_hires_owned = color_hires_view.copy()
             if (color_hires_view.shape[0] != self.policy_height or
                     color_hires_view.shape[1] != self.policy_width):
@@ -587,10 +582,9 @@ class DepthFeatNode(Node):
                 time.sleep(sleep_s)
 
     # ------------------------------------------------------------------
-    # YOLO seg + DepthFeatureExtractor
-    # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
-    # AprilTag detector (mirrors bottle_apriltag_node._setup_apriltag)
+    # AprilTag detector (mirrors bottle_apriltag_node._setup_apriltag /
+    # _run_apriltag, kept inline because we don't want a cross-node
+    # dependency for offline cotrain data collection).
     # ------------------------------------------------------------------
     def _setup_apriltag(self) -> None:
         dict_id = getattr(cv2.aruco, self.apriltag_dict_name, None)
@@ -622,12 +616,13 @@ class DepthFeatNode(Node):
         )
 
     def _run_apriltag(self, color_hires: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
-        """Detect AprilTag in `color_hires`, run PnP, lift to world frame +
-        apply biases, return (body_world, cap_world) in metres.
+        """Detect AprilTag on hires color, PnP, lift to policy world frame.
 
-        Returns None on detection miss, PnP failure, or filter rejection.
-        Mirrors bottle_apriltag_node._process_frame's logic (minus the
-        publishing side effects).
+        Returns (body_world, cap_world) in metres, both already z-lifted by
+        workstation_top_z + pose_bias so the numbers are directly comparable
+        to the policy obs frame. Returns None on detect miss / PnP fail /
+        mirror-solution filter / sudden-flip filter (each branch is the
+        same as bottle_apriltag_node).
         """
         gray = cv2.cvtColor(color_hires, cv2.COLOR_BGR2GRAY)
         if self._use_new_aruco_api and self._aruco_detector is not None:
@@ -655,30 +650,30 @@ class DepthFeatNode(Node):
         T_cam_tag[:3, 3] = tvec.reshape(3)
         T_world_tag = self._T_world_cam @ T_cam_tag
 
-        tag_world  = T_world_tag[:3, 3] + self.pose_bias
+        tag_world   = T_world_tag[:3, 3] + self.pose_bias
         tag_z_world = T_world_tag[:3, 2]
-        norm = np.linalg.norm(tag_z_world)
+        norm = float(np.linalg.norm(tag_z_world))
         if norm < 1e-9:
             return None
         tag_z_world = tag_z_world / norm
 
-        # Filter 1: PnP mirror solution
         if self.reject_z_below_horizon and tag_z_world[2] < 0.0:
             return None
-        # Filter 2: sudden flip vs last accepted axis
         if (self.reject_sudden_flip and self._prev_tag_z_world is not None
                 and float(np.dot(tag_z_world, self._prev_tag_z_world)) < 0.0):
             return None
 
         cap_world  = tag_world - self.cap_dz  * tag_z_world
         body_world = tag_world - self.body_dz * tag_z_world
-        # Lift to policy obs frame (z=0 at robot_base + workstation_top/2).
         cap_world[2]  += self.workstation_top_z
         body_world[2] += self.workstation_top_z
 
         self._prev_tag_z_world = tag_z_world
         return body_world.astype(np.float32), cap_world.astype(np.float32)
 
+    # ------------------------------------------------------------------
+    # YOLO seg + DepthFeatureExtractor
+    # ------------------------------------------------------------------
     def _setup_yolo(self) -> None:
         yolo_cfg = self._cfg["yolo_seg"]
         self._yolo_variant = str(yolo_cfg["variant"])
@@ -723,6 +718,12 @@ class DepthFeatNode(Node):
         self.extractor = DepthFeatureExtractor(
             self._extractor_cfg, output_dim=self.output_dim, device=self.device
         )
+        
+        # # Cache LSQ W/b and geom override on the inference device so the hot
+        # # path is pure tensor math.
+        # self._lsq_W = torch.from_numpy(_LSQ_W).to(self.device)              # (6, 6)
+        # self._lsq_B = torch.from_numpy(_LSQ_B).to(self.device)              # (6,)
+        # self._geom_override = torch.from_numpy(_GEOM_OVERRIDE).to(self.device)  # (4,)
 
     def _setup_fk_state(self) -> None:
         fk_sel = self._cfg["fk"]
@@ -869,11 +870,17 @@ class DepthFeatNode(Node):
         if color_bgr is None or depth_u16 is None or color_hires is None:
             return  # capture thread hasn't produced a frame yet
 
-        # ─── AprilTag detection on hires color (CPU, ~5ms) ─────────────
-        # Runs in parallel with the YOLO + depth_feat path below. We append
-        # to *both* collect buffers only when *both* paths succeed, so the
-        # two halves of data.npy stay row-aligned automatically.
-        apriltag_result = self._run_apriltag(color_hires)
+        # FK is required to even attempt inference. Until we've received the
+        # first FK message, abort the entire tick — without joint state the
+        # buffer row would also be useless (fk all zeros), so there's no
+        # value in recording a frame here.
+        fk_t = self._assemble_fk_vector()
+        if fk_t is None:
+            self.get_logger().warn(
+                f"No FK PoseArray received yet on '{self.fk_topic}' — "
+                f"skipping depth-feature update. Is fk_node running?"
+            )
+            return
 
         try:
             # YOLO segmentation + mask outside-instance depth pixels to 0.
@@ -882,89 +889,103 @@ class DepthFeatNode(Node):
             self.get_logger().error(f"YOLO mask_depth failed: {exc}")
             return
 
+        # depth_feat_row holds the per-frame buffer entry: valid flag + the
+        # 10-d prediction. Stays as zeros (valid=0) when YOLO can't see the
+        # target; populated from a fresh pred otherwise. Same convention as
+        # apriltag_row in bottle_apriltag_node_all_data.
+        depth_feat_row = np.zeros(11, dtype=np.float32)
+        pred_metres: torch.Tensor | None = None
+
         if bbox is None:
             # YOLO didn't detect the target — masked_depth is all fill_value (0).
             # Feeding that to DepthFeatureNetFiLM would produce a meaningless
             # pred and silently overwrite the IPC buffer; instead leave the
             # previous good feature in place so the policy can keep going.
+            # The buffer row for THIS frame is recorded with valid=0 so
+            # offline training ignores stale preds, but RGB/depth/FK/apriltag
+            # still get appended (they're all independently valid).
             self.get_logger().warn(
-                "YOLO target not detected this frame — skipping depth-feature "
-                "update; policy continues to consume the last good feature."
+                "YOLO target not detected this frame — depth-feat buffer row "
+                "marked invalid; IPC buffer retains last good feature."
             )
-            # Still emit viz so the operator can see the all-black mask.
-            if self.depth_vis_pub is not None:
-                self._publish_masked_depth(masked_depth)
-            return
+        else:
+            try:
+                # masked_depth (uint16, sensor-native units) -> metres tensor on GPU.
+                # DepthFeatureExtractor expects (B, H, W) or (B, 1, H, W) input and
+                # handles its own [near, far] clip + normalisation. depth_scale
+                # converts raw sensor values to metres in the same convention
+                # training used (collect_policy_realsense.py stores depth in mm
+                # uint16; trainer divides by 1000 to metres).
+                depth_t = (
+                    torch.from_numpy(masked_depth).to(self.device).float() * self.depth_scale
+                ).unsqueeze(0)   # (1, H, W) float32 metres
 
-        fk_t = self._assemble_fk_vector()
-        if fk_t is None:
-            self.get_logger().warn(
-                f"No FK PoseArray received yet on '{self.fk_topic}' — "
-                f"skipping depth-feature update. Is fk_node running?"
-            )
-            if self.depth_vis_pub is not None:
-                self._publish_masked_depth(masked_depth)
-            return
-
-        try:
-            # masked_depth (uint16, sensor-native units) -> metres tensor on GPU.
-            # DepthFeatureExtractor expects (B, H, W) or (B, 1, H, W) input and
-            # handles its own [near, far] clip + normalisation. depth_scale
-            # converts raw sensor values to metres in the same convention
-            # training used (collect_policy_realsense.py stores depth in mm
-            # uint16; trainer divides by 1000 to metres).
-            depth_t = (
-                torch.from_numpy(masked_depth).to(self.device).float() * self.depth_scale
-            ).unsqueeze(0)   # (1, H, W) float32 metres
-
-            # target=None -> wrapper returns (feature, pred, None) and skips
-            # the loss/optimizer path entirely.
-            _feature, pred, _loss = self.extractor.step(
-                raw_depth=depth_t, target=None, fk=fk_t
-            )
-
-            # pred[..., 0:6] is metres (positions); pred[..., 6:10] is in [0,1].
-            # Un-normalize the geom slab so the IPC buffer is uniformly in metres.
-            pred_metres = pred.clone()
-            pred_metres[..., 6:10] = self.extractor.un_preprocess_geom(pred[..., 6:10])
-            # In-place into the IPC-shared buffer; consumers read this same
-            # GPU memory.
-            self.feature_buffer.copy_(pred_metres, non_blocking=True)
-
-            # Collect-mode: snapshot body / cap (already in world frame, metres)
-            # into the rolling buffers for end-of-run mean dump.
-            # SYNC RULE: only append when *both* this depth_feat prediction
-            # and the apriltag detection succeeded this frame, so the four
-            # buffers (body/cap for depth_feat AND apriltag) stay length-aligned
-            # and row index always corresponds to the same physical frame.
-            pred_pts_np = pred_metres[0, :6].detach().cpu().numpy().astype(np.float32)
-            if apriltag_result is not None:
-                apriltag_body, apriltag_cap = apriltag_result
-                with self._buffer_lock:
-                    self._body_buf.append(pred_pts_np[0:3])
-                    self._cap_buf.append(pred_pts_np[3:6])
-                    self._apriltag_body_buf.append(apriltag_body)
-                    self._apriltag_cap_buf.append(apriltag_cap)
-            else:
-                # AprilTag missed / rejected this frame — skip this collect
-                # sample on both sides to keep alignment. depth_feat IPC + viz
-                # still publish below (deployment side is unaffected).
-                self.get_logger().warn(
-                    f"AprilTag id={self.target_tag_id} miss/rejected this "
-                    f"frame — depth_feat sample skipped (buffer kept "
-                    f"row-aligned)."
+                # target=None -> wrapper returns (feature, pred, None) and skips
+                # the loss/optimizer path entirely.
+                _feature, pred, _loss = self.extractor.step(
+                    raw_depth=depth_t, target=None, fk=fk_t
                 )
-        except Exception as exc:
-            self.get_logger().error(f"DepthFeatureExtractor inference failed: {exc}")
-            rclpy.shutdown()
-            return
 
+                # pred[..., 0:6] is metres (positions); pred[..., 6:10] is in [0,1].
+                # Un-normalize the geom slab so the IPC buffer is uniformly in metres.
+                pred_metres = pred.clone()
+                pred_metres[..., 6:10] = self.extractor.un_preprocess_geom(pred[..., 6:10])
+
+                # # (a) LSQ-compensate body+cap (6-d affine fitted from real apriltag data).
+                # pred_metres[..., 0:6] = pred_metres[..., 0:6] @ self._lsq_W + self._lsq_B
+
+                # # (b) Override the geom slab — predictor's geom branch is too noisy in real.
+                # # Broadcast (4,) into (1, 4) row. If pred has batch > 1 this also broadcasts.
+                # pred_metres[..., 6:10] = self._geom_override
+                # In-place into the IPC-shared buffer; consumers read this same
+                # GPU memory.
+                self.feature_buffer.copy_(pred_metres, non_blocking=True)
+
+                depth_feat_row[0]    = 1.0
+                depth_feat_row[1:11] = pred_metres[0].detach().cpu().numpy().astype(np.float32)
+            except Exception as exc:
+                self.get_logger().error(f"DepthFeatureExtractor inference failed: {exc}")
+                rclpy.shutdown()
+                return
+
+        # Viz always — operator sees the all-black mask on YOLO miss too.
         if self.depth_vis_pub is not None:
             self._publish_masked_depth(masked_depth)
-        if self.bottle_poses_pub is not None:
+        # Bottle pose/geom topics carry only fresh preds; on YOLO miss the
+        # IPC buffer's last-good is still valid for the policy, but we don't
+        # want to mis-stamp it as a new prediction over the debug topic.
+        if pred_metres is not None and self.bottle_poses_pub is not None:
             self._publish_bottle_poses(pred_metres)
-        if self.bottle_geom_pub is not None:
+        if pred_metres is not None and self.bottle_geom_pub is not None:
             self._publish_bottle_geom(pred_metres)
+
+        # ── Cotrain rolling buffer append (after publish, so any inference
+        # / publish failure aborts before bookkeeping). Six aligned deques;
+        # everything stored is from this exact frame (same RealSense
+        # wait_for_frames return). AprilTag is best-effort: a (7,) row
+        # `[valid, body_xyz, cap_xyz]` — invalid frames still take a slot
+        # so the four "always-valid" modalities (rgb_hires/rgb_lores/depth/
+        # fk) stay length-aligned with apriltag/timestamp. Offline pipelines
+        # filter by `apriltag[:, 0] == 1` when they need GT-supervised rows.
+        apriltag_row = np.zeros(7, dtype=np.float32)
+        apr_result = self._run_apriltag(color_hires)
+        if apr_result is not None:
+            body_world, cap_world = apr_result
+            apriltag_row[0]   = 1.0
+            apriltag_row[1:4] = body_world
+            apriltag_row[4:7] = cap_world
+
+        # FK: cheap GPU→CPU copy of 24 floats. `fk_t` is (1, fk_dim) on device.
+        fk_np = fk_t[0].detach().cpu().numpy().astype(np.float32)
+
+        with self._rolling_lock:
+            self._rgb_hires_buf.append(color_hires)
+            self._rgb_lores_buf.append(color_bgr)
+            self._depth_buf.append(depth_u16)
+            self._fk_buf.append(fk_np)
+            self._apriltag_buf.append(apriltag_row)
+            self._depth_feat_buf.append(depth_feat_row)
+            self._timestamp_buf.append(time.time())
 
         elapsed = time.perf_counter() - loop_start
         period = 1.0 / max(self.inference_hz, 1e-3)
@@ -1073,22 +1094,21 @@ class DepthFeatNode(Node):
         return response
 
     # ------------------------------------------------------------------
-    # shutdown
-    # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
-    # Enter-key triggered collect
+    # Cotrain enter-trigger collect — full buffer snapshot per save
     # ------------------------------------------------------------------
     def _start_stdin_listener(self) -> None:
         self._stdin_thread = threading.Thread(
-            target=self._stdin_listener_loop, daemon=True, name="collect_stdin"
+            target=self._stdin_listener_loop, daemon=True, name="cotrain_stdin"
         )
         self._stdin_thread.start()
 
     def _stdin_listener_loop(self) -> None:
-        """Block on stdin in a daemon thread; each newline = one save trigger.
+        """Block on stdin in a daemon thread; each newline triggers one
+        full-buffer dump to a timestamped subdir of _OUT_DIR.
 
-        Daemon so it gets terminated when the main thread exits — readline()
-        on a closed stdin returns '' which we treat as "shutting down".
+        Daemon thread — terminated when the main thread exits. readline()
+        returns '' if stdin is closed (e.g. `ros2 run` detached), at which
+        point we just exit the listener quietly.
         """
         while self._stdin_running and rclpy.ok():
             try:
@@ -1096,96 +1116,130 @@ class DepthFeatNode(Node):
             except (EOFError, KeyboardInterrupt):
                 return
             if not line:
-                # stdin closed (process detached or piped /dev/null) — bail out.
                 return
             if not self._stdin_running:
                 return
             self._handle_save_trigger()
 
     def _handle_save_trigger(self) -> None:
-        """One save cycle: snapshot buffer mean → append to data.npy → clear.
+        """One Enter cycle: snapshot the six rolling deques into a single
+        timestamped .npz file, then keep the buffers rolling (do NOT clear).
 
-        Buffer access is protected by _buffer_lock against the inference
-        timer thread. After save, all four buffers are cleared so the next
-        Enter starts a fresh sample (no carry-over from the previous bottle
-        pose).
+        Not clearing means each save = the last 300 frames before that
+        Enter, including overlap with the previous save. This is what we
+        want for "lead-up + reaction" data — successive saves can capture
+        the same approach trajectory from slightly different viewpoints
+        depending on when the operator presses Enter.
         """
-        # Snapshot under lock (cheap — deques of small ndarrays), clear, then
-        # release. Doing the file write outside the lock keeps the inference
-        # timer unblocked during disk I/O.
-        with self._buffer_lock:
-            n_buf = len(self._cap_buf)
+        with self._rolling_lock:
+            n_buf = len(self._rgb_hires_buf)
             if n_buf == 0:
-                print(
-                    "[collect] buffer empty (no frame had both apriltag + "
-                    "depth_feat valid yet) — nothing to save."
-                )
+                print("[cotrain] buffer empty — no frame received yet, skipping save.")
                 return
-            body_list      = list(self._body_buf)
-            cap_list       = list(self._cap_buf)
-            apr_body_list  = list(self._apriltag_body_buf)
-            apr_cap_list   = list(self._apriltag_cap_buf)
-            self._body_buf.clear()
-            self._cap_buf.clear()
-            self._apriltag_body_buf.clear()
-            self._apriltag_cap_buf.clear()
+            # Snapshot copies under lock (fast: ndarrays are pointer copies).
+            rgb_hires_snap  = list(self._rgb_hires_buf)
+            rgb_lores_snap  = list(self._rgb_lores_buf)
+            depth_snap      = list(self._depth_buf)
+            fk_snap         = list(self._fk_buf)
+            apriltag_snap   = list(self._apriltag_buf)
+            depth_feat_snap = list(self._depth_feat_buf)
+            ts_snap         = list(self._timestamp_buf)
 
-        df_body  = np.stack(body_list,     axis=0).mean(axis=0)
-        df_cap   = np.stack(cap_list,      axis=0).mean(axis=0)
-        apr_body = np.stack(apr_body_list, axis=0).mean(axis=0)
-        apr_cap  = np.stack(apr_cap_list,  axis=0).mean(axis=0)
+        # Stack outside the lock so inference timer keeps running. Stacking
+        # 300 frames of 640x480x3 takes ~50ms but doesn't block anyone.
+        rgb_hires_arr  = np.stack(rgb_hires_snap,  axis=0)      # (N,480,640,3) uint8
+        rgb_lores_arr  = np.stack(rgb_lores_snap,  axis=0)      # (N,240,320,3) uint8
+        depth_arr      = np.stack(depth_snap,      axis=0)      # (N,240,320)   uint16
+        fk_arr         = np.stack(fk_snap,         axis=0)      # (N, fk_dim)   float32
+        apriltag_arr   = np.stack(apriltag_snap,   axis=0)      # (N, 7)        float32
+        depth_feat_arr = np.stack(depth_feat_snap, axis=0)      # (N, 11)       float32
+        ts_arr         = np.asarray(ts_snap, dtype=np.float64)  # (N,)          float64
+
+        n_apriltag_valid   = int(apriltag_arr[:, 0].sum())
+        n_depth_feat_valid = int(depth_feat_arr[:, 0].sum())
 
         try:
-            data = _load_or_init_dataset(_OUT_NPY)
-            _append_row(data, "depth_feat_body", df_body)
-            _append_row(data, "depth_feat_cap",  df_cap)
-            _append_row(data, "apriltag_body",   apr_body)
-            _append_row(data, "apriltag_cap",    apr_cap)
-            _save_dataset(_OUT_NPY, data)
-            # Apriltag values below already include the z lift
-            # (pose_bias_z + workstation_top_z, applied in _run_apriltag),
-            # so they're directly comparable to depth_feat in the same frame.
-            apr_z_lift = float(self.pose_bias[2]) + float(self.workstation_top_z)
+            _OUT_DIR.mkdir(parents=True, exist_ok=True)
+            sample_name = datetime.now().strftime("sample_%Y%m%d_%H%M%S_%f")[:-3]
+            sample_dir = _OUT_DIR / sample_name
+            sample_dir.mkdir(parents=True, exist_ok=False)
+
+            # Single .npz with everything — uncompressed for fast write
+            # (~380 MB / save, ~1s on a typical SSD). Use np.savez_compressed
+            # if disk space matters more than save latency.
+            npz_path = sample_dir / "data.npz"
+            np.savez(
+                str(npz_path),
+                rgb_hires  = rgb_hires_arr,
+                rgb_lores  = rgb_lores_arr,
+                depth      = depth_arr,
+                fk         = fk_arr,
+                apriltag   = apriltag_arr,
+                depth_feat = depth_feat_arr,
+                timestamp  = ts_arr,
+            )
+
+            # Sidecar metadata — config values used so offline pipelines can
+            # reproduce / sanity-check.
+            meta_path = sample_dir / "meta.json"
+            meta = {
+                "source":                  "depth_feat_node_all_data",
+                "n_frames":                n_buf,
+                "n_apriltag_valid":        n_apriltag_valid,
+                "n_depth_feat_valid":      n_depth_feat_valid,
+                "capture_resolution":      [self.rs_color_width, self.rs_color_height],
+                "policy_resolution":       [self.policy_width, self.policy_height],
+                "capture_hz":              self.capture_hz,
+                "inference_hz":            self.inference_hz,
+                "fk_dim":                  int(self.fk_dim),
+                "apriltag_dict":           self.apriltag_dict_name,
+                "apriltag_id":             int(self.target_tag_id),
+                "marker_size_m":           float(self.marker_size_m),
+                "cap_dz":                  float(self.cap_dz),
+                "body_dz":                 float(self.body_dz),
+                "bottle_geom":             self._apriltag_bottle_geom.tolist(),
+                "pose_bias":               self.pose_bias.tolist(),
+                "workstation_top_z":       float(self.workstation_top_z),
+                "T_world_cam":             self._T_world_cam.tolist(),
+                "fk_topic":                self.fk_topic,
+                "fk_link_names":           list(self.fk_link_names),
+                "apriltag_row_layout":     "[valid, body_x, body_y, body_z, cap_x, cap_y, cap_z]; "
+                                           "valid=0 rows have zero positions.",
+                "depth_feat_row_layout":   "[valid, body_x, body_y, body_z, cap_x, cap_y, cap_z, "
+                                           "geom_body_r, geom_body_h, geom_cap_r, geom_cap_h]; "
+                                           "valid=0 means YOLO missed target on that frame (IPC "
+                                           "buffer retained last-good, but this row is NOT GT).",
+                "saved_at":                datetime.now().isoformat(),
+            }
+            with meta_path.open("w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
+
+            self._save_counter += 1
             print(
-                f"[collect] saved sample N={len(data['depth_feat_body'])} "
-                f"(averaged over {n_buf} frames):\n"
-                f"  depth_feat_body=({df_body[0]:+.4f},{df_body[1]:+.4f},{df_body[2]:+.4f}) m\n"
-                f"  depth_feat_cap =({df_cap[0]:+.4f},{df_cap[1]:+.4f},{df_cap[2]:+.4f}) m\n"
-                f"  apriltag_body  =({apr_body[0]:+.4f},{apr_body[1]:+.4f},{apr_body[2]:+.4f}) m   "
-                f"(z lifted by {apr_z_lift:+.5f})\n"
-                f"  apriltag_cap   =({apr_cap[0]:+.4f},{apr_cap[1]:+.4f},{apr_cap[2]:+.4f}) m   "
-                f"(z lifted by {apr_z_lift:+.5f})\n"
-                f"  diff(depth_feat - apriltag) body=({df_body[0]-apr_body[0]:+.4f},"
-                f"{df_body[1]-apr_body[1]:+.4f},{df_body[2]-apr_body[2]:+.4f}) m  "
-                f"cap=({df_cap[0]-apr_cap[0]:+.4f},{df_cap[1]-apr_cap[1]:+.4f},"
-                f"{df_cap[2]-apr_cap[2]:+.4f}) m\n"
-                f"  [collect] buffers cleared. Move bottle, then press ENTER for next sample."
+                f"[cotrain] saved sample #{self._save_counter} → {sample_dir.name}\n"
+                f"  npz:        {npz_path}  ({npz_path.stat().st_size / 1e6:.1f} MB)\n"
+                f"  frames:     {n_buf}\n"
+                f"  apriltag:   {n_apriltag_valid}/{n_buf} valid "
+                f"({100 * n_apriltag_valid / n_buf:.1f}%)\n"
+                f"  depth_feat: {n_depth_feat_valid}/{n_buf} valid "
+                f"({100 * n_depth_feat_valid / n_buf:.1f}%)\n"
+                f"  buffers continue rolling — press ENTER again for next sample."
             )
         except Exception as exc:  # noqa: BLE001
-            print(f"[collect] dataset save failed: {exc}")
+            print(f"[cotrain] save failed: {exc}")
 
+    # ------------------------------------------------------------------
+    # shutdown
+    # ------------------------------------------------------------------
     def destroy_node(self) -> bool:
-        # Stop capture + timer + stdin listener. We do NOT auto-dump residual
-        # buffer here — collect mode is fully enter-triggered, so quitting
-        # without pressing Enter discards anything still in the buffer (this
-        # is what the user explicitly asked for to avoid accidental saves).
         self._capture_running = False
         self._stdin_running = False
         if hasattr(self, "inference_timer") and self.inference_timer is not None:
             self.inference_timer.cancel()
         if getattr(self, "_capture_thread", None) is not None and self._capture_thread.is_alive():
             self._capture_thread.join(timeout=1.0)
-        # stdin thread is a daemon — it will be torn down when the main
-        # thread exits. We don't actively join it because sys.stdin.readline
-        # is blocking and can't be interrupted from another thread cleanly.
-
-        n_unsaved = len(self._cap_buf)
-        if n_unsaved > 0:
-            print(
-                f"[collect] exiting with {n_unsaved} unsaved frames in buffer "
-                f"— discarded (press Enter before quitting to save)."
-            )
-
+        # stdin thread is daemon — readline() can't be interrupted from
+        # another thread cleanly, but process exit terminates it.
         if hasattr(self, "rs_pipeline") and self.rs_pipeline is not None:
             try:
                 self.rs_pipeline.stop()

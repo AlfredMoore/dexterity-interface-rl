@@ -195,7 +195,8 @@ class DepthFeatNode(Node):
 
         self.get_logger().info(
             f"DepthFeatNode ready:\n"
-            f"  rs        = {self.rs_color_width}x{self.rs_color_height}@{int(self.capture_hz)}Hz\n"
+            f"  rs        = {self.rs_color_width}x{self.rs_color_height}@{int(self.capture_hz)}Hz "
+            f"-> {self.policy_width}x{self.policy_height} (CPU resize)\n"
             f"  inf_rate  = {self.inference_hz}Hz\n"
             f"  yolo      = yolo26{self._yolo_variant}-seg  target={self._yolo_target!r}\n"
             f"  clip      = [{self.clip_near}, {self.clip_far}]m\n"
@@ -258,6 +259,13 @@ class DepthFeatNode(Node):
         self.rs_color_width = int(c_intr["width"])
         self.rs_color_height = int(c_intr["height"])
         self.capture_hz = float(self._rs_cfg["rs_fps"])
+
+        # Policy / YOLO / DepthFeatureNet input resolution. RealSense captures
+        # at rs_color_width x rs_color_height (640x480 now, so SDK filters get
+        # high-res input), then the capture loop CPU-downsamples to this size.
+        # Hardcoded to the training input — change only if you retrain.
+        self.policy_width = 320
+        self.policy_height = 240
 
     def _init_device(self) -> None:
         if not torch.cuda.is_available():
@@ -387,10 +395,36 @@ class DepthFeatNode(Node):
             if not color_frame or not depth_frame:
                 continue
 
-            # Both arrays are views on RealSense-owned memory; .copy() so they
-            # survive once the underlying frame goes out of scope.
-            color_bgr = np.asanyarray(color_frame.get_data()).copy()
-            depth_u16 = np.asanyarray(depth_frame.get_data()).copy()
+            # SDK gave us frames at capture resolution (e.g. 640x480) — that
+            # high pixel count was needed by decimation / hole_filling / align
+            # above. Now downsample on CPU to the policy input size (320x240).
+            color_hires = np.asanyarray(color_frame.get_data())
+            depth_hires = np.asanyarray(depth_frame.get_data())
+            if (color_hires.shape[0] != self.policy_height or
+                    color_hires.shape[1] != self.policy_width):
+                # Different interpolations per modality:
+                #   * color: INTER_AREA — local-average is the right thing
+                #     for RGB downsampling (clean low-res, no aliasing).
+                #   * depth: INTER_NEAREST — DO NOT average depth across
+                #     edges; mean creates phantom "in-between" depth at
+                #     object boundaries (a thin ring of mid-distance pixels
+                #     between near and far). Nearest matches the spirit of
+                #     RealSense's SDK decimation_filter (which uses non-zero
+                #     median, not mean) so behaviour is consistent with the
+                #     training-data collection pipeline.
+                color_bgr = cv2.resize(
+                    color_hires, (self.policy_width, self.policy_height),
+                    interpolation=cv2.INTER_AREA,
+                )
+                depth_u16 = cv2.resize(
+                    depth_hires, (self.policy_width, self.policy_height),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            else:
+                # Already at policy resolution — just .copy() to detach from
+                # the RealSense-owned buffer (the SDK reuses it next frame).
+                color_bgr = color_hires.copy()
+                depth_u16 = depth_hires.copy()
 
             with self.vision_lock:
                 self.latest_color_bgr = color_bgr
