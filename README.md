@@ -54,6 +54,19 @@ cd <path to>/dexterity-interface-rl
 
 xhost +local:docker
 docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/workspace --device /dev/bus/usb:/dev/bus/usb --net=host -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix dex-policy
+
+docker run --name handrl-policy --rm -itd --privileged --gpus all -v $(pwd):/workspace --device /dev/bus/usb:/dev/bus/usb --net=host -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix dex-policy    # detached
+```
+
+Attach to Policy Container
+```bash
+docker exec -it -e DISPLAY=$DISPLAY handrl-policy bash
+cd /workspace/libs/robot_motion_interface/ros
+colcon build --symlink-install
+source install/setup.bash
+cd /workspace
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export ROS_STATIC_PEERS='192.168.4.4'
 ```
 
 Dependencies
@@ -68,20 +81,20 @@ cd /workspace/dep/rsl_rl-HAND
 pip install -e .
 cd /workspace
 
-cd /workspace/dep/Grounded-SAM-2
-pip install -e .
-cd /workspace
+# cd /workspace/dep/Grounded-SAM-2
+# pip install -e .
+# cd /workspace
 ```
 
-Depth-Anything-3-HAND
+<!-- Depth-Anything-3-HAND
 ```bash
 cd /workspace/dep
 git clone -b gpu https://github.com/AlfredMoore/Depth-Anything-3-HAND.git
 pip install -e Depth-Anything-3-HAND
 cd /workspace
-```
+``` -->
 
-Compile curobo
+<!-- Compile curobo
 ```bash
 cd /workspace/dep
 git clone https://github.com/AlfredMoore/curobo-HAND.git curobo
@@ -89,16 +102,16 @@ cd curobo
 pip install -e . --no-build-isolation
 python3 -m pytest .
 cd /workspace
-```
+``` -->
 
-Prompt depth anything
+<!-- Prompt depth anything
 ```bash
 cd /workspace/dep
 git clone https://github.com/DepthAnything/PromptDA.git # 9161547
 # This repo is not ready for `pip install -e .`
 export PYTHONPATH=/workspace/dep/PromptDA:$PYTHONPATH
 cd /workspace
-```
+``` -->
 
 Segment Anything 2
 ```bash
@@ -109,14 +122,23 @@ pip install -e .
 cd /workspace
 ```
 
-Efficient SAM 3 (including Segment Anything 3)
+Segment Anything 3
+```bash
+cd /workspace/dep
+git clone https://github.com/facebookresearch/sam3.git
+cd sam3
+pip install -e .
+cd /workspace
+```
+
+<!-- Efficient SAM 3 (including Segment Anything 3)
 ```bash
 cd /workspace/dep
 git clone https://github.com/SimonZeng7108/efficientsam3.git -b sam3_litetext   # bef17f5
 cd efficientsam3
 pip install --force-reinstall --no-deps --no-build-isolation -e .
 cd /workspace
-```
+``` -->
 
 Realsense Test
 ```bash
@@ -130,16 +152,16 @@ python -m robot_motion_interface.utils.realsense_artag_cali \
   --target-tag-id 0 \
   --aruco-dict DICT_4X4_50
 ```
-
+<!-- 
 Commit the image from the host (optional)
 ```bash
 docker commit handrl-policy dex-policy:compiled
 # Then you can directly run the full installed container by
 xhost +local:docker
 docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/workspace --device /dev/bus/usb:/dev/bus/usb --net=host -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix dex-policy:compiled
-```
+``` -->
 
-Run Pre-grasp Sampling Modules
+<!-- Run Pre-grasp Sampling Modules
 ```bash
 cd /workspace
 # pinocchio and curobo test
@@ -148,7 +170,7 @@ python -m robot_motion_interface.utils.kinematics
 # python -m robot_motion_interface.utils.pose_sampler
 # # home to a pre-grasp pose traj generation (this takes a long time to filter 50k joint poses)
 # python -m robot_motion_interface.utils.traj_sampler
-```
+``` -->
 
 ROS2 Build
 ```bash
@@ -156,35 +178,45 @@ cd /workspace/libs/robot_motion_interface/ros
 colcon build --symlink-install
 source install/setup.bash
 cd /workspace
+export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+export ROS_STATIC_PEERS='192.168.4.4'
 ```
 
-Test Nodes
+<!-- Test Nodes
 ```bash
 ros2 run robot_motion_interface_ros yolo_node   # yolo masked depth map
 ros2 run robot_motion_interface_ros cv_node
-```
-
+``` -->
+<!-- 
 Curobo TrajOpt Nodes
 ```bash
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 export ROS_STATIC_PEERS='192.168.4.4'
 ros2 run robot_motion_interface_ros test_curobo
-```
+``` -->
 
-Play polict
+Go to pre-grasp pose
 ```bash
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 export ROS_STATIC_PEERS='192.168.4.4'
 ros2 run robot_motion_interface_ros replay_target_pregrasp    # go to pre-grasp pose
-ros2 run robot_motion_interface_ros <policy node>
+# ros2 run robot_motion_interface_ros <policy node>
+```
 
-Retargeting Nodes
+Run
+```bash
+ros2 run robot_motion_interface_ros fk_node # FK node
+ros2 run robot_motion_interface_ros depth_sam_feat_node
+ros2 run robot_motion_interface_ros 
+```
+
+<!-- Retargeting Nodes
 ```bash
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 export ROS_STATIC_PEERS='192.168.4.4'
 ros2 run robot_motion_interface_ros test_retarget_traj_player --ros-args \
   -p traj_path:=models/egodex/traj-retarging/screw_unscrew_bottle_cap/0_curobo_2stage-interpolated.npz
-```
+``` -->
 
 Replay Traj
 ```bash
@@ -194,15 +226,12 @@ ros2 run robot_motion_interface_ros replay_target_pregrasp    # go to pre-grasp 
 ros2 run robot_motion_interface_ros replay_target_policy  # replay target <runtime>/actions_dones_targets.pt
 # ros2 run robot_motion_interface_ros replay_action_torch
 ```
-Attach to Policy Container
-```bash
-docker exec -it -e DISPLAY=$DISPLAY handrl-policy bash
-```
 
+<!-- 
 Run Aux Policy
 ```bash
 ros2 run robot_motion_interface_ros aux_policy --ros-args -p policy_timing_log_every:=30
-```
+``` -->
 
 
 

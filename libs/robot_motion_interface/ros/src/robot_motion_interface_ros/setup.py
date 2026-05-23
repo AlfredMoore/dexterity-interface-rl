@@ -31,6 +31,7 @@ setup(
             'aux_policy_2 = robot_motion_interface_ros.aux_policy_v2:main',
             'depth_feat_policy = robot_motion_interface_ros.depth_feat_policy:main',
             'depth_feat_node = robot_motion_interface_ros.depth_feat_node:main',
+            'depth_sam_feat_node = robot_motion_interface_ros.depth_sam_feat_node:main',
             'depth_feat_node_collect = robot_motion_interface_ros.depth_feat_node_collect:main',
             'depth_feat_node_all_data = robot_motion_interface_ros.depth_feat_node_all_data:main',
             'bottle_apriltag_node = robot_motion_interface_ros.bottle_apriltag_node:main',

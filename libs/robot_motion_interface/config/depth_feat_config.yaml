@@ -37,6 +37,33 @@ yolo_seg:
 #     x: 1.1GB VRAM, 23% utl, Det: Good
 
 # ---------------------------------------------------------------------------
+# SAM3-anchored + SAM2 dual-bank streaming tracker
+# ---------------------------------------------------------------------------
+# Args feed directly into SAM2P3DualBankTracker(__init__) in
+# robot_motion_interface/utils/sam2p3_dualbank_util.py. ONLY read by
+# depth_sam_feat_node — the legacy depth_feat_node (yolo_seg path) ignores
+# this section. Indexed access (cfg["sam2p3"][k]) — missing key fails loudly.
+#
+# Path resolution: ckpt fields are workspace-relative (resolve against
+# /workspace inside the handrl-policy docker, which is mounted at the repo
+# root). sam2_cfg is a SAM2 hydra config NAME (not a filesystem path) and is
+# passed through to the sam2 package untouched.
+#
+# Reference 4090 budget (steady state): SAM2P3 ≈ 50 ms/step, with a ~200 ms
+# spike every cycle_K calls when SAM3 ViT-H re-anchors a new bank. Set
+# runtime.inference_rate to ≤ 20 Hz to leave headroom.
+sam2p3:
+  sam2_ckpt: "models/sam2/sam2.1_hiera_small.pt"    # in-docker path
+  sam2_cfg:  "configs/sam2.1/sam2.1_hiera_s.yaml"   # SAM2 hydra config name
+  sam3_ckpt: "models/sam3/sam3.pt"                  # in-docker path
+  prompt:    "bottle."                              # GroundingDINO-style text
+  prompt_type: "mask"                               # "mask" (default) | "box"
+  cycle_K:   100                                    # frames between bank swaps
+  warmup_W:  7                                      # overlap window before swap
+  sam3_conf: 0.1                                    # SAM3 detection threshold
+  offload_video_to_cpu: false                       # true on <16 GB GPUs
+
+# ---------------------------------------------------------------------------
 # Depth-feature network (inference)
 # ---------------------------------------------------------------------------
 # Must match the arch used at training time (train_depth_predictor.py).

@@ -211,6 +211,12 @@ class _StreamBank:
         self._local_pos   = -1
         self._max_frames  = max_frames
         self.prompt_type  = prompt_type
+        # Frozen-mode cache: once the buffer fills, step() stops pushing and
+        # returns this cached mask instead of raising. SAM3 retries continue
+        # in the outer tracker, so when detection comes back a new bank takes
+        # over and this one is retired.
+        self._last_returned_mask: Optional[np.ndarray] = None
+        self._frozen_warned: bool = False
 
         # Both prompts are stored regardless of which one is sent to SAM2 —
         # the unused one is still useful for visualisation / logging.  SAM2's
@@ -265,12 +271,22 @@ class _StreamBank:
             pred_masks = cond_out["pred_masks"].to(self.device, non_blocking=True)
         else:
             assert bgr is not None, "bgr required after the anchor step"
+            # Buffer full → freeze. Stop pushing new frames, return the last
+            # computed mask. Don't raise — the outer SAM3-retry loop keeps
+            # running (every cycle_K/4 frames), so when detection succeeds a
+            # new bank spawns and this frozen one gets retired on swap.
+            # `_last_returned_mask is None` only happens if the anchor step
+            # itself didn't produce a mask, which shouldn't be possible.
+            if self._local_pos + 1 >= self._max_frames:
+                if not self._frozen_warned:
+                    self._frozen_warned = True
+                    print(
+                        f"  [bank@{self.spawn_global}] buffer full at "
+                        f"max_frames={self._max_frames}; mask frozen until "
+                        f"SAM3 retry succeeds and a new bank replaces this one."
+                    )
+                return self._last_returned_mask
             self._local_pos += 1
-            if self._local_pos >= self._max_frames:
-                raise RuntimeError(
-                    f"_StreamBank exceeded max_frames={self._max_frames}; "
-                    f"a bank lifetime exceeded cycle_K + warmup_W + margin."
-                )
             # In-place write into the pre-allocated buffer.
             img = _preprocess_bgr(bgr, self._image_size, self.state["images"].device)
             self.state["images"][self._local_pos] = img
@@ -295,7 +311,9 @@ class _StreamBank:
         _, video_res_masks = self.predictor._get_orig_video_res_output(
             self.state, pred_masks,
         )
-        return (video_res_masks[0, 0] > 0).cpu().numpy()
+        mask_np = (video_res_masks[0, 0] > 0).cpu().numpy()
+        self._last_returned_mask = mask_np
+        return mask_np
 
     def release(self):
         """Drop heavy state to let GC reclaim images buffer and memory bank entries."""
@@ -384,8 +402,14 @@ class SAM2P3DualBankTracker:
         self.offload_video_to_cpu = offload_video_to_cpu
         self.verbose     = verbose
 
-        # Each bank lives at most cycle_K + warmup_W frames; +32 frames margin.
-        self._max_frames_per_bank = cycle_K + warmup_W + 32
+        # Bank-buffer size. Old default was cycle_K + warmup_W + 32, but that
+        # leaves zero room for SAM3 spawn-frame misses (one miss freezes
+        # _next_spawn_at; the primary bank then runs to the cap and trips
+        # RuntimeError). Sizing it at 2 * cycle_K + warmup_W gives the fixed
+        # K/4 retry stride 4 attempts (~cycle_K worth of frames) before the
+        # buffer fills. VRAM cost on cycle_K=100 is +1.6 GB per bank, fits
+        # easily on a 4090.
+        self._max_frames_per_bank = 2 * cycle_K + warmup_W
 
         # Build SAM3 (image model)
         self.sam3 = _SAM3Anchor(sam3_ckpt, device=device, conf=sam3_conf)
@@ -405,6 +429,12 @@ class SAM2P3DualBankTracker:
         self._did_swap  = False
         self._last_sam3_box: Optional[np.ndarray] = None
         self._last_sam3_frame: Optional[int] = None
+        # Exponential-backoff retry counter for SAM3 spawn-frame miss. Without
+        # this, a single miss (e.g. hand occludes the bottle on the spawn
+        # frame) freezes _next_spawn_at / _next_swap_at, so the primary bank
+        # never retires and eventually trips _StreamBank.max_frames=139.
+        # Reset to 0 on every successful SAM3 spawn (init + step's spawn path).
+        self._sam3_miss_count: int = 0
 
     # ── helpers ──────────────────────────────────────────────────────────
     def _vprint(self, msg: str) -> None:
@@ -454,6 +484,7 @@ class SAM2P3DualBankTracker:
         self._did_swap        = False
         self._last_sam3_box   = None
         self._last_sam3_frame = None
+        self._sam3_miss_count = 0
         self._vprint("  [reset] all banks released")
 
     @torch.inference_mode()
@@ -516,8 +547,28 @@ class SAM2P3DualBankTracker:
                     ))
                     spawned_this_iter = True
                     self._did_spawn = True
+                    self._sam3_miss_count = 0  # success resets the backoff
                 else:
-                    self._vprint(f"  [spawn] frame {g:3d}  SAM3 missed — staying single-bank")
+                    # SAM3 missed on the spawn frame (e.g. hand occludes the
+                    # bottle right when re-anchor was scheduled). Reschedule
+                    # the next spawn at a *fixed* cycle_K // 4 retry stride
+                    # and shift swap_at in lockstep so the primary retires
+                    # the moment a new bank finally spawns.
+                    #
+                    # Fixed (not exponential) stride is intentional: with a
+                    # bank lifetime of cycle_K + warmup_W + cycle_K (see
+                    # _max_frames_per_bank), 4 retries fit before the buffer
+                    # fills, vs only 1 retry for K/2 backoff. K/4 ≈ 1.7s at
+                    # 15 Hz inference — comparable to a grasp's occlusion
+                    # window, so retries land soon after the hand clears.
+                    self._sam3_miss_count += 1
+                    backoff = max(1, self.cycle_K // 4)
+                    self._next_spawn_at = g + backoff
+                    self._next_swap_at  = self._next_spawn_at + self.warmup_W
+                    self._vprint(
+                        f"  [spawn] frame {g:3d}  SAM3 missed (miss #{self._sam3_miss_count}) "
+                        f"— retry at frame {self._next_spawn_at}, swap at {self._next_swap_at}"
+                    )
 
             # ── Step each active bank ────────────────────────────────────
             outs = []
