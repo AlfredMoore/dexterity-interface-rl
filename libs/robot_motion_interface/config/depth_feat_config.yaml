@@ -75,7 +75,7 @@ depth_feature:
   backbone: "resnet10"       # resnet10 / resnet8 / resnet18
   num_keypoints: 64          # # of soft keypoints after 1x1 conv
   mlp_hidden: 256            # head MLP width
-  use_film: true             # FiLM conditioning on/off (must match training)
+  use_film: false             # FiLM conditioning on/off (must match training)
   fk_dim: 24                 # 2 * (3 base + 3 fingers * 3) for 3-finger hand
   film_hidden: 128           # FiLM generator trunk width
   fk_embed_dim: 32           # FK late-concat embed dim (0 disables)
@@ -89,7 +89,7 @@ depth_feature:
   # which is mounted at the dexterity-interface-rl repo root). Absolute host
   # paths pass through unchanged — override here when the checkpoint lives
   # outside the repo, e.g. on a mounted training output dir.
-  log_dir: "models/depth_predictor/latest"
+  log_dir: "models/depth_predictor/no_film"
   # Optional pin to a specific .pth file. When set, takes precedence over the
   # log_dir latest-pick logic (which selects best_val.pth in inference mode,
   # or the largest-step file otherwise). Same resolution rules as log_dir —

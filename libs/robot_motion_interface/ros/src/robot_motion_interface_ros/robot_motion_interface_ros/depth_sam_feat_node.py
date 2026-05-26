@@ -756,7 +756,7 @@ class DepthSamFeatNode(Node):
             # bottle_geom: [0.04, 0.12, 0.04, 0.03]  # 3D bottle
             # bottle_geom: [0.042, 0.098, 0.04, 0.02]  # pink small
             # bottle_geom: [0.034, 0.15, 0.032, 0.016]  # black tall
-            pred_metres[..., 6:10] = torch.tensor([0.04, 0.16, 0.029, 0.02], device=self.device)
+            # pred_metres[..., 6:10] = torch.tensor([0.04, 0.16, 0.029, 0.02], device=self.device)
             # pred_metres[..., 6:10] = torch.tensor([0.04, 0.12, 0.04, 0.03], device=self.device)
             # pred_metres[..., 6:10] = torch.tensor([0.042, 0.098, 0.04, 0.02], device=self.device)
             # pred_metres[..., 6:10] = torch.tensor([0.034, 0.15, 0.032, 0.016], device=self.device)
