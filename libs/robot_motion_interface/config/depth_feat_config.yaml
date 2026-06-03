@@ -89,7 +89,8 @@ depth_feature:
   # which is mounted at the dexterity-interface-rl repo root). Absolute host
   # paths pass through unchanged — override here when the checkpoint lives
   # outside the repo, e.g. on a mounted training output dir.
-  log_dir: "models/depth_predictor/no_film"
+  log_dir: "models/depth_predictor/no_drift"   # pick .pth from this training run's output
+  # log_dir: "models/depth_predictor/no_drift"
   # Optional pin to a specific .pth file. When set, takes precedence over the
   # log_dir latest-pick logic (which selects best_val.pth in inference mode,
   # or the largest-step file otherwise). Same resolution rules as log_dir —
