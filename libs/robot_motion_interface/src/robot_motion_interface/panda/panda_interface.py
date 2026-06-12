@@ -160,6 +160,33 @@ class PandaInterface(Interface):
 
 
 
+    # --- SYSID read-only diagnostics (require the control loop stopped) ---
+    def sysid_load_info(self) -> np.ndarray:
+        """(15,) [m_ee, m_load, m_total, F_x_Cload(3), I_load(9)] from RobotState
+        (the load configured in Franka Desk / FCI web)."""
+        return self._panda_interface_cpp.sysid_load_info()
+
+    def sysid_gravity(self, q: np.ndarray = None) -> np.ndarray:
+        """(7,) model gravity joint torque under the configured load.
+        q=None -> evaluate at the current pose; else evaluate at q (len 7)."""
+        q_arg = np.zeros(0) if q is None else np.asarray(q, dtype=float)
+        return self._panda_interface_cpp.sysid_gravity(q_arg)
+
+    def sysid_tau_ext(self) -> np.ndarray:
+        """(7,) RobotState.tau_ext_hat_filtered (external-torque estimate)."""
+        return self._panda_interface_cpp.sysid_tau_ext()
+
+    def sysid_tau_measured(self) -> np.ndarray:
+        """(7,) RobotState.tau_J (measured link-side joint torque)."""
+        return self._panda_interface_cpp.sysid_tau_measured()
+
+    def sysid_set_load(self, mass: float, com: np.ndarray, inertia: np.ndarray) -> bool:
+        """Set the configured load in code; True if accepted (Step 0.5 correction
+        test). com=(3,), inertia=(3,3). Control loop must be stopped."""
+        return self._panda_interface_cpp.sysid_set_load(
+            float(mass), np.asarray(com, dtype=float), np.asarray(inertia, dtype=float)
+        )
+
     def start_loop(self):
         """
         Start control loop

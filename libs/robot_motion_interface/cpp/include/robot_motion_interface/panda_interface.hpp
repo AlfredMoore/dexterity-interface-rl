@@ -12,6 +12,7 @@
 
 #include "robot_motion/controllers/joint_torque_controller.hpp"
 #include <franka/robot.h>
+#include <franka/model.h>
 #include <franka/exception.h>
 
 
@@ -55,13 +56,39 @@ public:
      * @brief Stop the background runtime.
      */
     void stop_loop();
-    
+
+    // -------------------------------------------------------------------------
+    // SYSID read-only diagnostics (Step 0). REQUIRE the control loop STOPPED:
+    // they call robot_.readOnce()/loadModel(), which conflict with control().
+    // -------------------------------------------------------------------------
+
+    /** @brief Configured load + masses from RobotState (set via Desk/FCI web).
+     *  @return (15,) [m_ee, m_load, m_total, F_x_Cload(3), I_load(9, row-major)] */
+    Eigen::VectorXd sysid_load_info();
+
+    /** @brief Model-based gravity joint torque under the configured load.
+     *  @param q (7,) pose to evaluate at; EMPTY -> current measured pose.
+     *  @return (7,) gravity torque (Nm). */
+    Eigen::VectorXd sysid_gravity(const Eigen::VectorXd& q = Eigen::VectorXd());
+
+    /** @brief RobotState.tau_ext_hat_filtered (external-torque estimate). @return (7,) */
+    Eigen::VectorXd sysid_tau_ext();
+
+    /** @brief RobotState.tau_J (measured link-side joint torque). @return (7,) */
+    Eigen::VectorXd sysid_tau_measured();
+
+    /** @brief Set the configured load in code (Step 0.5 correction test).
+     *  @return true if accepted. Control loop must be stopped. */
+    bool sysid_set_load(double mass, const Eigen::Vector3d& com,
+                        const Eigen::Matrix3d& inertia);
+
 
 protected:
 
 
     franka::Robot robot_;
     std::unique_ptr<robot_motion::Controller> controller_;
+    std::unique_ptr<franka::Model> model_;  // lazily loaded by sysid_gravity
 
     std::atomic<bool> control_loop_running_ =  false;
     Eigen::VectorXd control_loop_state_{Eigen::VectorXd::Zero(14)};

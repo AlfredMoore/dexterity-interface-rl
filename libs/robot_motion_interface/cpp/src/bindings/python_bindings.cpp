@@ -23,7 +23,14 @@ PYBIND11_MODULE(robot_motion_interface_pybind, m) {
         .def("set_joint_positions", &PandaInterface::set_joint_positions)
         .def("joint_state", &PandaInterface::joint_state)
         .def("start_loop", &PandaInterface::start_loop)
-        .def("stop_loop", &PandaInterface::stop_loop);
+        .def("stop_loop", &PandaInterface::stop_loop)
+        // SYSID read-only diagnostics (require control loop stopped).
+        .def("sysid_load_info", &PandaInterface::sysid_load_info)
+        .def("sysid_gravity", &PandaInterface::sysid_gravity, py::arg("q") = Eigen::VectorXd())
+        .def("sysid_tau_ext", &PandaInterface::sysid_tau_ext)
+        .def("sysid_tau_measured", &PandaInterface::sysid_tau_measured)
+        .def("sysid_set_load", &PandaInterface::sysid_set_load,
+             py::arg("mass"), py::arg("com"), py::arg("inertia"));
 
 
     using VecRef = Eigen::Ref<const Eigen::VectorXd>;
