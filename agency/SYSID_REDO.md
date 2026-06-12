@@ -125,14 +125,29 @@ identification —— 上一次 sysid 比较随意(直接用 LSE 选 kp/kd,没�
 - 辨识采样可高于 policy 的 20Hz(如 200Hz 下发与记录)以抓 armature/高频;端到端验证段回到 20Hz 管线。
 
 ### 第 2 步 —— sim 复放拟合 `hand_mjlab/scripts/sysid_replay_fit.py`(待建)
-- 单 env 拉起对应单臂 entity,喂记录的同一串 `q_target`,整轨匹配。
-- 拟合 θ = **{armature, frictionloss, dof_damping, kp/kd 复核, 控制延迟}**;
+
+**方法:基于 `mujoco.sysid`**(MuJoCo 内置 sysid 工具箱,Gauss-Newton + 有限差分 Jacobian,
+自带可辨识性分析 + HTML 报告 + 置信区间;比手写 CMA-ES 更快且更有诊断能力)。
+
+参考文献(灵巧手 sysid 实践):
+- **DeXtreme** (NVIDIA, Allegro Hand, 2022):16 DOF × 5 参数 = 80 参数 CMA-ES 轨迹匹配 → 我们的
+  参数集和策略(逐关节→全局)与此一致,但用 `mujoco.sysid` 替代 CMA-ES。
+- **InDex / Visual Dexterity** (NVIDIA, 2022):只用一根手指的 step + 正弦扫频标定 stiffness/damping/
+  velocity limits → **同指复制到对称手指**(Tesollo 三指机械对称,标一指 4 关节复用到 12)。
+- **FunGrasp** (CoRL 2025 最佳海报):开环部署粗策略采真机轨迹 → 反向优化 stiffness/damping;
+  指出**高传动比电机的反射惯量 + 非线性摩擦**是灵巧手 sysid 核心挑战。
+- 共识:**接触参数(指↔物摩擦)不做 sysid,留给 DR**。
+
+流程:
+- 单 env plain MuJoCo(CPU,不需要 GPU/Warp),构建单臂模型(`get_arm_spec` + 手动加 position actuator)。
+- 喂第 1 步录的 `q_target` → `mujoco.sysid.optimize` 最小化 sim-real 轨迹残差。
+- 拟合 θ = **{armature, frictionloss, dof_damping, kp/kd 复核}**;
   **kp/kd 是真机标称,不重新 LSE 选**,只复核微调。
-- loss:`Σ_t Σ_j w_j[(q_sim−q_real)² + λ(q̇_sim−q̇_real)²]`(有 τ 加力矩项),逐关节归一化。
-- 优化:CMA-ES / Optuna(或自由空间可微 rollout 梯度);**先逐关节、再全局微调**;
-  **显式检查可辨识性**(armature↔kd、frictionloss↔damping 易简并)。
-- 复刻第 2 节的两个非线性(误差 clamp、Coriolis),重力基线用第 0 步结论。
-- 验证:留出集(没标过的幅值/频率 + 真实任务片段)。
+- **一指标定 → 全手复用**(借鉴 InDex):Tesollo 三指机械对称,只标一根手指的 4 关节(F1M1–F1M4),
+  结果复制到 F2/F3。arm 7 关节逐个标。总有效参数 ≈ 7×3 + 4×3 = 33(而非 19×3 = 57)。
+- 复刻第 2 节的两个非线性(误差 clamp ±0.3、Coriolis 前馈差异),重力基线用第 0 步结论。
+- **sim-to-sim 自洽测试**:先注入已知 θ 生成合成数据,验证拟合能恢复 → 确保管线/可辨识性无误后再用真机数据。
+- 验证:留出集(random 模式录制,未标过的幅值/频率)。
 
 ### 第 3 步 —— 写回 + DR(端到端验证推迟)
 - **当前**:用简单/随机轨迹的**留出集**验证拟合(没标过的幅值/频率/随机种子),不做端到端。
@@ -185,9 +200,10 @@ identification —— 上一次 sysid 比较随意(直接用 LSE 选 kp/kd,没�
 > 且 arm/finger 分开 vel_scale。拟合走 `q_target→q`,与此无关;但作为 port 偏差另行核对。
 
 ## 6. sim 代码改动(待 review 后再动)
-- **新增**:`hand_mjlab/scripts/sysid_replay_fit.py`(单 env 单臂复放 + 整轨拟合;plain MuJoCo,
-  读 `logs/sysid/` 下从 dex copy 过来的 npz)。
-- 拟合输出**写回** `panda_tesollo_constants.py`(armature/frictionloss/damping/delay/重力处理)。
+- **新增**:`hand_mjlab/scripts/sysid_replay_fit.py`(基于 `mujoco.sysid` 内置工具箱,plain MuJoCo
+  单 env CPU;读 `logs/sysid/` 下从 dex copy 过来的 npz;Gauss-Newton 拟合 + HTML 报告 + 可辨识性分析)。
+- **一指标定 → 全手复用**:F1 的 4 关节结果复制到 F2/F3(Tesollo 三指机械对称)。
+- 拟合输出**写回** `panda_tesollo_constants.py`(armature/frictionloss/damping/重力处理)。
 
 ## 6.5 数据流(已确认)
 - **mjlab 不进 container**(py3.13+Warp+GPU,与 dex 容器不兼容)。
@@ -260,3 +276,11 @@ uv run python scripts/sysid_replay_fit.py --arm right \
   `.../examples/oscillating_ex.py`、`.../utils/sysid_action_traj_gen.py`(参考)。
 - sim:`src/hand_mjlab/assets/panda_tesollo/panda_tesollo_constants.py`、
   `src/hand_mjlab/tasks/hand/mdp/actions.py`、`src/hand_mjlab/tasks/hand/hand_env_cfg.py`。
+
+## 参考文献(第 2 步方法依据)
+- **`mujoco.sysid`**:MuJoCo 内置 sysid 工具箱(DeepMind),Gauss-Newton + `mujoco.rollout` 并行扰动,
+  教程含 5-DOF arm armature 辨识。`github.com/google-deepmind/mujoco/tree/main/python/mujoco/sysid`
+- **DeXtreme** (NVIDIA, 2022):Allegro Hand 80 参数 CMA-ES 轨迹匹配 sim2real。`arxiv.org/abs/2210.13702`
+- **InDex / Visual Dexterity** (NVIDIA, 2022):单指 step+正弦标定 → 对称复制。`arxiv.org/abs/2211.11744`
+- **FunGrasp** (CoRL 2025):开环采轨迹 → 反向优化 stiffness/damping;高传动比挑战。`arxiv.org/abs/2411.16755`
+- **`based-robotics/mujoco-sysid`** (GitHub, 92★):含 Franka Panda EE 负载辨识例子 + Log-Cholesky 惯量参数化。
