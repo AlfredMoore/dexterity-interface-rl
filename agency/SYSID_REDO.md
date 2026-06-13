@@ -183,16 +183,33 @@ identification —— 上一次 sysid 比较随意(直接用 LSE 选 kp/kd,没�
 - **可能**:`robot_.setLoad(...)` 修正右臂重力补偿(取决于第 0 步结论;已包成 `sysid_set_load`)。
 
 ### 实施进度
-- ✅ **第 0 步**:C++ 只读出口 `sysid_load_info/gravity/tau_ext/tau_measured/set_load`
-  (`panda_interface.hpp/.cpp`,新增 `model_` 成员 + `<franka/model.h>`)、pybind 5 个 `.def`、
-  `panda/panda_interface.py` 薄包装、诊断脚本 `sysid/sysid_gravity_diag.py`
-  (单臂读 + dump + 离线 `--compare` + set_load 验证)。
-- ✅ **第 1 步**:`sysid/sysid_excitation.py`(架构 B 单臂 in-process;simple+random 激励;
-  **逐字复刻真机 `compute_targets` 管线**;记录 `raw_action/ema_action/q_target/q/dq` → npz)。
-  动态 τ 不记(`sysid_tau_*` 要求控制环停;静态 τ 是第 0 步)。
-- ❌ **控制环重连不做**(已移除,`start_loop`/`stop_loop` 保持原样)。
-- ⚠️ **本机无 franka 头文件/build,未编译验证** → 需 `pip install -e libs/robot_motion_interface`
-  重编译 pybind 扩展(纯 Python 的 `sysid/` editable 即时可见)。`Franka::Franka` 已链接,无需改 CMake。
+- ✅ **第 0 步**(已执行):重力/负载诊断。结果:
+  - 左右 m_ee 已对齐(0.994 kg);m_load=0(Tesollo 走 EE 配置不走 load)。
+  - 右臂 J5/J6 有 ~1–2.7 Nm tau_ext 残差(老化/物理不对称,非配置问题)。
+  - PD 刚度高(kp=70 for J6)→ 力矩失配仅导致 ~0.04 rad 位置偏差。
+- ✅ **第 1 步**(已执行):激励采集(架构 A,ROS pub/sub 经 rl_driver)。
+  右臂 simple×4 幅值(0.1/0.3/0.6/1.0) + random×1;左臂 simple×2 + random×1。
+  数据在 `runtime/system_id/*.npz` 和 `hand_mjlab/logs/sysid/`。
+- ✅ **第 2 步**(已执行):`hand_mjlab/scripts/sysid_replay_fit.py`(基于 `mujoco.sysid`)。
+  拟合结论见下方「最终结论」。
+
+### 最终结论(2026-06-12)
+
+**标称参数已被验证为正确,无需修改 `panda_tesollo_constants.py`。**
+
+| 维度 | 结论 |
+|---|---|
+| **Arm (7 关节)** | RMSE < 0.003 rad(近乎完美) |
+| **Finger M1/M3/M4** | RMSE < 0.01 rad(良好) |
+| **Finger M2** | RMSE 0.025–0.057 rad(三指一致,最大误差源) |
+| **植物参数(armature/frictionloss/damping)** | 优化器在 16 参数 × 4 轨迹上确认标称即为最优(Gauss-Newton 无梯度可降) |
+| **kp/kd** | 解冻后仍不动 → 配置值正确 |
+| **M2 残差原因** | 非参数可解释;最可能是 Tesollo M2 伺服的未建模动力学(backlash/非线性,M2 ROM 最大 ±101°) |
+
+**后续行动:**
+- sim2real 部署时用 **DR 覆盖** M2 残差(DR 范围可针对 M2 设宽)
+- 如果 sim2real 效果不好再回来做更深的 M2 建模(backlash model / neural residual)
+- 左臂大概率也 OK(同型号,标称一致),先不单独标
 
 > **发现的 sim↔real 管线偏差**(记录,影响理解,不影响拟合——因为我们记录 q_target):
 > 真机 `compute_targets`(rl_policy_node)= `tgt = prev_tgt + a·dt·vel·scale`,**无** alpha/joint_pos
