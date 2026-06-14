@@ -1,0 +1,82 @@
+# Runtime params for depth_feat_policy_node using mjlab-trained policies.
+#
+# Replaces the old runtime_cfg_play.yaml (no longer exported) and HandEnv.yaml.
+# These values must match the training config (params/env.yaml actions section).
+# Update when retraining with different action params.
+
+# Action integration (SmoothedJointPositionAction params)
+dt: 0.05               # physics_timestep(0.005) * decimation(10)
+action_ema: 0.5
+action_scale: 1.0
+target_alpha: 0.5
+
+# Per-class velocity scales (applied to action integration)
+arm_vel_scale: 1.0
+finger_vel_scale: 1.5
+arm_joint_expr: "panda_joint.*"
+finger_joint_expr: "F.*M.*"
+
+# Frozen joints (regex matched against unprefixed joint names)
+left_frozen_joint_expr: null
+right_frozen_joint_expr: "panda_joint7"
+
+# FK link names for obs (unprefixed; node adds left_/right_ prefix)
+finger_tip_links: ["F1_TIP_TOP", "F2_TIP_TOP", "F3_TIP_TOP"]
+hand_palm_links: ["delto_offset_link"]
+
+# Soft joint position limits (per-arm, 19 joints: 7 Panda + 12 Tesollo).
+# Same for left and right. From the URDF joint limits.
+soft_lower:
+  - -2.8973    # panda_joint1
+  - -1.7628    # panda_joint2
+  - -2.8973    # panda_joint3
+  - -3.0718    # panda_joint4
+  - -2.8973    # panda_joint5
+  - -0.0175    # panda_joint6
+  - -2.8973    # panda_joint7
+  - -1.0472    # F1M1
+  - -1.7628    # F1M2
+  - -0.1571    # F1M3
+  - -0.2269    # F1M4
+  - -1.9199    # F2M1
+  - -1.7628    # F2M2
+  - -0.1571    # F2M3
+  - -0.2269    # F2M4
+  - -0.0873    # F3M1
+  - -1.7628    # F3M2
+  - -0.1571    # F3M3
+  - -0.2269    # F3M4
+
+soft_upper:
+  - 2.8973     # panda_joint1
+  - 1.7628     # panda_joint2
+  - 2.8973     # panda_joint3
+  - -0.0698    # panda_joint4
+  - 2.8973     # panda_joint5
+  - 3.7525     # panda_joint6
+  - 2.8973     # panda_joint7
+  - 1.0472     # F1M1
+  - 1.7628     # F1M2
+  - 2.5307     # F1M3
+  - 2.0246     # F1M4
+  - 0.1396     # F2M1
+  - 1.7628     # F2M2
+  - 2.5307     # F2M3
+  - 2.0246     # F2M4
+  - 2.0071     # F3M1
+  - 1.7628     # F3M2
+  - 2.5307     # F3M3
+  - 2.0246     # F3M4
+
+# Bottle geom normalization bounds (must match observations.py::_JAR_GEOM_LO/_HI)
+jar_geom_lo: [0.03, 0.10, 0.02, 0.02]
+jar_geom_hi: [0.05, 0.20, 0.055, 0.04]
+
+# Policy inference rate (Hz). Formerly in rl_policy_node_config.yaml.
+infer_rate: 30.0
+
+# Obs layout for the mjlab actor.
+# Actor groups: proprio_noised (history=2) + extero_noised (history=1) = 234d.
+# History order per term: [oldest, newest] (CircularBuffer convention).
+proprio_history: 2
+actor_obs_dim: 234

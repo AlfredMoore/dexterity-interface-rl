@@ -1,21 +1,16 @@
 """Policy node that consumes a pre-computed depth feature vector via CUDA IPC.
 
-============================================================================
-What's different from aux_policy_v2
-============================================================================
-aux_policy_v2 reads the *raw depth image* from cam_node's IPC buffer and lets
-the policy network's internal vision backbone encode it. This node instead
-reads a *pre-computed depth feature vector* from depth_feat_node and splices
-it into the obs vector at the bottle slots
-(`bottleBodyPosNoised` / `bottleCapPosNoised` / `bottleGeomCfg`).
+Refactored for mjlab-trained policies. The obs layout follows mjlab's per-term
+history convention: proprio_noised (112d x history=2 = 224d) concatenated with
+extero_noised (10d x history=1 = 10d) = 234d total actor obs.
 
-depth_feat_node runs the trained `DepthFeatureNetFiLM` (see
-HAND-policy/source/HAND/HAND/tasks/direct/hand/depth_feature.py and
-HAND-policy/scripts/sim2real/train_depth_predictor.py) on the live
-RealSense depth + a YOLO26-seg mask + FK conditioning, and exposes the
-result (10-d in metres) via the same `Trigger`-service IPC pattern cam_node
-uses for raw depth. The service name + tensor layout are read from
-`depth_feat_config.yaml` so producer and consumer can't drift.
+Key differences from the HAND/IsaacLab version:
+  - No joint velocity in actor obs (critic-only in mjlab)
+  - No bottleBodyRot6D in actor obs
+  - jar_geom normalized to [-1,1] (not repeated 3x)
+  - Targets are RAW positions (not scaled)
+  - History is per-term [oldest, newest], not global frame stacking
+  - Config comes from mjlab_policy_runtime.yaml, not runtime_cfg_play.yaml
 """
 
 from __future__ import annotations
@@ -27,9 +22,8 @@ from pathlib import Path
 from typing import Any
 
 import base64
-import cv2
-import io
 import pickle
+import re
 import numpy as np
 import rclpy
 import torch
@@ -37,9 +31,9 @@ import torch.multiprocessing  # noqa: F401  # registers CUDA IPC reducers in For
 import yaml
 from geometry_msgs.msg import PoseArray
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-from rclpy.executors import MultiThreadedExecutor, SingleThreadedExecutor
+from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
-from sensor_msgs.msg import JointState, Image
+from sensor_msgs.msg import JointState
 from std_srvs.srv import Trigger
 
 from robot_motion_interface.utils.qos import HIGH_PERF_QOS, HIGH_RELIA_QOS
@@ -71,68 +65,15 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 
 
 def _scale_torch(value: torch.Tensor, lower: torch.Tensor, upper: torch.Tensor) -> torch.Tensor:
-    """Clip then min-max scale [lower, upper] -> [-1, 1] elementwise.
-
-    Clipping first guarantees the output stays inside [-1, 1] even if `value`
-    strays outside [lower, upper] — e.g. a depth-feature geom prediction
-    landing outside the policy-side bounds when the predictor was trained
-    with slightly different bounds, or a real joint snapshot momentarily
-    exceeding the soft limits. Matches observations.py behaviour so
-    deployment obs has the same range the actor saw during training.
-    """
+    """Clip then min-max scale [lower, upper] -> [-1, 1] elementwise."""
     clipped = value.clamp(min=lower, max=upper)
     return 2.0 * (clipped - lower) / (upper - lower) - 1.0
-
-
-def _rot6d_from_axis(
-    body_pos: torch.Tensor,
-    cap_pos: torch.Tensor,
-    world_z: torch.Tensor,
-    world_x: torch.Tensor,
-) -> torch.Tensor:
-    """Derive bottle rotation 6D from (cap_pos - body_pos) — covers 2/3 DOF.
-
-    The vector from body to cap is the bottle's principal axis = R[:, 2]
-    (third column of the rotation matrix). Rotation around this axis (roll)
-    is unobservable from positions alone, so we pick a deterministic world
-    reference and Gram-Schmidt the remaining two columns. The bottle is
-    roughly rotationally symmetric around its axis, so this loses little
-    info in practice — definitely better than identity, which carries zero
-    axis information.
-
-    Reference axis = world Z, unless the bottle's principal axis is too
-    close to parallel with world Z (cos > 0.95), in which case fall back to
-    world X to keep the cross product well-conditioned.
-
-    Output convention matches `_quat_wxyz_to_6d`: first two columns of R
-    flattened (Zhou et al. 2019).
-
-    Args:
-        body_pos: (B, 3) bottle body position, metres.
-        cap_pos:  (B, 3) bottle cap position, metres.
-        world_z:  (1, 3) or (B, 3) cached world-Z reference.
-        world_x:  (1, 3) or (B, 3) cached world-X reference (fallback).
-
-    Returns:
-        (B, 6) rot6d.
-    """
-    z = cap_pos - body_pos                                       # (B, 3)
-    z = z / z.norm(dim=-1, keepdim=True).clamp(min=1e-9)         # principal axis
-    cos_z = (z * world_z).sum(dim=-1, keepdim=True).abs()        # (B, 1)
-    ref = torch.where(cos_z < 0.95, world_z, world_x)            # broadcast (B, 3)
-    x = torch.cross(ref, z, dim=-1)
-    x = x / x.norm(dim=-1, keepdim=True).clamp(min=1e-9)         # R[:, 0]
-    y = torch.cross(z, x, dim=-1)                                # R[:, 1]
-    return torch.cat([x, y], dim=-1)                             # (B, 6)
 
 
 def _quat_wxyz_to_6d(quat_wxyz: torch.Tensor) -> torch.Tensor:
     """Quaternion (..., 4) wxyz -> 6D rotation (..., 6).
 
-    First two columns of the rotation matrix, flattened. Continuous,
-    free of q ≡ -q antipodal ambiguity (Zhou et al., 2019). Mirrors
-    `observations.py::quat_to_6d` exactly — duplicated here to avoid
-    a cross-repo import.
+    First two columns of the rotation matrix, flattened (Zhou et al., 2019).
     """
     r, i, j, k = torch.unbind(quat_wxyz, -1)
     two_s = 2.0 / (quat_wxyz * quat_wxyz).sum(-1)
@@ -144,12 +85,6 @@ def _quat_wxyz_to_6d(quat_wxyz: torch.Tensor) -> torch.Tensor:
     c1_z = two_s * (j * k + i * r)
     return torch.stack((c0_x, c0_y, c0_z, c1_x, c1_y, c1_z), dim=-1)
 
-
-# Bottle-geom bounds, MUST match observations.py:147-151. Used to convert
-# depth_feat_node's metres-space geom prediction into the [-1, 1] scaled
-# 12-d `bottleGeomCfg` slot the actor consumes.
-_BOTTLE_GEOM_LOWER = (0.03, 0.10, 0.02, 0.02)
-_BOTTLE_GEOM_UPPER = (0.05, 0.20, 0.055, 0.04)
 
 # ---------------------------------------------------------------------------
 # DepthFeatPolicyNode
@@ -168,10 +103,6 @@ class DepthFeatPolicyNode(Node):
         self._init_threading_locks()
 
         # -- 3. components --
-        # No rsl_rl import: the policy comes in as a TorchScript file with
-        # actor + EmpiricalNormalization already baked together (see
-        # IsaacLab's export_policy_as_jit). The node loads it with
-        # torch.jit.load and calls it as `actions = self.policy(obs)`.
         self._build_joint_mappings()
         self._read_hand_link_counts()
         self._build_policy_and_normalizer()
@@ -193,88 +124,41 @@ class DepthFeatPolicyNode(Node):
     # Step 1: params & cfgs
     # ------------------------------------------------------------------
     def _init_callback_mutex_groups(self) -> None:
-        # Three independent mutex groups so /joint_states, fk_topic, and the
-        # policy timer don't serialize each other at the executor level. Each
-        # callback's own lock (joint_lock / fk_lock) still protects shared
-        # state vs the timer reader.
         self.js_grp = MutuallyExclusiveCallbackGroup()
         self.fk_grp = MutuallyExclusiveCallbackGroup()
         self.infer_grp = MutuallyExclusiveCallbackGroup()
 
     def _declare_parameters(self) -> None:
-        """Declare ROS parameters: paths + da3 model override only.
-
-        All paths must be absolute. Frequencies / runtime knobs come from cfg files.
-        Missing files will fail naturally at cfg-load time.
-        """
-        # All training-side artifacts live under a single policy_log dir,
-        # mirroring rsl_rl's checkpoint folder layout. Each retraining run
-        # drops in a new policy.pt + cfg yamls; deployment just rsync's the
-        # log dir over and points this parameter at it. Defaults to
-        # <RMI_ROOT>/runtime/policy_log/ — change via launch arg to swap
-        # between deployed runs without touching the node code.
-        #
-        # Expected layout (mirrors rsl_rl + rslppo_play.py export output):
-        #   <policy_log_dir>/
-        #     exported/
-        #       policy.pt              # TorchScript actor + normalizer
-        #       runtime_cfg_play.yaml  # joint mappings + dt/action_scale/EMA
-        #     params/
-        #       agent.yaml             # PPO agent config (read for logging)
-        #       env.yaml               # actor obs key list + dims
-        self.declare_parameter("policy_log_dir", str((RMI_ROOT / "runtime" / "policy_log").resolve()))
-        self.declare_parameter("hand_env_cfg_path", str((RMI_ROOT / "runtime" / "HandEnv.yaml").resolve()))
+        self.declare_parameter("policy_log_dir", str((RMI_ROOT / "runtime" / "policy").resolve()))
+        self.declare_parameter("mjlab_runtime_cfg_path", str((RMI_ROOT / "config" / "mjlab_policy_runtime.yaml").resolve()))
         self.declare_parameter("driver_cfg_path", str((RMI_ROOT / "config" / "rl_bimanual_driver_config.yaml").resolve()))
-        self.declare_parameter("policy_node_cfg_path", str((RMI_ROOT / "config" / "rl_policy_node_config.yaml").resolve()))
         self.declare_parameter("fk_cfg_path", str((RMI_ROOT / "config" / "fk_config.yaml").resolve()))
-        self.declare_parameter("da3_cfg_path", str((RMI_ROOT / "config" / "da3_compile_config.yaml").resolve()))
         self.declare_parameter(
             "depth_feat_cfg_path",
             str((RMI_ROOT / "config" / "depth_feat_config.yaml").resolve()),
         )
 
-        # Derive per-file paths from the policy_log root. If your deployment
-        # layout differs, override `policy_log_dir` rather than each path.
         self.policy_log_dir = Path(self.get_parameter("policy_log_dir").value)
         self.jit_policy_path = self.policy_log_dir / "exported" / "policy.pt"
-        self.runtime_cfg_path = self.policy_log_dir / "exported" / "runtime_cfg_play.yaml"
-        self.agent_cfg_path = self.policy_log_dir / "params" / "agent.yaml"
-        self.env_cfg_path = self.policy_log_dir / "params" / "env.yaml"
 
-        self.hand_env_cfg_path = Path(self.get_parameter("hand_env_cfg_path").value)
+        self.mjlab_runtime_cfg_path = Path(self.get_parameter("mjlab_runtime_cfg_path").value)
         self.driver_cfg_path = Path(self.get_parameter("driver_cfg_path").value)
-        self.policy_node_cfg_path = Path(self.get_parameter("policy_node_cfg_path").value)
         self.fk_cfg_path = Path(self.get_parameter("fk_cfg_path").value)
-        self.da3_cfg_path = Path(self.get_parameter("da3_cfg_path").value)
         self.depth_feat_cfg_path = Path(self.get_parameter("depth_feat_cfg_path").value)
 
     def _load_configs(self) -> None:
-        """Load all YAML cfgs. Missing files raise FileNotFoundError naturally."""
-        self.runtime_cfg = _load_yaml(self.runtime_cfg_path)
-        self.env_cfg = _load_yaml(self.env_cfg_path)
-        # agent.yaml is loaded for diagnostics (PPO hparams, normalization
-        # flag) — the JIT policy doesn't actually need it at runtime since
-        # actor + normalizer are baked into the ScriptModule.
-        self.agent_cfg = _load_yaml(self.agent_cfg_path)
-        self.hand_env_cfg = _load_yaml(self.hand_env_cfg_path)
+        self.mjlab_rt = _load_yaml(self.mjlab_runtime_cfg_path)
         self.driver_cfg = _load_yaml(self.driver_cfg_path)
-        self.policy_node_cfg = _load_yaml(self.policy_node_cfg_path)
         self.fk_cfg = _load_yaml(self.fk_cfg_path)
-        self.da3_full_cfg = _load_yaml(self.da3_cfg_path)
         self.depth_feat_full_cfg = _load_yaml(self.depth_feat_cfg_path)
 
-        self.get_logger().info("#### Depth-feat policy node configs: ####")
-        self.get_logger().info(f"policy_log_dir:       {self.policy_log_dir}")
-        self.get_logger().info(f"  jit_policy_path:    {self.jit_policy_path}")
-        self.get_logger().info(f"  runtime_cfg_path:   {self.runtime_cfg_path}")
-        self.get_logger().info(f"  agent_cfg_path:     {self.agent_cfg_path}")
-        self.get_logger().info(f"  env_cfg_path:       {self.env_cfg_path}")
-        self.get_logger().info(f"hand_env_cfg_path:    {self.hand_env_cfg_path}")
-        self.get_logger().info(f"driver_cfg_path:      {self.driver_cfg_path}")
-        self.get_logger().info(f"policy_node_cfg_path: {self.policy_node_cfg_path}")
-        self.get_logger().info(f"da3_cfg_path:         {self.da3_cfg_path}")
-        self.get_logger().info(f"fk_cfg_path:          {self.fk_cfg_path}")
-        self.get_logger().info(f"depth_feat_cfg_path:  {self.depth_feat_cfg_path}")
+        self.get_logger().info("#### Depth-feat policy node configs (mjlab): ####")
+        self.get_logger().info(f"policy_log_dir:          {self.policy_log_dir}")
+        self.get_logger().info(f"  jit_policy_path:       {self.jit_policy_path}")
+        self.get_logger().info(f"mjlab_runtime_cfg_path:  {self.mjlab_runtime_cfg_path}")
+        self.get_logger().info(f"driver_cfg_path:         {self.driver_cfg_path}")
+        self.get_logger().info(f"fk_cfg_path:             {self.fk_cfg_path}")
+        self.get_logger().info(f"depth_feat_cfg_path:     {self.depth_feat_cfg_path}")
 
     def _init_device(self) -> None:
         if not torch.cuda.is_available():
@@ -297,43 +181,55 @@ class DepthFeatPolicyNode(Node):
 
     def _build_joint_mappings(self) -> None:
         # Real driver order: left panda+tesollo, then right panda+tesollo.
-        left_real = [
-            "left_" + n
-            for n in self.driver_cfg["left_panda_joint_names"] + self.driver_cfg["left_tesollo_joint_names"]
-        ]
-        right_real = [
-            "right_" + n
-            for n in self.driver_cfg["right_panda_joint_names"] + self.driver_cfg["right_tesollo_joint_names"]
-        ]
+        left_panda = self.driver_cfg["left_panda_joint_names"]
+        left_tesollo = self.driver_cfg["left_tesollo_joint_names"]
+        right_panda = self.driver_cfg["right_panda_joint_names"]
+        right_tesollo = self.driver_cfg["right_tesollo_joint_names"]
+
+        left_real = ["left_" + n for n in left_panda + left_tesollo]
+        right_real = ["right_" + n for n in right_panda + right_tesollo]
         self.real_joint_names = left_real + right_real
         self.action_num = len(self.real_joint_names)
 
-        # Bidirectional index map between policy order and real driver order.
-        policy_joint_names = self.runtime_cfg["bimanual_joint_names"]
+        # Policy order = driver's all_joint_names (same 38-d bimanual ordering).
+        policy_joint_names = list(self.driver_cfg["all_joint_names"])
         policy2real_idx, real2policy_idx = joint_mapping(policy_joint_names, self.real_joint_names)
         self.policy2real_idx = self._to_dev_t(policy2real_idx, dtype=torch.long)
         self.real2policy_idx = self._to_dev_t(real2policy_idx, dtype=torch.long)
 
-        # Per-arm policy-order indices into the bimanual action vector.
-        policy_action_indices = self.runtime_cfg["policy_action_indices_dict"]
-        self.left_policy_indices = self._to_dev_t(policy_action_indices["left"], dtype=torch.long)
-        self.right_policy_indices = self._to_dev_t(policy_action_indices["right"], dtype=torch.long)
+        # Per-arm indices: first 19 joints are left (7 panda + 12 tesollo),
+        # next 19 are right.
+        n_per_arm = len(left_panda) + len(left_tesollo)
+        self.left_policy_indices = self._to_dev_t(list(range(n_per_arm)), dtype=torch.long)
+        self.right_policy_indices = self._to_dev_t(list(range(n_per_arm, 2 * n_per_arm)), dtype=torch.long)
 
-        # Per-arm scales / soft limits / vel limits (policy order, per-arm slices).
-        scale_dict = self.runtime_cfg["robot_action_scale_dict"]
-        limits_dict = self.runtime_cfg["robot_joint_limits_dict"]
-        vel_scale_left = self._to_dev_t(scale_dict["left_joint_vel_action"])
-        vel_scale_right = self._to_dev_t(scale_dict["right_joint_vel_action"])
-        lower_left = self._to_dev_t(limits_dict["left_joint_pose_soft_lower"])
-        lower_right = self._to_dev_t(limits_dict["right_joint_pose_soft_lower"])
-        upper_left = self._to_dev_t(limits_dict["left_joint_pose_soft_upper"])
-        upper_right = self._to_dev_t(limits_dict["right_joint_pose_soft_upper"])
-        vel_limit_left = self._to_dev_t(limits_dict["left_joint_vel"])
-        vel_limit_right = self._to_dev_t(limits_dict["right_joint_vel"])
+        # Vel scale: arm joints get arm_vel_scale, finger joints get finger_vel_scale.
+        arm_vel = float(self.mjlab_rt["arm_vel_scale"])
+        finger_vel = float(self.mjlab_rt["finger_vel_scale"])
+        arm_expr = self.mjlab_rt["arm_joint_expr"]
+        finger_expr = self.mjlab_rt["finger_joint_expr"]
+
+        def _vel_scale_for(unprefixed_names: list[str]) -> list[float]:
+            scales = []
+            for n in unprefixed_names:
+                if re.fullmatch(arm_expr, n):
+                    scales.append(arm_vel)
+                elif re.fullmatch(finger_expr, n):
+                    scales.append(finger_vel)
+                else:
+                    raise ValueError(f"Joint '{n}' matches neither arm_joint_expr nor finger_joint_expr")
+            return scales
+
+        unprefixed_left = left_panda + left_tesollo
+        unprefixed_right = right_panda + right_tesollo
+        vel_scale_left = self._to_dev_t(_vel_scale_for(unprefixed_left))
+        vel_scale_right = self._to_dev_t(_vel_scale_for(unprefixed_right))
+
+        # Soft limits (same for both arms, from mjlab_runtime_cfg).
+        soft_lower = self._to_dev_t(self.mjlab_rt["soft_lower"])
+        soft_upper = self._to_dev_t(self.mjlab_rt["soft_upper"])
 
         # Scatter per-arm slices into full bimanual policy-order vectors.
-        # Integration runs in policy order; conversion to real order only happens
-        # at the publish boundary in _policy_update_loop.
         def _scatter_full(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
             full = torch.zeros(self.action_num, dtype=torch.float32, device=self.device)
             full[self.left_policy_indices] = left
@@ -341,30 +237,39 @@ class DepthFeatPolicyNode(Node):
             return full
 
         self.full_scale_policy = _scatter_full(vel_scale_left, vel_scale_right).unsqueeze(0)
-        self.full_lower_policy = _scatter_full(lower_left, lower_right).unsqueeze(0)
-        self.full_upper_policy = _scatter_full(upper_left, upper_right).unsqueeze(0)
+        self.full_lower_policy = _scatter_full(soft_lower, soft_lower).unsqueeze(0)
+        self.full_upper_policy = _scatter_full(soft_upper, soft_upper).unsqueeze(0)
 
-        # Per-arm bounds kept for obs scaling (policy order, per-arm).
-        self.left_soft_lower = lower_left.unsqueeze(0)
-        self.left_soft_upper = upper_left.unsqueeze(0)
-        self.right_soft_lower = lower_right.unsqueeze(0)
-        self.right_soft_upper = upper_right.unsqueeze(0)
-        self.left_vel_limit = vel_limit_left.unsqueeze(0)
-        self.right_vel_limit = vel_limit_right.unsqueeze(0)
+        # Per-arm soft limits kept for obs scaling.
+        self.left_soft_lower = soft_lower.unsqueeze(0)
+        self.left_soft_upper = soft_upper.unsqueeze(0)
+        self.right_soft_lower = soft_lower.unsqueeze(0)
+        self.right_soft_upper = soft_upper.unsqueeze(0)
+
+        # Frozen-joint mask per arm.
+        left_frozen_expr = self.mjlab_rt.get("left_frozen_joint_expr")
+        right_frozen_expr = self.mjlab_rt.get("right_frozen_joint_expr")
+        frozen = torch.zeros(self.action_num, dtype=torch.bool, device=self.device)
+
+        if left_frozen_expr:
+            for i, name in enumerate(unprefixed_left):
+                if re.fullmatch(left_frozen_expr, name):
+                    frozen[i] = True
+        if right_frozen_expr:
+            for i, name in enumerate(unprefixed_right):
+                if re.fullmatch(right_frozen_expr, name):
+                    frozen[n_per_arm + i] = True
+
+        if frozen.any():
+            frozen_names = [n for n, f in zip(policy_joint_names, frozen) if f]
+            self.get_logger().info(f"Frozen joints: {frozen_names}")
+        self._frozen_mask = frozen
 
     def _read_hand_link_counts(self) -> None:
-        """Resolve fk topic + per-group prefixed link names used to look up
-        positions inside fk_pose_dict during compose_obs.
+        """Resolve FK link names from mjlab_runtime_cfg."""
+        finger_tip_links = list(self.mjlab_rt["finger_tip_links"])
+        hand_palm_links = list(self.mjlab_rt["hand_palm_links"])
 
-        FK itself runs in the external fk_node. fk_cfg.link_names is the source
-        of truth for both the published PoseArray order and the fk_pose_dict
-        keys.
-        """
-        hand_link_dict = self.hand_env_cfg["env"]["robot"]["linkNames"]
-        finger_tip_links = list(hand_link_dict["finger_tips"])
-        hand_palm_links = list(hand_link_dict["hand_palm"])
-
-        # Prefixed names matching pinocchio frames in fk_node / fk_cfg.link_names.
         self.left_fingertip_names = [f"left_{n}" for n in finger_tip_links]
         self.right_fingertip_names = [f"right_{n}" for n in finger_tip_links]
         self.left_hand_base_names = [f"left_{n}" for n in hand_palm_links]
@@ -375,67 +280,19 @@ class DepthFeatPolicyNode(Node):
         self.fk_topic = str(self.fk_cfg["fk_topic"])
 
     def _build_policy_and_normalizer(self) -> None:
-        """Resolve obs dims from env.yaml, then load the JIT-exported policy.
+        """Load obs dims from mjlab_runtime_cfg, cache scaling tensors, load JIT policy."""
+        # Jar geom bounds from runtime config.
+        self._geom_lower_t = self._to_dev_t(self.mjlab_rt["jar_geom_lo"]).unsqueeze(0)
+        self._geom_upper_t = self._to_dev_t(self.mjlab_rt["jar_geom_hi"]).unsqueeze(0)
 
-        The TorchScript file at `self.jit_policy_path` was produced by
-        IsaacLab's `export_policy_as_jit`, which wraps:
-            forward(obs) = actor(normalizer(obs))
-        So inference is just `actions = self.policy(obs_clamped)` — no
-        separate EmpiricalNormalization, no rsl-rl class import, no
-        state_dict surgery. Re-export from rslppo_play.py whenever the
-        upstream training run changes.
+        # Obs dims.
+        self.obs_dim = int(self.mjlab_rt["actor_obs_dim"])
+        self.proprio_history = int(self.mjlab_rt["proprio_history"])
 
-        The depth feature still gets spliced into the obs vector at the
-        `bottleBodyPosNoised` / `bottleCapPosNoised` / `bottleGeomCfg` slots
-        inside `_compose_actor_obs`; that part is independent of how the
-        actor weights happen to be packaged.
-        """
-        # 1. Cache scaling tensors used by _compose_actor_obs.
-        # Bottle-geom bounds (1, 4) — MUST match observations.py:147-151.
-        self._geom_lower_t = self._to_dev_t(list(_BOTTLE_GEOM_LOWER)).unsqueeze(0)
-        self._geom_upper_t = self._to_dev_t(list(_BOTTLE_GEOM_UPPER)).unsqueeze(0)
-
-        # World reference axes used by _rot6d_from_axis to Gram-Schmidt the
-        # bottle's rotation from (cap_pos - body_pos). World Z is the primary
-        # reference; world X is the fallback when the bottle axis is nearly
-        # parallel to world Z (avoids degenerate cross-product). Shape (1, 3)
-        # so they broadcast against the (B, 3) pos tensors.
-        self._world_z = self._to_dev_t([0.0, 0.0, 1.0]).unsqueeze(0)
-        self._world_x = self._to_dev_t([1.0, 0.0, 0.0]).unsqueeze(0)
-
-        # 2. Read obs dims / actor key order from env.yaml. The JIT file
-        # carries the actor weights but NOT the obs key list, so we still
-        # need env_cfg as the single source of truth for the obs layout.
-        self.n_stack_frame = int(self.env_cfg["n_stack_frame"])
-        self.actor_obs_keys: list[str] = list(self.env_cfg["actors"])
-        self.actor_obs_unstacked_space = int(self.env_cfg["actor_obs_unstacked_space"])
-        self.critic_obs_unstacked_space = int(self.env_cfg["critic_obs_unstacked_space"])
-        self.num_actor_obs = self.n_stack_frame * self.actor_obs_unstacked_space
-        self.num_critic_obs = self.n_stack_frame * self.critic_obs_unstacked_space
-
-        # Mirror aux_policy_v2's `obs_dim` / `state_dim` names so the rest of
-        # the class (buffers, summary, etc.) keeps working unchanged.
-        self.obs_dim = self.num_actor_obs
-        self.state_dim = self.num_critic_obs
-
-        # cfg-internal sanity: obs_DOF summed over the actor keys must equal
-        # actor_obs_unstacked_space — catches yaml drift early.
-        obs_dof = self.env_cfg["obs_DOF"]
-        inferred_unstacked = sum(int(obs_dof[k]) for k in self.actor_obs_keys)
-        if inferred_unstacked != self.actor_obs_unstacked_space:
-            raise ValueError(
-                f"sum(obs_DOF[actor_obs_keys])={inferred_unstacked} "
-                f"!= actor_obs_unstacked_space={self.actor_obs_unstacked_space}"
-            )
-
-        # 3. Load the JIT-exported policy. The exporter bakes the
-        # EmpiricalNormalization in as the first module of `forward`, so
-        # calling `self.policy(raw_obs)` returns actions directly.
         if not self.jit_policy_path.exists():
             raise FileNotFoundError(
                 f"JIT policy not found at {self.jit_policy_path}. "
-                f"Re-export via rslppo_play.py (export_policy_as_jit) or "
-                f"point --jit_policy_path at the correct exported/ dir."
+                f"Re-export or point --policy_log_dir at the correct run."
             )
         self.policy = torch.jit.load(
             str(self.jit_policy_path), map_location=self.device
@@ -443,15 +300,10 @@ class DepthFeatPolicyNode(Node):
         self.policy.eval()
         self.get_logger().info(
             f"Loaded JIT policy: {self.jit_policy_path}  "
-            f"(num_actor_obs={self.num_actor_obs}, num_actions={self.action_num})"
+            f"(actor_obs_dim={self.obs_dim}, num_actions={self.action_num})"
         )
 
     def _init_state_buffers(self) -> None:
-        """Allocate all reusable np / torch buffers used by the policy loop.
-
-        Sized off cfg-derived dims; allocated once here so the policy loop never
-        does per-step allocations.
-        """
         A = self.action_num
 
         # /joint_states latest snapshot (CPU, written by sub callback).
@@ -463,63 +315,44 @@ class DepthFeatPolicyNode(Node):
         self._joint_pos_snapshot_np: np.ndarray = np.zeros((A,), dtype=np.float32)
         self._joint_vel_snapshot_np: np.ndarray = np.zeros((A,), dtype=np.float32)
 
-        # GPU mirrors used by the policy loop (filled from CPU snapshots).
-        # All in policy order — joint_pos/vel are converted from real at the loop top.
+        # GPU mirrors (policy order).
         self._joint_pos_policy_t: torch.Tensor = torch.zeros((1, A), dtype=torch.float32, device=self.device)
         self._joint_vel_policy_t: torch.Tensor = torch.zeros((1, A), dtype=torch.float32, device=self.device)
         self._targets_snapshot_t: torch.Tensor = torch.zeros((1, A), dtype=torch.float32, device=self.device)
         self._prev_actions_snapshot_t: torch.Tensor = torch.zeros((1, A), dtype=torch.float32, device=self.device)
 
-        # Persistent policy state (policy order; lives across steps).
+        # Persistent policy state (policy order).
         self.targets_policy: torch.Tensor = torch.zeros((1, A), dtype=torch.float32, device=self.device)
         self.targets_initialized: bool = False
         self.prev_actions_policy: torch.Tensor = torch.zeros((1, A), dtype=torch.float32, device=self.device)
-        # Previous unstacked actor obs, used for the second frame in the
-        # stacked obs (n_stack_frame=2 case).
-        self.prev_actor_obs: torch.Tensor = torch.zeros(
-            (1, self.actor_obs_unstacked_space), dtype=torch.float32, device=self.device
-        )
+        self._frozen_default_targets: torch.Tensor = torch.zeros((1, A), dtype=torch.float32, device=self.device)
 
-        # Stacked-obs working buffers (reused every step).
-        self._stacked_obs_buf: torch.Tensor = torch.zeros((1, self.obs_dim), dtype=torch.float32, device=self.device)
+        # Per-term proprio history buffer: stores the previous frame's proprio
+        # terms (112d total = 19+19+19+19+9+9+3+6+3+6 per side).
+        # On first step, initialized from the current frame.
+        self._PROPRIO_DIM = 112
+        self._prev_proprio: torch.Tensor = torch.zeros(
+            (1, self._PROPRIO_DIM), dtype=torch.float32, device=self.device
+        )
+        self._proprio_initialized: bool = False
+
+        # Working buffers.
+        self._obs_buf: torch.Tensor = torch.zeros((1, self.obs_dim), dtype=torch.float32, device=self.device)
         self._obs_clamped_buf: torch.Tensor = torch.zeros((1, self.obs_dim), dtype=torch.float32, device=self.device)
 
-        # FK results: a single dict keyed by "<linkname>_pos" (xyz, float32[3]) and
-        # "<linkname>_wxyz" (float32[4]). Pre-allocated in fk_cfg.link_names order;
+        # FK results dict.
         self.fk_pose_dict: dict[str, np.ndarray] = {}
         for name in self.fk_link_names:
             self.fk_pose_dict[name + "_pos"] = np.zeros(3, dtype=np.float32)
             self.fk_pose_dict[name + "_wxyz"] = np.zeros(4, dtype=np.float32)
         self.has_fk: bool = False
 
-        # Depth feature tensor: a CUDA IPC view onto depth_feat_node's
-        # persistent feature buffer. Filled by _fetch_depth_feature_handle();
-        # read directly by the policy loop with no lock — tearing is rare and
-        # the cost of a torn read is negligible. Shape is (1, feature_dim)
-        # at the moment; see DepthFeatureNetFiLM for the feature layout.
+        # Depth feature IPC tensor.
         self.latest_depth_feature: torch.Tensor | None = None
-        # self._feat_snapshot_t: torch.Tensor | None = None  # set in _fetch_*
 
     def _fetch_depth_feature_handle(self) -> None:
-        """One-shot: call depth_feat_node's service, decode the CUDA IPC
-        handle, and attach self.latest_depth_feature to its persistent
-        feature buffer.
-
-        Mirrors aux_policy_v2's `_fetch_depth_handle` exactly — only the
-        upstream node and expected tensor layout differ:
-            * upstream: depth_feat_node (not cam_node).
-            * service:  resolved from depth_feat_config.yaml::ipc.handle_service_name
-                        (same yaml the producer uses, so the two are guaranteed
-                        in sync).
-            * payload:  (1, 10) float CUDA tensor laid out as
-                        [bottleBodyPos(3), bottleCapPos(3), bottleGeomCfg(4)]
-                        all in metres (geom un-normalized on the producer side).
-
-        Blocks until the service is advertised. Once attached,
-        self.latest_depth_feature is a direct GPU view; depth_feat_node keeps
-        writing into the same memory via copy_, so reads always reflect the
-        most recent completed inference.
-        """
+        """One-shot: call depth_feat_node's service, decode CUDA IPC handle,
+        attach self.latest_depth_feature to the persistent feature buffer."""
         service_name = str(self.depth_feat_full_cfg["ipc"]["handle_service_name"])
 
         client = self.create_client(Trigger, service_name)
@@ -559,8 +392,6 @@ class DepthFeatPolicyNode(Node):
             )
 
         self.latest_depth_feature = feature_view
-        # Local pre-allocated snapshot. Bounds any tearing window to a single
-        # D2D copy (~10us) instead of spanning a full upstream inference (~ms).
         self._feat_snapshot_t = torch.empty_like(feature_view)
         self.get_logger().info(
             f"Depth-feature IPC handle received: shape={tuple(feature_view.shape)} "
@@ -571,7 +402,6 @@ class DepthFeatPolicyNode(Node):
     # Step 4: subs & pubs
     # ------------------------------------------------------------------
     def _init_pub_sub(self) -> None:
-        """Wire ROS I/O: subscribe to /joint_states + fk_topic, publish /target_joint_states."""
         self.target_pub = self.create_publisher(
             JointState, "/target_joint_states", HIGH_RELIA_QOS
         )
@@ -582,7 +412,6 @@ class DepthFeatPolicyNode(Node):
             HIGH_PERF_QOS,
             callback_group=self.js_grp,
         )
-        # Single FK PoseArray from fk_node. Pose order matches fk_cfg.link_names.
         self.create_subscription(
             PoseArray,
             self.fk_topic,
@@ -590,19 +419,8 @@ class DepthFeatPolicyNode(Node):
             HIGH_PERF_QOS,
             callback_group=self.fk_grp,
         )
-        
-        # No depth visualization in this node; the feature is a 1D vector.
-        # depth_feat_node should expose its own depth/mask debug publisher
-        # if visualization is needed for the upstream pipeline.
 
     def _sub_fk_cb(self, msg: PoseArray) -> None:
-        """Write the inbound PoseArray into fk_pose_dict in fk_cfg.link_names order.
-
-        Per link, two entries are stored:
-          - "<linkname>_pos":  float32[3]  (x, y, z)
-          - "<linkname>_wxyz": float32[4]  (w, x, y, z)
-        fk_lock protects writers vs the compose_obs reader.
-        """
         if len(msg.poses) != self.fk_n_links:
             self.get_logger().error(
                 f"{self.fk_topic} pose count mismatch: {len(msg.poses)} vs "
@@ -625,17 +443,12 @@ class DepthFeatPolicyNode(Node):
             self.has_fk = True
 
     def _sub_joint_state_cb(self, msg: JointState) -> None:
-        """Snapshot the latest joint state into pre-allocated CPU buffers."""
         if len(msg.position) != self.action_num:
-            # Fail loudly — driver_cfg's joint name list and the actual
-            # /joint_states msg must agree, otherwise the policy/real index
-            # maps in _build_joint_mappings are all wrong.
             raise RuntimeError(
                 f"/joint_states DoF mismatch: msg.position has "
                 f"{len(msg.position)} entries, driver_cfg expects "
                 f"{self.action_num}."
             )
-        # Convert outside the lock to keep the critical section to a memcpy.
         pos_np = np.asarray(msg.position, dtype=np.float32)
         vel_np = np.asarray(msg.velocity, dtype=np.float32)
         with self.joint_lock:
@@ -644,23 +457,17 @@ class DepthFeatPolicyNode(Node):
             self.has_joint_state = True
 
     # ------------------------------------------------------------------
-    # Step 5: timer + summary 
-    # helpers: FK, obs composition, target integration, timing log
+    # Step 5: timer + summary
     # ------------------------------------------------------------------
     def _init_policy_timer(self) -> None:
-        """Initialize policy-step runtime scalars and start the policy ROS timer."""
-        self.policy_hz = float(self.policy_node_cfg["infer_rate"])
+        self.policy_hz = float(self.mjlab_rt["infer_rate"])
         if self.policy_hz <= 0.0:
             raise ValueError(f"infer_rate must be > 0, got {self.policy_hz}")
 
-        self.dt = float(self.runtime_cfg["dt"])
-        self.action_ema = float(self.runtime_cfg["action_EMA"])
-        # action_scale comes straight from runtime_cfg now (1.0 at time of
-        # writing per logs/.../runtime_cfg_play.yaml); aux_policy_v2 had a
-        # hardcoded 0.25 override that's been removed — must stay in sync
-        # with the training-side env's action_scale or target integration
-        # will drift away from the trained dynamics.
-        self.action_scale = float(self.runtime_cfg["action_scale"])
+        self.dt = float(self.mjlab_rt["dt"])
+        self.action_ema = float(self.mjlab_rt["action_ema"])
+        self.action_scale = float(self.mjlab_rt["action_scale"])
+        self.target_alpha = float(self.mjlab_rt["target_alpha"])
 
         timer_dt = 1.0 / self.policy_hz
         if abs(timer_dt - self.dt) > 1e-5:
@@ -680,137 +487,131 @@ class DepthFeatPolicyNode(Node):
 
     def _compose_actor_obs(
         self,
-        joint_pos_policy: torch.Tensor,  # [1, A] policy order
-        joint_vel_policy: torch.Tensor,  # [1, A] policy order
-        targets_policy: torch.Tensor,    # [1, A] policy order
-        feat_t: torch.Tensor,            # [1, 10] depth-feature: body(3) + cap(3) + geom(4) in metres
+        joint_pos_policy: torch.Tensor,  # [1, A]
+        targets_policy: torch.Tensor,    # [1, A]
+        feat_t: torch.Tensor,            # [1, 10] body(3)+cap(3)+geom(4) in metres
     ) -> torch.Tensor:
-        """Build the unstacked actor observation vector in the policy's expected key order.
+        """Build the 234d actor obs in mjlab's per-term history layout.
 
-        Three families of slots are filled here:
-          - proprio (joints, targets):   from /joint_states (already in policy order).
-          - FK (fingertips, hand base):  from fk_pose_dict, populated by fk_node.
-                                         Hand-base quaternions get converted to 6D.
-          - bottle (pos + geom):         from feat_t, the depth-feature node's
-                                         IPC tensor. The 4-d raw geom is rescaled
-                                         to [-1, 1] using observations.py bounds
-                                         and repeated 3x to fill the 12-d slot.
+        proprio_noised (224d) = 10 terms x [prev, current]:
+          left_joint_pos(19) | right_joint_pos(19) |
+          left_targets(19)   | right_targets(19)   |
+          left_fingertips(9) | right_fingertips(9) |
+          left_palm_pos(3)   | left_palm_rot6d(6)  |
+          right_palm_pos(3)  | right_palm_rot6d(6)
+          = 112 per frame, x2 history = 224
 
-        FK from real sensors is naturally noisy, so the FK-derived obs fill the
-        *Noised slots in actor_obs_keys without any extra noise injection.
-        Same goes for the depth feature — the trained predictor's error stands
-        in for the env's `bottle_pos_noise` term.
+        extero_noised (10d, no history):
+          bottle_pos(3) | cap_pos(3) | jar_geom(4)
         """
         left_jp = joint_pos_policy[:, self.left_policy_indices]
         right_jp = joint_pos_policy[:, self.right_policy_indices]
-        left_jv = joint_vel_policy[:, self.left_policy_indices]
-        right_jv = joint_vel_policy[:, self.right_policy_indices]
         left_tgt = targets_policy[:, self.left_policy_indices]
         right_tgt = targets_policy[:, self.right_policy_indices]
 
+        # Scale joint positions to [-1, 1] via soft limits.
         left_jp_s = _scale_torch(left_jp, self.left_soft_lower, self.left_soft_upper)
         right_jp_s = _scale_torch(right_jp, self.right_soft_lower, self.right_soft_upper)
-        left_jv_s = left_jv / self.left_vel_limit
-        right_jv_s = right_jv / self.right_vel_limit
 
-        # Snapshot FK positions + quats out of fk_pose_dict (concatenate into
-        # flat ndarrays under fk_lock), then H2D outside the lock. Quaternions
-        # are stored wxyz (see _sub_fk_cb), which matches observations.py's
-        # quat_to_6d convention.
+        # FK positions + palm quats.
         with self.fk_lock:
             l_ft_pos_np = np.concatenate([self.fk_pose_dict[n + "_pos"] for n in self.left_fingertip_names])
             r_ft_pos_np = np.concatenate([self.fk_pose_dict[n + "_pos"] for n in self.right_fingertip_names])
-            l_hb_pos_np = np.concatenate([self.fk_pose_dict[n + "_pos"] for n in self.left_hand_base_names])
-            l_hb_wxyz_np = np.concatenate([self.fk_pose_dict[n + "_wxyz"] for n in self.left_hand_base_names])
-            r_hb_pos_np = np.concatenate([self.fk_pose_dict[n + "_pos"] for n in self.right_hand_base_names])
-            r_hb_wxyz_np = np.concatenate([self.fk_pose_dict[n + "_wxyz"] for n in self.right_hand_base_names])
-        l_ft_pos = torch.from_numpy(l_ft_pos_np).unsqueeze(0).to(self.device, non_blocking=True)
-        r_ft_pos = torch.from_numpy(r_ft_pos_np).unsqueeze(0).to(self.device, non_blocking=True)
-        l_hb_pos = torch.from_numpy(l_hb_pos_np).unsqueeze(0).to(self.device, non_blocking=True)
-        r_hb_pos = torch.from_numpy(r_hb_pos_np).unsqueeze(0).to(self.device, non_blocking=True)
+            l_palm_pos_np = np.concatenate([self.fk_pose_dict[n + "_pos"] for n in self.left_hand_base_names])
+            r_palm_pos_np = np.concatenate([self.fk_pose_dict[n + "_pos"] for n in self.right_hand_base_names])
+            l_palm_wxyz_np = np.concatenate([self.fk_pose_dict[n + "_wxyz"] for n in self.left_hand_base_names])
+            r_palm_wxyz_np = np.concatenate([self.fk_pose_dict[n + "_wxyz"] for n in self.right_hand_base_names])
 
-        # quat (wxyz) -> 6D. Single hand-base link per side, so input/output are flat.
-        l_hb_wxyz = torch.from_numpy(l_hb_wxyz_np).unsqueeze(0).to(self.device, non_blocking=True)
-        r_hb_wxyz = torch.from_numpy(r_hb_wxyz_np).unsqueeze(0).to(self.device, non_blocking=True)
-        l_hb_rot6d = _quat_wxyz_to_6d(l_hb_wxyz)   # (1, 6)
-        r_hb_rot6d = _quat_wxyz_to_6d(r_hb_wxyz)   # (1, 6)
+        l_ft_pos = torch.from_numpy(l_ft_pos_np).unsqueeze(0).to(self.device, non_blocking=True)    # (1, 9)
+        r_ft_pos = torch.from_numpy(r_ft_pos_np).unsqueeze(0).to(self.device, non_blocking=True)    # (1, 9)
+        l_palm_pos = torch.from_numpy(l_palm_pos_np).unsqueeze(0).to(self.device, non_blocking=True) # (1, 3)
+        r_palm_pos = torch.from_numpy(r_palm_pos_np).unsqueeze(0).to(self.device, non_blocking=True) # (1, 3)
 
-        # Split depth feature tensor: [body(3), cap(3), geom_raw(4)] in metres.
-        body_pos_m = feat_t[:, 0:3]                # (1, 3)
-        cap_pos_m  = feat_t[:, 3:6]                # (1, 3)
-        geom_raw_m = feat_t[:, 6:10]               # (1, 4) raw metres — scaled inline below
+        l_palm_wxyz = torch.from_numpy(l_palm_wxyz_np).unsqueeze(0).to(self.device, non_blocking=True)
+        r_palm_wxyz = torch.from_numpy(r_palm_wxyz_np).unsqueeze(0).to(self.device, non_blocking=True)
+        l_palm_rot6d = _quat_wxyz_to_6d(l_palm_wxyz)  # (1, 6)
+        r_palm_rot6d = _quat_wxyz_to_6d(r_palm_wxyz)  # (1, 6)
 
-        # Inline scaling matches observations.py:147-151 — bottle geom is
-        # scaled to [-1, 1] and repeated 3x at obs-dict construction time,
-        # not pre-computed.
-        full_obs = {
-            # proprio (clean + noised both point to the same scaled vector
-            # because real sensors already carry the noise)
-            "leftJointPosScaled": left_jp_s,
-            "rightJointPosScaled": right_jp_s,
-            "leftJointPosScaledNoised": left_jp_s,
-            "rightJointPosScaledNoised": right_jp_s,
-            "leftJointVelScaled": left_jv_s,
-            "rightJointVelScaled": right_jv_s,
-            "leftTargets": left_tgt,
-            "rightTargets": right_tgt,
-            # FK proprio
-            "leftFingerTipsPos": l_ft_pos,
-            "rightFingerTipsPos": r_ft_pos,
-            "leftFingerTipsPosNoised": l_ft_pos,
-            "rightFingerTipsPosNoised": r_ft_pos,
-            "leftHandBasePos": l_hb_pos,
-            "rightHandBasePos": r_hb_pos,
-            "leftHandBasePosNoised": l_hb_pos,
-            "rightHandBasePosNoised": r_hb_pos,
-            "leftHandBaseRot6D": l_hb_rot6d,
-            "rightHandBaseRot6D": r_hb_rot6d,
-            "leftHandBaseRot6DNoised": l_hb_rot6d,
-            "rightHandBaseRot6DNoised": r_hb_rot6d,
-            # bottle (from depth feature predictor)
-            "bottleBodyPos": body_pos_m,
-            "bottleCapPos": cap_pos_m,
-            "bottleBodyPosNoised": body_pos_m,
-            "bottleCapPosNoised": cap_pos_m,
-            "bottleGeomCfg": _scale_torch(
-                geom_raw_m, self._geom_lower_t, self._geom_upper_t
-            ).repeat(1, 3),
-            # bottle body rot6d: derived from (cap_pos - body_pos) via
-            # _rot6d_from_axis. Covers 2/3 DOF — roll around the bottle's
-            # principal axis is unobservable from positions alone, but the
-            # bottle is roughly rotationally symmetric so this is a
-            # reasonable approximation. Replaces the previous identity-rot6d
-            # placeholder, which carried zero axis information.
-            "bottleBodyRot6DNoised": _rot6d_from_axis(
-                body_pos_m, cap_pos_m, self._world_z, self._world_x
-            ),
-        }
-        actor_obs = torch.cat([full_obs[k] for k in self.actor_obs_keys], dim=-1)
-        if int(actor_obs.shape[-1]) != self.actor_obs_unstacked_space:
+        # Current proprio frame (112d): the 10 terms concatenated.
+        cur_proprio = torch.cat([
+            left_jp_s,      # 19
+            right_jp_s,     # 19
+            left_tgt,       # 19  (RAW targets, not scaled)
+            right_tgt,      # 19
+            l_ft_pos,       # 9
+            r_ft_pos,       # 9
+            l_palm_pos,     # 3
+            l_palm_rot6d,   # 6
+            r_palm_pos,     # 3
+            r_palm_rot6d,   # 6
+        ], dim=-1)          # total = 112
+
+        if int(cur_proprio.shape[-1]) != self._PROPRIO_DIM:
+            raise ValueError(
+                f"proprio dim={int(cur_proprio.shape[-1])} != expected {self._PROPRIO_DIM}"
+            )
+
+        # Initialize prev_proprio on first call.
+        if not self._proprio_initialized:
+            self._prev_proprio.copy_(cur_proprio)
+            self._proprio_initialized = True
+
+        # Per-term history: interleave [prev, cur] for each term.
+        # Term boundaries within the 112d proprio vector:
+        #   left_jp(19), right_jp(19), left_tgt(19), right_tgt(19),
+        #   left_ft(9), right_ft(9), left_palm_pos(3), left_palm_rot6d(6),
+        #   right_palm_pos(3), right_palm_rot6d(6)
+        term_sizes = [19, 19, 19, 19, 9, 9, 3, 6, 3, 6]
+        proprio_parts = []
+        offset = 0
+        for sz in term_sizes:
+            prev_term = self._prev_proprio[:, offset:offset + sz]
+            cur_term = cur_proprio[:, offset:offset + sz]
+            proprio_parts.append(prev_term)
+            proprio_parts.append(cur_term)
+            offset += sz
+        proprio_obs = torch.cat(proprio_parts, dim=-1)  # 224d
+
+        # Update prev_proprio for next step.
+        self._prev_proprio.copy_(cur_proprio)
+
+        # Extero (10d, no history): body_pos(3) + cap_pos(3) + jar_geom(4).
+        body_pos_m = feat_t[:, 0:3]
+        cap_pos_m = feat_t[:, 3:6]
+        geom_raw = feat_t[:, 6:10]
+        jar_geom_scaled = _scale_torch(geom_raw, self._geom_lower_t, self._geom_upper_t)  # (1, 4)
+
+        extero_obs = torch.cat([body_pos_m, cap_pos_m, jar_geom_scaled], dim=-1)  # 10d
+
+        actor_obs = torch.cat([proprio_obs, extero_obs], dim=-1)  # 234d
+
+        if int(actor_obs.shape[-1]) != self.obs_dim:
             raise ValueError(
                 f"composed actor obs dim={int(actor_obs.shape[-1])} "
-                f"!= actor_obs_unstacked_space={self.actor_obs_unstacked_space}"
+                f"!= actor_obs_dim={self.obs_dim}"
             )
         return actor_obs
 
     def _compute_next_targets(
         self,
-        actions_policy: torch.Tensor,        # [1, A] policy order
-        prev_actions_policy: torch.Tensor,   # [1, A] policy order
-        joint_pos_policy: torch.Tensor,      # [1, A] policy order
+        actions_policy: torch.Tensor,
+        prev_actions_policy: torch.Tensor,
+        joint_pos_policy: torch.Tensor,
         prev_targets_policy: torch.Tensor,
-        alpha: float = 0.5,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """EMA-smooth actions and integrate to next joint targets (policy order), clamped to soft limits."""
         ema_actions = (
             actions_policy.clamp(-1.0, 1.0) * self.action_ema
             + prev_actions_policy * (1.0 - self.action_ema)
         )
+        alpha = self.target_alpha
         next_targets_policy = torch.clamp(
             joint_pos_policy * (1.0 - alpha) + prev_targets_policy * alpha + ema_actions * self.dt * self.full_scale_policy * self.action_scale,
             min=self.full_lower_policy,
             max=self.full_upper_policy,
         )
+        if self._frozen_mask.any():
+            next_targets_policy[:, self._frozen_mask] = self._frozen_default_targets[:, self._frozen_mask]
         return next_targets_policy, ema_actions
 
     def _log_policy_timing(
@@ -823,7 +624,6 @@ class DepthFeatPolicyNode(Node):
         policy_inference_sync_s: float,
         total_s: float,
     ) -> None:
-        """Warn when the policy step blows past per-stage / total budgets."""
         stage_threshold_s = 0.01
         total_threshold_s = 0.02
         stages = {
@@ -854,16 +654,12 @@ class DepthFeatPolicyNode(Node):
         if not self.has_joint_state:
             return
 
-        # 1) Snapshot the IPC-shared depth-feature tensor into a pre-allocated
-        # local buffer. depth_feat_node writes the IPC tensor in-place via
-        # copy_; taking a local D2D copy here pins the feature for the rest
-        # of this step. Same tearing tradeoff as aux_policy_v2's depth path.
+        # 1) Snapshot depth-feature IPC tensor.
         if self.latest_depth_feature is None:
             self.get_logger().error("Depth-feature IPC handle not yet attached.")
             return
         self._feat_snapshot_t.copy_(self.latest_depth_feature, non_blocking=True)
         feat_t = self._feat_snapshot_t
-        # torch.cuda.synchronize()
         t01 = time.perf_counter()
         if feat_t.ndim != 2 or feat_t.shape[0] != 1:
             self.get_logger().error(
@@ -873,25 +669,19 @@ class DepthFeatPolicyNode(Node):
             rclpy.shutdown()
             return
 
-        # NOTE: no debug visualization here — the depth-feature is a 1D vector,
-        # not an image. If a sanity-check publisher is wanted, log feat_t.norm()
-        # / per-dim statistics instead, or move visualization to the upstream
-        # depth_feat_node which still has access to the raw masked depth.
-
         # 2) Snapshot latest joint arrays (real order) under joint_lock.
         with self.joint_lock:
             if not self.has_joint_state:
                 return
             np.copyto(self._joint_pos_snapshot_np, self.latest_joint_pos_real_np)
             np.copyto(self._joint_vel_snapshot_np, self.latest_joint_vel_real_np)
-        # torch.cuda.synchronize()
         t02 = time.perf_counter()
 
-        # 3) Wait until fk_node has produced at least one sample for all four groups.
+        # 3) Wait for FK.
         if not self.has_fk:
             return
 
-        # 4) CPU snapshots -> GPU tensors, then real->policy reorder.
+        # 4) CPU -> GPU, real -> policy order.
         joint_pos_real_t = torch.from_numpy(self._joint_pos_snapshot_np).to(self.device, non_blocking=True)
         joint_vel_real_t = torch.from_numpy(self._joint_vel_snapshot_np).to(self.device, non_blocking=True)
         self._joint_pos_policy_t[0, :].copy_(joint_pos_real_t[self.real2policy_idx])
@@ -899,45 +689,27 @@ class DepthFeatPolicyNode(Node):
 
         if not self.targets_initialized:
             self.targets_policy.copy_(self._joint_pos_policy_t)
+            self._frozen_default_targets.copy_(self._joint_pos_policy_t)
             self.targets_initialized = True
         self._targets_snapshot_t.copy_(self.targets_policy)
         self._prev_actions_snapshot_t.copy_(self.prev_actions_policy)
-        # torch.cuda.synchronize()
         t03 = time.perf_counter()
-        # 5) Compose obs (policy order), build stacked obs, run policy.
-        cur_actor_obs = self._compose_actor_obs(
+
+        # 5) Compose 234d obs, run policy.
+        actor_obs = self._compose_actor_obs(
             joint_pos_policy=self._joint_pos_policy_t,
-            joint_vel_policy=self._joint_vel_policy_t,
             targets_policy=self._targets_snapshot_t,
             feat_t=feat_t,
         )
-        # torch.cuda.synchronize()
         t1 = time.perf_counter()
 
-        if self.n_stack_frame == 1:
-            self._stacked_obs_buf.copy_(cur_actor_obs)
-        elif self.n_stack_frame == 2:
-            self._stacked_obs_buf[:, : self.actor_obs_unstacked_space].copy_(cur_actor_obs)
-            self._stacked_obs_buf[:, self.actor_obs_unstacked_space :].copy_(self.prev_actor_obs)
-            self.prev_actor_obs.copy_(cur_actor_obs)
-        else:
-            raise ValueError(
-                f"n_stack_frame={self.n_stack_frame} is not supported by depth_feat_policy."
-            )
-        obs_clamped = torch.clamp(self._stacked_obs_buf, -100.0, 100.0, out=self._obs_clamped_buf)
+        obs_clamped = torch.clamp(actor_obs, -100.0, 100.0, out=self._obs_clamped_buf)
 
         with torch.inference_mode():
-            # JIT-exported policy: forward(obs) = actor(normalizer(obs)). The
-            # obs_normalizer was baked into the ScriptModule by
-            # export_policy_as_jit, so we hand it the un-normalized obs
-            # vector directly. Depth feature is already spliced into the
-            # bottle slots inside _compose_actor_obs.
             actions_policy = self.policy(obs_clamped)
-        
-        # torch.cuda.synchronize()
         t2 = time.perf_counter()
 
-        # 6) Integrate and publish (convert policy->real only at publish boundary).
+        # 6) Integrate and publish.
         next_targets_policy, ema_actions_policy = self._compute_next_targets(
             actions_policy=actions_policy,
             prev_actions_policy=self._prev_actions_snapshot_t,
@@ -953,7 +725,6 @@ class DepthFeatPolicyNode(Node):
         msg.name = self.real_joint_names
         msg.position = next_targets_real[0].detach().cpu().tolist()
         self.target_pub.publish(msg)
-        # torch.cuda.synchronize()
         t_end = time.perf_counter()
         self._log_policy_timing(
             feat_copy_s=t01 - t0,
@@ -966,19 +737,13 @@ class DepthFeatPolicyNode(Node):
         )
 
     def _build_node_cfg_summary(self) -> dict[str, Any]:
-        """Build a deterministic runtime summary for the final ready log."""
         return {
             "paths": {
                 "policy_log_dir": str(self.policy_log_dir),
                 "jit_policy_path": str(self.jit_policy_path),
-                "runtime_cfg_path": str(self.runtime_cfg_path),
-                "agent_cfg_path": str(self.agent_cfg_path),
-                "env_cfg_path": str(self.env_cfg_path),
-                "hand_env_cfg_path": str(self.hand_env_cfg_path),
+                "mjlab_runtime_cfg_path": str(self.mjlab_runtime_cfg_path),
                 "driver_cfg_path": str(self.driver_cfg_path),
-                "policy_node_cfg_path": str(self.policy_node_cfg_path),
                 "fk_cfg_path": str(self.fk_cfg_path),
-                "da3_cfg_path": str(self.da3_cfg_path),
                 "depth_feat_cfg_path": str(self.depth_feat_cfg_path),
             },
             "rates_hz": {
@@ -993,35 +758,25 @@ class DepthFeatPolicyNode(Node):
                 "dt": float(self.dt),
                 "action_ema": float(self.action_ema),
                 "action_scale": float(self.action_scale),
+                "target_alpha": float(self.target_alpha),
             },
             "obs": {
-                "n_stack_frame": int(self.n_stack_frame),
-                "actor_obs_unstacked_space": int(self.actor_obs_unstacked_space),
-                "critic_obs_unstacked_space": int(self.critic_obs_unstacked_space),
-                "num_actor_obs": int(self.num_actor_obs),
-                "num_critic_obs": int(self.num_critic_obs),
-                "actor_obs_keys": list(self.actor_obs_keys),
+                "actor_obs_dim": int(self.obs_dim),
+                "proprio_history": int(self.proprio_history),
+                "proprio_dim_per_frame": self._PROPRIO_DIM,
             },
             "policy": {
                 "source": "torch.jit.load",
                 "jit_path": str(self.jit_policy_path),
                 "action_num": int(self.action_num),
-                "note": "actor + obs_normalizer baked together via export_policy_as_jit",
             },
-            "bottle_geom_bounds": {
-                "lower": list(_BOTTLE_GEOM_LOWER),
-                "upper": list(_BOTTLE_GEOM_UPPER),
-                "note": "must match observations.py:147-151",
+            "jar_geom_bounds": {
+                "lower": self.mjlab_rt["jar_geom_lo"],
+                "upper": self.mjlab_rt["jar_geom_hi"],
             },
         }
 
     def destroy_node(self) -> bool:
-        """Cancel the policy timer before destroying the ROS node.
-
-        RealSense / FK / DepthFeatureNetFiLM all live in their own nodes
-        (cam_node / fk_node / depth_feat_node — the last is TODO);
-        nothing to clean up here besides the timer.
-        """
         if hasattr(self, "policy_timer") and self.policy_timer is not None:
             self.policy_timer.cancel()
         return super().destroy_node()
@@ -1030,7 +785,6 @@ class DepthFeatPolicyNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = DepthFeatPolicyNode()
-    # executor = MultiThreadedExecutor(num_threads=3)
     executor = SingleThreadedExecutor()
     try:
         executor.add_node(node)

@@ -66,36 +66,13 @@ sam2p3:
 # ---------------------------------------------------------------------------
 # Depth-feature network (inference)
 # ---------------------------------------------------------------------------
-# Must match the arch used at training time (train_depth_predictor.py).
-# The checkpoint (depth_net_*.pth) is picked up by _load_latest_checkpoint as
-# the most-recent .pth in `log_dir` — point it at the training run that
-# produced the deployed weights.
+# JIT-traced model exported by hand_mjlab/scripts/export_depth_predictor.py.
+# Architecture is baked into the JIT file — no arch fields needed here.
 depth_feature:
-  # network arch (mirror train_depth_predictor.py defaults)
-  backbone: "resnet10"       # resnet10 / resnet8 / resnet18
-  num_keypoints: 64          # # of soft keypoints after 1x1 conv
-  mlp_hidden: 256            # head MLP width
-  use_film: false             # FiLM conditioning on/off (must match training)
-  fk_dim: 24                 # 2 * (3 base + 3 fingers * 3) for 3-finger hand
-  film_hidden: 128           # FiLM generator trunk width
-  fk_embed_dim: 32           # FK late-concat embed dim (0 disables)
   output_dim: 10             # bottleBodyPos(3) + bottleCapPos(3) + geom(4)
-  # depth preprocessing — must match training (DepthFeatureExtractorCfg.near/far)
   near: 0.1                  # metres; closer than this -> clipped + ignored
   far:  1.1                  # metres; farther than this -> clipped + ignored
-  # checkpoint
-  load_checkpoint: true
-  # Workspace-relative by default (resolves against /workspace inside docker,
-  # which is mounted at the dexterity-interface-rl repo root). Absolute host
-  # paths pass through unchanged — override here when the checkpoint lives
-  # outside the repo, e.g. on a mounted training output dir.
-  log_dir: "models/depth_predictor/no_drift"   # pick .pth from this training run's output
-  # log_dir: "models/depth_predictor/no_drift"
-  # Optional pin to a specific .pth file. When set, takes precedence over the
-  # log_dir latest-pick logic (which selects best_val.pth in inference mode,
-  # or the largest-step file otherwise). Same resolution rules as log_dir —
-  # workspace-relative or absolute. Default null = scan log_dir.
-  checkpoint_path: null
+  checkpoint_path: "libs/robot_motion_interface/runtime/state_estimator/exported/depth_predictor.pt"
 
 # ---------------------------------------------------------------------------
 # FK link selection

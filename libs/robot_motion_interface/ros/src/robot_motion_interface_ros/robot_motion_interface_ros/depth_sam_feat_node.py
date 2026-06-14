@@ -1,10 +1,6 @@
 """ROS 2 node: live RealSense + SAM3-init + SAM2 dual-bank tracking + depth-feature inference.
 
-Drop-in replacement for depth_feat_node.py where the YOLO seg masker is swapped
-out for SAM2P3DualBankTracker (SAM3 text-prompted bbox/mask anchor + SAM2 video
-predictor with periodic re-anchoring via two overlapping memory-bank states).
-
-Capture / inference are decoupled (mirrors depth_feat_node.py):
+Capture / inference are decoupled:
 
     ┌─ capture thread ──────────────────────┐
     │ wait_for_frames at rs_fps             │   <- realsense_config.yaml::rs_fps
@@ -20,66 +16,22 @@ Capture / inference are decoupled (mirrors depth_feat_node.py):
     │      tracker.warmup + tracker.init    │   SAM3 ViT-H ~150 ms one-shot
     │   -> tracker.step(color)              │   SAM2 video propagation ~50 ms
     │   -> mask -> masked_depth (np.where)  │
-    │   -> uint16 mm -> float32 metres      │
-    │   -> DepthFeatureExtractor.step(...)  │
+    │   -> depth preprocess + JIT net fwd   │
     │   -> un-normalize geom slab           │
     │   -> copy_ into CUDA IPC buffer       │
     │   -> optional Image publish for vis   │   (rqt_image_view / RViz)
     └───────────────────────────────────────┘
 
-Decoupling lets the camera keep running at native FPS while the (heavier)
-SAM2P3 + DepthFeatureNetFiLM path runs at whatever rate the GPU can sustain.
-
-(*) Segmentation is kept inline (vs a separate node) so depth and mask stay
-    in lockstep on the same captured frame.
-
-(*) DepthFeatureNetFiLM, trained offline by
-    HAND-policy/scripts/sim2real/train_depth_predictor.py. Inference mode:
-    cfg.train=False (no optimizer, net.eval()), cfg.load_checkpoint=True
-    (latest depth_net_*.pth picked up from `depth_feature.log_dir`).
-
-FK conditioning vector (24-d for a 3-finger hand) is assembled per-step from
-the latest PoseArray on fk_config.fk_topic. Layout matches train_depth_predictor.py:
-    [leftHandBasePos(3), rightHandBasePos(3),
-     leftFingerTipsPos(F*3), rightFingerTipsPos(F*3)]
-Link names come from the `fk:` section of depth_feat_config.yaml.
+DepthFeatureNet (no FiLM, no FK conditioning) loaded as a JIT-traced model
+from depth_feature.checkpoint_path. Trained offline by
+hand_mjlab/scripts/train_depth_predictor.py, exported via
+DepthFeatureNet.export_jit().
 
 Output buffer is a persistent (1, 10) CUDA tensor with layout
     [bottleBodyPos(3), bottleCapPos(3), bottleGeomCfg_metres(4)]
-all in metres. The geom slab is un-normalized inside this node
-(un_preprocess_geom) so downstream consumers see metres, not [0, 1]. The
-buffer's CUDA IPC handle is encoded once at startup and served via the
-Trigger service ipc.handle_service_name (default
-/depth_feat_node/get_feature_handle); depth_feat_policy_node attaches a
-view onto this same memory at startup.
-
-RealSense settings (resolution / fps / intrinsics / exposure) are read from
-`libs/robot_motion_interface/config/realsense_config.yaml`.
-SAM2P3 + DepthFeatureExtractor + FK link selection + IPC service name +
-inference_rate are read from
-`libs/robot_motion_interface/config/depth_feat_config.yaml`.
-
-The depth_feat_config.yaml must contain a `sam2p3:` section like:
-
-    sam2p3:
-      sam2_ckpt: "models/sam2/sam2.1_hiera_small.pt"   # workspace-relative
-      sam2_cfg:  "configs/sam2.1/sam2.1_hiera_s.yaml"  # hydra-resolved by sam2
-      sam3_ckpt: "models/sam3/sam3.pt"                 # workspace-relative
-      prompt:    "bottle."
-      prompt_type: "mask"                              # "mask" | "box"
-      cycle_K:   100                                   # primary duration (step() calls)
-      warmup_W:  7                                     # overlap window before swap
-      sam3_conf: 0.3
-      offload_video_to_cpu: false                      # set true on <16 GB GPUs
-
-Memory budget on 4090 (offload_video_to_cpu=false):
-    SAM3 ViT-H              ~3.0 GB
-    SAM2.1-hiera-small      ~0.2 GB
-    Two banks' images bufs  ~3.6 GB  (peak during warmup overlap)
-    Memory bank entries     ~0.4 GB
-    -------------------------------
-    sam2p3 total            ~7.2 GB
-    DepthFeatureNetFiLM     ~0.5 GB
+all in metres. The geom slab is un-normalized inside this node so downstream
+consumers see metres, not [0, 1]. The buffer's CUDA IPC handle is served via
+the Trigger service ipc.handle_service_name.
 """
 
 from __future__ import annotations
@@ -107,10 +59,10 @@ from std_msgs.msg import Float32MultiArray
 from std_srvs.srv import Trigger
 
 from robot_motion_interface.utils.depth_feature import (
-    DepthFeatureExtractor,
-    DepthFeatureExtractorCfg,
+    _GEOM_MIN as _DEFAULT_GEOM_MIN,
+    _GEOM_MAX as _DEFAULT_GEOM_MAX,
 )
-from robot_motion_interface.utils.qos import HIGH_PERF_QOS, HIGH_RELIA_QOS
+from robot_motion_interface.utils.qos import HIGH_RELIA_QOS
 from robot_motion_interface.utils.sam2p3_dualbank_util import SAM2P3DualBankTracker
 
 
@@ -120,32 +72,6 @@ from robot_motion_interface.utils.sam2p3_dualbank_util import SAM2P3DualBankTrac
 WORKSPACE_ROOT = Path("/workspace")
 REALSENSE_CONFIG_PATH = "libs/robot_motion_interface/config/realsense_config.yaml"
 DEPTH_FEAT_CONFIG_PATH = "libs/robot_motion_interface/config/depth_feat_config.yaml"
-FK_CONFIG_PATH = "libs/robot_motion_interface/config/fk_config.yaml"
-
-# # ── LSQ compensation for body/cap (fitted offline, 40 samples) ──────────
-# # corrected_pos = pred_pos @ _LSQ_W + _LSQ_B
-# # Input/output layout: [body_x, body_y, body_z, cap_x, cap_y, cap_z] m,
-# # in the policy obs frame (z=0 at tabletop + workstation_top/2).
-# # Mean residual ≈ 1.88 cm; see libs/.../utils/lsq.py to re-fit when the
-# # bottle / camera mount / training run changes.
-# _LSQ_W = np.array([
-#     [ 0.34887896641805943,  0.5759479808107646,   0.06614204741424203,  0.34887896641805943,  0.575947980810764,    0.06614182648443188 ],
-#     [-0.3973368369406706,   0.8405134497492819,   0.01997501091804399, -0.3973368369406706,   0.8405134497492821,   0.019975154132943485],
-#     [ 2.2356774912943127,   0.2701747221227452,   0.03863010411512774,  2.2356774912943127,   0.270174722122746,    0.03863030075067703 ],
-#     [ 1.499541154062977,   -0.5197405499934648,  -0.03657934233377573,  1.499541154062977,   -0.5197405499934643,  -0.0365791896497728  ],
-#     [ 0.02313018766017715,  0.7080967439829899,  -0.05670362713046395,  0.02313018766017715,  0.7080967439829897,  -0.056703724825511594],
-#     [-1.3527293168223906,   0.6504247049806191,   0.04017506682628019, -1.3527293168223906,   0.650424704980618,    0.040174965768886906],
-# ], dtype=np.float32)
-# _LSQ_B = np.array([
-#     -0.9315139006546089, -0.9493223558367246, 0.8603479782973352,
-#     -0.9315139006546089, -0.9493223558367241, 0.9558478742668937,
-# ], dtype=np.float32)
-
-# # ── Geom override (predictor's geom branch is too noisy in real, override
-# # with the measured value of the specific bottle in use). Order matches
-# # train_depth_predictor.py geom slab:
-# #     [body_radius, body_height, cap_radius, cap_height]  metres
-# _GEOM_OVERRIDE = np.array([0.04, 0.16, 0.029, 0.02], dtype=np.float32)
 
 
 def _resolve_workspace_path(value: object) -> Path:
@@ -190,17 +116,13 @@ class DepthSamFeatNode(Node):
         self._load_configs()
         self._init_device()
 
-        # vision_lock protects the latest captured frames vs the inference
-        # timer. fk_lock protects the FK PoseArray buffer vs assembly.
         self.vision_lock = threading.Lock()
-        self.fk_lock = threading.Lock()
         self.latest_color_bgr: np.ndarray | None = None
         self.latest_depth_u16: np.ndarray | None = None
 
         self._setup_realsense()
         self._setup_sam2p3()
         self._setup_depth_feature()
-        self._setup_fk_state()
         self._setup_ipc_buffer()
 
         # IPC handle is encoded once — depth_feat_policy_node decodes it on
@@ -209,7 +131,6 @@ class DepthSamFeatNode(Node):
 
         self._init_vis_publisher()
         self._start_capture_thread()
-        self._init_fk_subscription()
         self._init_inference_timer()
         self._init_handle_service()
 
@@ -222,10 +143,8 @@ class DepthSamFeatNode(Node):
             f"K={self._sam_cycle_K} W={self._sam_warmup_W}\n"
             f"             sam2={Path(self._sam_sam2_ckpt).name}  sam3={Path(self._sam_sam3_ckpt).name}\n"
             f"  clip      = [{self.clip_near}, {self.clip_far}]m\n"
-            f"  depth_net = {self._extractor_cfg.backbone}  fk_dim={self.fk_dim}  "
-            f"film={self._extractor_cfg.use_film}  out={self.output_dim}\n"
-            f"  ckpt_dir  = {self._extractor_cfg.log_dir}\n"
-            f"  fk_topic  = {self.fk_topic}  ({self.fk_n_links} links)\n"
+            f"  depth_net = DepthFeatureNet (no FiLM)  out={self.output_dim}\n"
+            f"  ckpt      = {self._ckpt_path}\n"
             f"  ipc_svc   = {self.ipc_service_name}"
         )
 
@@ -238,27 +157,20 @@ class DepthSamFeatNode(Node):
         # leaves absolute paths untouched.
         self.declare_parameter("depth_feat_config_path", DEPTH_FEAT_CONFIG_PATH)
         self.declare_parameter("realsense_config_path", REALSENSE_CONFIG_PATH)
-        self.declare_parameter("fk_config_path", FK_CONFIG_PATH)
         self.depth_feat_config_path = _resolve_workspace_path(
             self.get_parameter("depth_feat_config_path").value
         )
         self.realsense_config_path = _resolve_workspace_path(
             self.get_parameter("realsense_config_path").value
         )
-        self.fk_config_path = _resolve_workspace_path(
-            self.get_parameter("fk_config_path").value
-        )
 
     def _load_configs(self) -> None:
         cfg = _load_yaml(self.depth_feat_config_path)
         rs_cfg_full = _load_yaml(self.realsense_config_path)
-        fk_cfg = _load_yaml(self.fk_config_path)
 
         self._cfg = cfg
         self._rs_cfg = rs_cfg_full["realsense"]
-        self._fk_cfg = fk_cfg
 
-        # Pre-pull the scalar knobs the rest of __init__ needs.
         feat_cfg = cfg["depth_feature"]
         runtime_cfg = cfg.get("runtime", {})
         disp_cfg = cfg.get("display", {})
@@ -272,10 +184,7 @@ class DepthSamFeatNode(Node):
         self.bottle_poses_topic = str(disp_cfg.get("bottle_poses_topic", "/depth_feat_node/bottle_pose"))
         self.publish_bottle_geom = bool(disp_cfg.get("publish_bottle_geom", True))
         self.bottle_geom_topic = str(disp_cfg.get("bottle_geom_topic", "/depth_feat_node/bottle_geom"))
-        # fk_cfg defines the world frame that fk_node publishes its PoseArray in.
-        # We piggy-back on it so RViz can overlay our debug poses on the FK ones
-        # without an extra TF.
-        self.world_frame_id = str(fk_cfg.get("world_frame_id", "world"))
+        self.world_frame_id = "world"
 
         c_intr = self._rs_cfg["color_intrinsics"]
         self.rs_color_width = int(c_intr["width"])
@@ -291,7 +200,7 @@ class DepthSamFeatNode(Node):
 
     def _init_device(self) -> None:
         if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is required for DepthFeatureExtractor.")
+            raise RuntimeError("CUDA is required for DepthFeatureNet inference.")
         self.device = torch.device("cuda")
 
     # ------------------------------------------------------------------
@@ -329,11 +238,8 @@ class DepthSamFeatNode(Node):
             )
         except Exception:
             self.depth_scale = 0.001
-        # Training (collect_policy_realsense.py + train_depth_predictor.py) is
-        # hard-coded to "raw depth value * 1e-3 = metres" (depth stored as mm
-        # uint16, trainer divides by 1000). Any sensor whose factory depth
-        # scale isn't 0.001 would silently break that contract — fail loudly
-        # rather than feed mismatched units into the FiLM net.
+        # Training stores depth as mm uint16, trainer divides by 1000 to metres.
+        # A sensor with depth_scale != 0.001 would silently break that contract.
         if abs(self.depth_scale - 0.001) > 1e-6:
             raise RuntimeError(
                 f"RealSense depth_scale={self.depth_scale} != 0.001 m/unit; "
@@ -497,74 +403,21 @@ class DepthSamFeatNode(Node):
 
     def _setup_depth_feature(self) -> None:
         feat_cfg = self._cfg["depth_feature"]
-        # log_dir is workspace-relative by default; absolute host paths pass
-        # through _resolve_workspace_path untouched. checkpoint_path follows
-        # the same resolution rules; None / empty stays None so the extractor
-        # falls back to scanning log_dir.
-        log_dir = str(_resolve_workspace_path(feat_cfg["log_dir"]))
         ckpt_path_raw = feat_cfg.get("checkpoint_path", None)
-        checkpoint_path = (
-            str(_resolve_workspace_path(ckpt_path_raw)) if ckpt_path_raw else None
-        )
-        self._extractor_cfg = DepthFeatureExtractorCfg(
-            enable=True,
-            train=False,
-            load_checkpoint=bool(feat_cfg.get("load_checkpoint", True)),
-            backbone=str(feat_cfg["backbone"]),
-            num_keypoints=int(feat_cfg["num_keypoints"]),
-            mlp_hidden=int(feat_cfg["mlp_hidden"]),
-            near=self.clip_near,
-            far=self.clip_far,
-            log_dir=log_dir,
-            checkpoint_path=checkpoint_path,
-            use_film=bool(feat_cfg.get("use_film", True)),
-            fk_dim=int(feat_cfg["fk_dim"]),
-            film_hidden=int(feat_cfg["film_hidden"]),
-            fk_embed_dim=int(feat_cfg["fk_embed_dim"]),
-        )
-        self.output_dim = int(feat_cfg["output_dim"])
-        self.fk_dim = int(feat_cfg["fk_dim"])
-        self.extractor = DepthFeatureExtractor(
-            self._extractor_cfg, output_dim=self.output_dim, device=self.device
-        )
-        
-        # # Cache LSQ W/b and geom override on the inference device so the hot
-        # # path is pure tensor math.
-        # self._lsq_W = torch.from_numpy(_LSQ_W).to(self.device)              # (6, 6)
-        # self._lsq_B = torch.from_numpy(_LSQ_B).to(self.device)              # (6,)
-        # self._geom_override = torch.from_numpy(_GEOM_OVERRIDE).to(self.device)  # (4,)
-
-    def _setup_fk_state(self) -> None:
-        fk_sel = self._cfg["fk"]
-        self.fk_link_names: list[str] = list(self._fk_cfg["link_names"])
-        self.fk_topic: str = str(self._fk_cfg["fk_topic"])
-        self.fk_n_links = len(self.fk_link_names)
-        self.left_hand_base_names = list(fk_sel["left_hand_base_links"])
-        self.right_hand_base_names = list(fk_sel["right_hand_base_links"])
-        self.left_fingertip_names = list(fk_sel["left_fingertip_links"])
-        self.right_fingertip_names = list(fk_sel["right_fingertip_links"])
-
-        # Sanity: cfg fk_dim must match the link-selection sizes.
-        n_left_base = 3 * len(self.left_hand_base_names)
-        n_right_base = 3 * len(self.right_hand_base_names)
-        n_left_tips = 3 * len(self.left_fingertip_names)
-        n_right_tips = 3 * len(self.right_fingertip_names)
-        derived_fk_dim = n_left_base + n_right_base + n_left_tips + n_right_tips
-        if derived_fk_dim != self.fk_dim:
+        if not ckpt_path_raw:
             raise ValueError(
-                f"fk_dim mismatch: depth_feature.fk_dim={self.fk_dim} vs "
-                f"link-derived={derived_fk_dim} "
-                f"(left_base={n_left_base}, right_base={n_right_base}, "
-                f"left_tips={n_left_tips}, right_tips={n_right_tips})"
+                "depth_feature.checkpoint_path is required (JIT .jit.pt file)"
             )
+        self._ckpt_path = str(_resolve_workspace_path(ckpt_path_raw))
+        self.output_dim = int(feat_cfg["output_dim"])
 
-        self.fk_pose_dict: dict[str, np.ndarray] = {
-            name + "_pos": np.zeros(3, dtype=np.float32) for name in self.fk_link_names
-        }
-        self.has_fk = False
-        # Pre-allocated CPU buffer for FK vector assembly each step.
-        self._fk_cpu = np.zeros(self.fk_dim, dtype=np.float32)
-        self._fk_gpu = torch.zeros((1, self.fk_dim), dtype=torch.float32, device=self.device)
+        self.net = torch.jit.load(self._ckpt_path, map_location=self.device)
+        self.net.eval()
+
+        geom_min = feat_cfg.get("geom_min", list(_DEFAULT_GEOM_MIN))
+        geom_max = feat_cfg.get("geom_max", list(_DEFAULT_GEOM_MAX))
+        self._geom_min = torch.tensor(geom_min, device=self.device, dtype=torch.float32)
+        self._geom_max = torch.tensor(geom_max, device=self.device, dtype=torch.float32)
 
     def _setup_ipc_buffer(self) -> None:
         ipc_cfg = self._cfg["ipc"]
@@ -610,57 +463,6 @@ class DepthSamFeatNode(Node):
             )
         else:
             self.bottle_geom_pub = None
-
-    # ------------------------------------------------------------------
-    # FK PoseArray subscriber
-    # ------------------------------------------------------------------
-    def _init_fk_subscription(self) -> None:
-        self.create_subscription(
-            PoseArray, self.fk_topic, self._sub_fk_cb, HIGH_PERF_QOS
-        )
-
-    def _sub_fk_cb(self, msg: PoseArray) -> None:
-        """Write the inbound PoseArray into fk_pose_dict in fk_cfg.link_names order."""
-        if len(msg.poses) != self.fk_n_links:
-            self.get_logger().error(
-                f"{self.fk_topic} pose count mismatch: {len(msg.poses)} vs "
-                f"expected {self.fk_n_links} (fk_cfg.link_names)"
-            )
-            rclpy.shutdown()
-            return
-        with self.fk_lock:
-            for name, p in zip(self.fk_link_names, msg.poses):
-                pos = self.fk_pose_dict[name + "_pos"]
-                pos[0] = p.position.x
-                pos[1] = p.position.y
-                pos[2] = p.position.z
-            self.has_fk = True
-
-    def _assemble_fk_vector(self) -> torch.Tensor | None:
-        """Concat [left_base, right_base, left_tips, right_tips] -> (1, fk_dim) GPU.
-
-        Returns None until at least one FK PoseArray has been received.
-        """
-        if not self.has_fk:
-            return None
-        with self.fk_lock:
-            offset = 0
-            for name in self.left_hand_base_names:
-                self._fk_cpu[offset:offset + 3] = self.fk_pose_dict[name + "_pos"]
-                offset += 3
-            for name in self.right_hand_base_names:
-                self._fk_cpu[offset:offset + 3] = self.fk_pose_dict[name + "_pos"]
-                offset += 3
-            for name in self.left_fingertip_names:
-                self._fk_cpu[offset:offset + 3] = self.fk_pose_dict[name + "_pos"]
-                offset += 3
-            for name in self.right_fingertip_names:
-                self._fk_cpu[offset:offset + 3] = self.fk_pose_dict[name + "_pos"]
-                offset += 3
-        self._fk_gpu.copy_(
-            torch.from_numpy(self._fk_cpu).unsqueeze(0), non_blocking=True
-        )
-        return self._fk_gpu
 
     # ------------------------------------------------------------------
     # Inference timer
@@ -709,10 +511,6 @@ class DepthSamFeatNode(Node):
         masked_depth = np.where(mask, depth_u16, 0).astype(np.uint16)
 
         if not mask.any():
-            # Tracker produced an empty mask this frame — likely full
-            # occlusion or the bottle left the FOV.  Same fallback as the
-            # YOLO branch: leave the previous good feature in the IPC
-            # buffer so the policy isn't blindsided by a meaningless pred.
             self.get_logger().warn(
                 "tracker produced empty mask this frame — skipping depth-feature "
                 "update; policy continues to consume the last good feature."
@@ -721,57 +519,29 @@ class DepthSamFeatNode(Node):
                 self._publish_masked_depth(masked_depth)
             return
 
-        fk_t = self._assemble_fk_vector()
-        if fk_t is None:
-            self.get_logger().warn(
-                f"No FK PoseArray received yet on '{self.fk_topic}' — "
-                f"skipping depth-feature update. Is fk_node running?"
-            )
-            if self.depth_vis_pub is not None:
-                self._publish_masked_depth(masked_depth)
-            return
-
         try:
-            # masked_depth (uint16, sensor-native units) -> metres tensor on GPU.
-            # DepthFeatureExtractor expects (B, H, W) or (B, 1, H, W) input and
-            # handles its own [near, far] clip + normalisation. depth_scale
-            # converts raw sensor values to metres in the same convention
-            # training used (collect_policy_realsense.py stores depth in mm
-            # uint16; trainer divides by 1000 to metres).
             depth_t = (
-                torch.from_numpy(masked_depth).to(self.device).float() * self.depth_scale
-            ).unsqueeze(0)   # (1, H, W) float32 metres
-
-            # target=None -> wrapper returns (feature, pred, None) and skips
-            # the loss/optimizer path entirely.
-            _feature, pred, _loss = self.extractor.step(
-                raw_depth=depth_t, target=None, fk=fk_t
+                torch.from_numpy(masked_depth).to(self.device).float()
+                * self.depth_scale
             )
+            depth_t = depth_t.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+            depth_t = torch.nan_to_num(
+                depth_t, nan=self.clip_far, posinf=self.clip_far, neginf=0.0
+            )
+            depth_t = depth_t.clamp(min=self.clip_near, max=self.clip_far)
+            depth_t = (depth_t - self.clip_near) / (self.clip_far - self.clip_near)
 
-            # pred[..., 0:6] is metres (positions); pred[..., 6:10] is in [0,1].
-            # Un-normalize the geom slab so the IPC buffer is uniformly in metres.
+            with torch.no_grad():
+                _feature, pred = self.net(depth_t)
+
             pred_metres = pred.clone()
-            pred_metres[..., 6:10] = self.extractor.un_preprocess_geom(pred[..., 6:10])
-            # bottle_geom: [0.04, 0.16, 0.029, 0.02]  # green bottle
-            # bottle_geom: [0.04, 0.12, 0.04, 0.03]  # 3D bottle
-            # bottle_geom: [0.042, 0.098, 0.04, 0.02]  # pink small
-            # bottle_geom: [0.034, 0.15, 0.032, 0.016]  # black tall
-            # pred_metres[..., 6:10] = torch.tensor([0.04, 0.16, 0.029, 0.02], device=self.device)
-            # pred_metres[..., 6:10] = torch.tensor([0.04, 0.12, 0.04, 0.03], device=self.device)
-            # pred_metres[..., 6:10] = torch.tensor([0.042, 0.098, 0.04, 0.02], device=self.device)
-            # pred_metres[..., 6:10] = torch.tensor([0.034, 0.15, 0.032, 0.016], device=self.device)
-
-            # # (a) LSQ-compensate body+cap (6-d affine fitted from real apriltag data).
-            # pred_metres[..., 0:6] = pred_metres[..., 0:6] @ self._lsq_W + self._lsq_B
-
-            # # (b) Override the geom slab — predictor's geom branch is too noisy in real.
-            # # Broadcast (4,) into (1, 4) row. If pred has batch > 1 this also broadcasts.
-            # pred_metres[..., 6:10] = self._geom_override
-            # In-place into the IPC-shared buffer; consumers read this same
-            # GPU memory.
+            pred_metres[..., 6:10] = (
+                pred_metres[..., 6:10] * (self._geom_max - self._geom_min)
+                + self._geom_min
+            )
             self.feature_buffer.copy_(pred_metres, non_blocking=True)
         except Exception as exc:
-            self.get_logger().error(f"DepthFeatureExtractor inference failed: {exc}")
+            self.get_logger().error(f"DepthFeatureNet inference failed: {exc}")
             rclpy.shutdown()
             return
 
