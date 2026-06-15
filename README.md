@@ -53,9 +53,9 @@ docker build -f docker/Dockerfile.policy_py312 -t dex-policy .
 cd <path to>/dexterity-interface-rl
 
 xhost +local:docker
-docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/workspace --device /dev/bus/usb:/dev/bus/usb --net=host -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix dex-policy
+docker run --name handrl-policy --rm -it --privileged --gpus all -v $(pwd):/workspace -v /dev:/dev --net=host -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix dex-policy
 
-docker run --name handrl-policy --rm -itd --privileged --gpus all -v $(pwd):/workspace --device /dev/bus/usb:/dev/bus/usb --net=host -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix dex-policy    # detached
+docker run --name handrl-policy --rm -itd --privileged --gpus all -v $(pwd):/workspace -v /dev:/dev --net=host -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix dex-policy    # detached
 ```
 
 Attach to Policy Container
