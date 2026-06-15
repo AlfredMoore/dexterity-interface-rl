@@ -38,7 +38,7 @@ import pyrealsense2 as rs
 import yaml
 
 # ── Tunable constants / defaults ────────────────────────────────────────────
-DEFAULT_ARUCO_DICT_NAME = "DICT_4X4_50"
+DEFAULT_ARUCO_DICT_NAME = "DICT_APRILTAG_36h11"
 DEFAULT_AUTO_DETECT_DICT = False
 AXIS_THICKNESS = 3                        # line thickness for drawn axes
 DEFAULT_PRINT_EVERY_N = 30                # print every N loops to throttle stdout
@@ -91,8 +91,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--marker-size",
         type=float,
-        required=True,
-        help="Physical ArUco side length in meters (required, e.g. 0.1).",
+        default=0.1,
+        help="Physical ArUco side length in meters (default: 0.1).",
     )
     parser.add_argument(
         "--aruco-dict",
@@ -104,8 +104,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-tag-id",
         type=int,
-        required=True,
-        help="Target marker ID to track/save. Required to avoid 'first detected ID' drift.",
+        default=0,
+        help="Target marker ID to track/save (default: 0).",
     )
     parser.add_argument(
         "--auto-detect-dict",
