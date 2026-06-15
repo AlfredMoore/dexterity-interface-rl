@@ -53,6 +53,19 @@ class RunTrajNode(Node):
         self.get_logger().info(f"Loaded traj: {traj_path}, shape={self.traj.shape}, publish_hz={self.publish_hz}")
 
     def run_once(self) -> None:
+        # Wait for the driver to subscribe before streaming. The QoS is RELIABLE +
+        # VOLATILE, so any setpoint published before DDS discovery matches the
+        # subscriber (~2s across machines) is dropped and never resent. Without this
+        # wait the arm receives nothing until matching completes, then jumps to a
+        # setpoint well into the trajectory.
+        while rclpy.ok() and self.target_pub.get_subscription_count() == 0:
+            self.get_logger().info("Waiting for a subscriber on /target_joint_states ...")
+            time.sleep(0.1)
+        time.sleep(0.5)  # margin for the link to fully establish before streaming
+        self.get_logger().info(
+            f"Subscriber connected ({self.target_pub.get_subscription_count()}). Streaming trajectory."
+        )
+
         msg = JointState()
         msg.name = self.joint_names
         dt = 1.0 / self.publish_hz
