@@ -350,6 +350,16 @@ class DepthFeatPolicyNode(Node):
         # Depth feature IPC tensor.
         self.latest_depth_feature: torch.Tensor | None = None
 
+        # Recording buffer (auto-saves after N steps).
+        self._rec_max_steps = 800
+        self._rec_step = 0
+        self._rec_actor_obs = torch.zeros((self._rec_max_steps, self.obs_dim), dtype=torch.float32, device=self.device)
+        self._rec_actions = torch.zeros((self._rec_max_steps, A), dtype=torch.float32, device=self.device)
+        self._rec_targets = torch.zeros((self._rec_max_steps, A), dtype=torch.float32, device=self.device)
+        self._rec_joint_pos = torch.zeros((self._rec_max_steps, A), dtype=torch.float32, device=self.device)
+        self._rec_feat = torch.zeros((self._rec_max_steps, 10), dtype=torch.float32, device=self.device)
+        self._rec_saved = False
+
     def _fetch_depth_feature_handle(self) -> None:
         """One-shot: call depth_feat_node's service, decode CUDA IPC handle,
         attach self.latest_depth_feature to the persistent feature buffer."""
@@ -579,6 +589,9 @@ class DepthFeatPolicyNode(Node):
         body_pos_m = feat_t[:, 0:3]
         cap_pos_m = feat_t[:, 3:6]
         geom_raw = feat_t[:, 6:10]
+        # body_pos_m = torch.tensor([[0.0, 0.0, 1.0169]], device=self.device)       # jar body
+        # cap_pos_m  = torch.tensor([[0.0, 0.0, 1.1069]], device=self.device)       # jar cap
+        # geom_raw   = torch.tensor([[0.04, 0.16, 0.029, 0.02]], device=self.device)  # meter
         jar_geom_scaled = _scale_torch(geom_raw, self._geom_lower_t, self._geom_upper_t)  # (1, 4)
 
         extero_obs = torch.cat([body_pos_m, cap_pos_m, jar_geom_scaled], dim=-1)  # 10d
@@ -719,6 +732,18 @@ class DepthFeatPolicyNode(Node):
         self.targets_policy.copy_(next_targets_policy)
         self.prev_actions_policy.copy_(ema_actions_policy)
 
+        # Record step.
+        if self._rec_step < self._rec_max_steps:
+            i = self._rec_step
+            self._rec_actor_obs[i].copy_(actor_obs[0])
+            self._rec_actions[i].copy_(actions_policy[0])
+            self._rec_targets[i].copy_(next_targets_policy[0])
+            self._rec_joint_pos[i].copy_(self._joint_pos_policy_t[0])
+            self._rec_feat[i].copy_(feat_t[0])
+            self._rec_step += 1
+            if self._rec_step == self._rec_max_steps and not self._rec_saved:
+                self._save_recording()
+
         next_targets_real = next_targets_policy[:, self.policy2real_idx]
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -735,6 +760,20 @@ class DepthFeatPolicyNode(Node):
             policy_inference_sync_s=t_end - t2,
             total_s=t_end - t0,
         )
+
+    def _save_recording(self) -> None:
+        out = self.policy_log_dir / "policy_recording.npz"
+        np.savez_compressed(
+            str(out),
+            actor_obs=self._rec_actor_obs.cpu().numpy(),
+            actions=self._rec_actions.cpu().numpy(),
+            targets=self._rec_targets.cpu().numpy(),
+            joint_pos=self._rec_joint_pos.cpu().numpy(),
+            feat=self._rec_feat.cpu().numpy(),
+            joint_names=np.array(self.real_joint_names),
+        )
+        self._rec_saved = True
+        self.get_logger().info(f"Recording saved: {out} ({self._rec_max_steps} steps)")
 
     def _build_node_cfg_summary(self) -> dict[str, Any]:
         return {
@@ -779,6 +818,13 @@ class DepthFeatPolicyNode(Node):
     def destroy_node(self) -> bool:
         if hasattr(self, "policy_timer") and self.policy_timer is not None:
             self.policy_timer.cancel()
+        if not self._rec_saved and self._rec_step > 0:
+            self._rec_actor_obs = self._rec_actor_obs[:self._rec_step]
+            self._rec_actions = self._rec_actions[:self._rec_step]
+            self._rec_targets = self._rec_targets[:self._rec_step]
+            self._rec_joint_pos = self._rec_joint_pos[:self._rec_step]
+            self._rec_feat = self._rec_feat[:self._rec_step]
+            self._save_recording()
         return super().destroy_node()
 
 
