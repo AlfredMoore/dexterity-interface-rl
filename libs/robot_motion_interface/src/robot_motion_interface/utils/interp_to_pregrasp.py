@@ -5,7 +5,8 @@ Unlike replay_target_np (which streams a precomputed, time-paced trajectory), th
 script builds the path online from wherever the arms currently are:
 
   1. Read the latest /joint_states (current 38-DoF position).
-  2. Use the pre-grasp target (hardcoded DEFAULT_PREGRASP, or --pregrasp override).
+  2. Use the pre-grasp target (hardcoded DEFAULT_PREGRASP, or --pregrasp override),
+     or the HOME pose (DEFAULT_HOME) when --home is passed.
   3. Linearly interpolate current -> target with a fixed per-step joint increment
      ("step size" in rad), NOT a fixed time budget. The number of waypoints is
      ceil(max|target - current| / step_size), so no joint moves more than
@@ -21,6 +22,7 @@ the driver reads /target_joint_states by index, not by name):
 
 Example:
   python -m robot_motion_interface.utils.interp_to_pregrasp --step_size 0.01 --publish_hz 20 -y
+  python -m robot_motion_interface.utils.interp_to_pregrasp --home --step_size 0.01 --publish_hz 20 -y   # retract to HOME
 """
 
 from __future__ import annotations
@@ -58,6 +60,20 @@ DEFAULT_PREGRASP = [
     0.0375, -0.0375, 0.5625, 0.2343,
     -0.0375, 0.0375, 0.5625, 0.2375,
     0.0375, -0.0375, 0.5625, 0.1625,
+]
+
+# Hardcoded 38-DoF HOME (retracted/neutral) pose, selected with --home instead of the
+# pre-grasp. Values from config/bimanual_arm_config.yaml (panda_home_joint_positions +
+# tesollo all-zero), applied to BOTH arms.
+DEFAULT_HOME = [
+    # left panda (7) -- Franka neutral
+    0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854,
+    # left tesollo (12) -- open hand
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    # right panda (7)
+    0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854,
+    # right tesollo (12)
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
 ]
 
 
@@ -169,6 +185,8 @@ def main(argv=None) -> None:
     parser.add_argument("--sub_timeout", type=float, default=30.0)
     parser.add_argument("--pregrasp", type=float, nargs="+", default=None,
                         help="Explicit pre-grasp target as DoF floats; overrides DEFAULT_PREGRASP.")
+    parser.add_argument("--home", action="store_true",
+                        help="Interpolate to the hardcoded HOME (retracted) pose instead of pre-grasp.")
     args = parser.parse_args(argv)
 
     if args.step_size <= 0.0:
@@ -178,9 +196,13 @@ def main(argv=None) -> None:
 
     joint_names = load_joint_names(Path(args.config))
     dof = len(joint_names)
-    target = args.pregrasp if args.pregrasp is not None else DEFAULT_PREGRASP
+    if args.home:
+        target, dest_name = DEFAULT_HOME, "HOME"
+    else:
+        target = args.pregrasp if args.pregrasp is not None else DEFAULT_PREGRASP
+        dest_name = "PRE-GRASP"
     if len(target) != dof:
-        raise ValueError(f"pre-grasp target expects {dof} values, got {len(target)}")
+        raise ValueError(f"{dest_name} target expects {dof} values, got {len(target)}")
     qT = np.asarray(target, dtype=np.float64)
 
     rclpy.init()
@@ -212,7 +234,7 @@ def main(argv=None) -> None:
 
         if not args.yes:
             input(
-                ">>> Robot will move from CURRENT pose to PRE-GRASP. "
+                f">>> Robot will move from CURRENT pose to {dest_name}. "
                 "Keep a hand on the e-stop. Press Enter to start (Ctrl-C to abort)..."
             )
 
@@ -232,7 +254,7 @@ def main(argv=None) -> None:
         while rclpy.ok() and time.perf_counter() < settle_end:
             node.publish_target(qT)
             time.sleep(dt)
-        node.get_logger().info("Reached pre-grasp target.")
+        node.get_logger().info(f"Reached {dest_name} target.")
 
     except KeyboardInterrupt:
         node.get_logger().warn("Interrupted; stopping (driver holds last sent target).")

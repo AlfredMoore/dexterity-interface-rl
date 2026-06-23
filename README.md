@@ -21,7 +21,7 @@ source install/setup.bash
 ROS2 Run Driver Node
 ```bash
 export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
-export ROS_STATIC_PEERS='192.168.4.9'
+export ROS_STATIC_PEERS='192.168.4.12'
 ros2 run robot_motion_interface_ros rl_driver
 ```
 
@@ -197,10 +197,15 @@ ros2 run robot_motion_interface_ros test_curobo
 
 Go to pre-grasp pose
 ```bash
-export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
-export ROS_STATIC_PEERS='192.168.4.4'
-ros2 run robot_motion_interface_ros replay_target_pregrasp    # go to pre-grasp pose
-# ros2 run robot_motion_interface_ros <policy node>
+# Go to Pre-grasp Pose in ROS2 container
+python -m robot_motion_interface.utils.interp_to_pregrasp --step_size 0.01 --publish_hz 20 -y
+```
+
+Replay a trajectory from a checkpoint in ROS2 container
+```bash
+python libs/robot_motion_interface/runtime/sysid_replay_traj.py \
+    --npz libs/robot_motion_interface/runtime/traj.npz \
+    --hz 20
 ```
 
 Run
