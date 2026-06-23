@@ -10,9 +10,9 @@ action_ema: 0.5
 action_scale: 1.0
 target_alpha: 0.5
 
-# Per-class velocity scales (applied to action integration)
-arm_vel_scale: 1.0
-finger_vel_scale: 1.5
+# Per-class velocity scales (arm_vel_scale / finger_vel_scale) are now read directly from
+# the deployed policy's params/env.yaml (auto-synced with training) -- removed here to
+# avoid stale drift. See depth_feat_policy._build_joint_mappings + utils/mjlab_yaml.
 arm_joint_expr: "panda_joint.*"
 finger_joint_expr: "F.*M.*"
 

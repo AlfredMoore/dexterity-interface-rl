@@ -38,6 +38,7 @@ from std_srvs.srv import Trigger
 
 from robot_motion_interface.utils.qos import HIGH_PERF_QOS, HIGH_RELIA_QOS
 from robot_motion_interface.utils.sim2real import joint_mapping
+from robot_motion_interface.utils.mjlab_yaml import load_mjlab_yaml
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +108,16 @@ class DepthFeatPolicyNode(Node):
         self._read_hand_link_counts()
         self._build_policy_and_normalizer()
         self._init_state_buffers()
-        self._fetch_depth_feature_handle()
+        # BYPASS perception (depth_sam_feat_node off): hardcode the jar-pose feature
+        # instead of fetching the CUDA-IPC handle. Uncomment the call below to restore.
+        # self._fetch_depth_feature_handle()
+        _hardcoded_jar_feat = torch.tensor(
+            [[0.0, 0.0, 1.0169, 0.0, 0.0, 1.1069, 0.04, 0.16, 0.029, 0.02]],
+            dtype=torch.float32,
+            device=self.device,
+        )  # body_pos(3)+cap_pos(3)+jar_geom(4), metres, env-local frame (= sim extero)
+        self.latest_depth_feature = _hardcoded_jar_feat
+        self._feat_snapshot_t = torch.empty_like(_hardcoded_jar_feat)
 
         # -- 4. subs & pubs --
         self._init_pub_sub()
@@ -151,6 +161,10 @@ class DepthFeatPolicyNode(Node):
         self.driver_cfg = _load_yaml(self.driver_cfg_path)
         self.fk_cfg = _load_yaml(self.fk_cfg_path)
         self.depth_feat_full_cfg = _load_yaml(self.depth_feat_cfg_path)
+        # Deployed policy's training env.yaml -> vel_scale etc. (auto-synced with the
+        # exported policy). See utils/mjlab_yaml: tag-ignoring loader (mjlab not importable).
+        self._env_cfg_path = self.policy_log_dir / "params" / "env.yaml"
+        self.env_cfg = load_mjlab_yaml(self._env_cfg_path)
 
         self.get_logger().info("#### Depth-feat policy node configs (mjlab): ####")
         self.get_logger().info(f"policy_log_dir:          {self.policy_log_dir}")
@@ -159,6 +173,7 @@ class DepthFeatPolicyNode(Node):
         self.get_logger().info(f"driver_cfg_path:         {self.driver_cfg_path}")
         self.get_logger().info(f"fk_cfg_path:             {self.fk_cfg_path}")
         self.get_logger().info(f"depth_feat_cfg_path:     {self.depth_feat_cfg_path}")
+        self.get_logger().info(f"env_cfg_path:            {self._env_cfg_path}")
 
     def _init_device(self) -> None:
         if not torch.cuda.is_available():
@@ -204,8 +219,11 @@ class DepthFeatPolicyNode(Node):
         self.right_policy_indices = self._to_dev_t(list(range(n_per_arm, 2 * n_per_arm)), dtype=torch.long)
 
         # Vel scale: arm joints get arm_vel_scale, finger joints get finger_vel_scale.
-        arm_vel = float(self.mjlab_rt["arm_vel_scale"])
-        finger_vel = float(self.mjlab_rt["finger_vel_scale"])
+        # Read from the deployed policy's env.yaml (auto-synced with training), NOT
+        # mjlab_policy_runtime.yaml which is hand-maintained and drifts stale.
+        _act = self.env_cfg["actions"]["left"]  # left/right share these integration params
+        arm_vel = float(_act["arm_vel_scale"])
+        finger_vel = float(_act["finger_vel_scale"])
         arm_expr = self.mjlab_rt["arm_joint_expr"]
         finger_expr = self.mjlab_rt["finger_joint_expr"]
 
