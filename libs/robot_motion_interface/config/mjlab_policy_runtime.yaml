@@ -73,10 +73,10 @@ jar_geom_lo: [0.03, 0.10, 0.02, 0.02]
 jar_geom_hi: [0.05, 0.20, 0.055, 0.04]
 
 # Policy inference rate (Hz). Formerly in rl_policy_node_config.yaml.
-infer_rate: 30.0
+infer_rate: 20.0
 
 # Obs layout for the mjlab actor.
 # Actor groups: proprio_noised (history=2) + extero_noised (history=1) = 234d.
 # History order per term: [oldest, newest] (CircularBuffer convention).
-proprio_history: 2
-actor_obs_dim: 234
+proprio_history: 8
+actor_obs_dim: 906

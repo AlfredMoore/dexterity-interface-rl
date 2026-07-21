@@ -112,7 +112,8 @@ class DepthFeatPolicyNode(Node):
         # instead of fetching the CUDA-IPC handle. Uncomment the call below to restore.
         # self._fetch_depth_feature_handle()
         _hardcoded_jar_feat = torch.tensor(
-            [[0.0, 0.0, 1.0169, 0.0, 0.0, 1.1069, 0.04, 0.16, 0.029, 0.02]],
+            [[0.0, 0.0, 1.0169, 0.0, 0.0, 1.1169, 0.04, 0.16, 0.035, 0.025]],    # green
+            # [[0.0, 0.0, 1.0169, 0.0, 0.0, 1.1069, 0.04, 0.16, 0.035, 0.02]],    # printed
             dtype=torch.float32,
             device=self.device,
         )  # body_pos(3)+cap_pos(3)+jar_geom(4), metres, env-local frame (= sim extero)
@@ -345,12 +346,13 @@ class DepthFeatPolicyNode(Node):
         self.prev_actions_policy: torch.Tensor = torch.zeros((1, A), dtype=torch.float32, device=self.device)
         self._frozen_default_targets: torch.Tensor = torch.zeros((1, A), dtype=torch.float32, device=self.device)
 
-        # Per-term proprio history buffer: stores the previous frame's proprio
-        # terms (112d total = 19+19+19+19+9+9+3+6+3+6 per side).
-        # On first step, initialized from the current frame.
+        # Per-term proprio history ring buffer (mjlab CircularBuffer semantics):
+        # holds the last N frames (N = proprio_history), oldest at [0], newest at [-1].
+        # 112d per frame = 19+19+19+19+9+9+3+6+3+6 per side. On the first frame the
+        # whole buffer is back-filled with that frame (NOT zeros), matching mjlab.
         self._PROPRIO_DIM = 112
-        self._prev_proprio: torch.Tensor = torch.zeros(
-            (1, self._PROPRIO_DIM), dtype=torch.float32, device=self.device
+        self._proprio_hist: torch.Tensor = torch.zeros(
+            (self.proprio_history, 1, self._PROPRIO_DIM), dtype=torch.float32, device=self.device
         )
         self._proprio_initialized: bool = False
 
@@ -519,18 +521,21 @@ class DepthFeatPolicyNode(Node):
         targets_policy: torch.Tensor,    # [1, A]
         feat_t: torch.Tensor,            # [1, 10] body(3)+cap(3)+geom(4) in metres
     ) -> torch.Tensor:
-        """Build the 234d actor obs in mjlab's per-term history layout.
+        """Build the actor obs in mjlab's per-term history layout.
 
-        proprio_noised (224d) = 10 terms x [prev, current]:
+        proprio_noised (112 * proprio_history) = 10 terms, each emitted as its
+        history_length (=proprio_history) frames oldest->newest, term-major:
           left_joint_pos(19) | right_joint_pos(19) |
           left_targets(19)   | right_targets(19)   |
           left_fingertips(9) | right_fingertips(9) |
           left_palm_pos(3)   | left_palm_rot6d(6)  |
           right_palm_pos(3)  | right_palm_rot6d(6)
-          = 112 per frame, x2 history = 224
+          = 112 per frame, x proprio_history frames.
 
         extero_noised (10d, no history):
           bottle_pos(3) | cap_pos(3) | jar_geom(4)
+
+        Total actor obs = 112 * proprio_history + 10, checked against obs_dim.
         """
         left_jp = joint_pos_policy[:, self.left_policy_indices]
         right_jp = joint_pos_policy[:, self.right_policy_indices]
@@ -579,12 +584,18 @@ class DepthFeatPolicyNode(Node):
                 f"proprio dim={int(cur_proprio.shape[-1])} != expected {self._PROPRIO_DIM}"
             )
 
-        # Initialize prev_proprio on first call.
+        # Update the ring buffer (mjlab CircularBuffer semantics). On the first call,
+        # back-fill ALL N frames with the current frame (not zeros); afterwards, roll and
+        # write the newest frame to [-1] (oldest at [0], newest at [-1]).
         if not self._proprio_initialized:
-            self._prev_proprio.copy_(cur_proprio)
+            self._proprio_hist[:] = cur_proprio
             self._proprio_initialized = True
+        else:
+            self._proprio_hist = torch.roll(self._proprio_hist, -1, dims=0)
+            self._proprio_hist[-1] = cur_proprio
 
-        # Per-term history: interleave [prev, cur] for each term.
+        # Per-term history: for each term emit its N frames oldest->newest, term-major
+        # (mjlab flattens each term's history separately, then concatenates terms).
         # Term boundaries within the 112d proprio vector:
         #   left_jp(19), right_jp(19), left_tgt(19), right_tgt(19),
         #   left_ft(9), right_ft(9), left_palm_pos(3), left_palm_rot6d(6),
@@ -593,15 +604,10 @@ class DepthFeatPolicyNode(Node):
         proprio_parts = []
         offset = 0
         for sz in term_sizes:
-            prev_term = self._prev_proprio[:, offset:offset + sz]
-            cur_term = cur_proprio[:, offset:offset + sz]
-            proprio_parts.append(prev_term)
-            proprio_parts.append(cur_term)
+            for f in range(self.proprio_history):  # oldest -> newest
+                proprio_parts.append(self._proprio_hist[f, :, offset:offset + sz])
             offset += sz
-        proprio_obs = torch.cat(proprio_parts, dim=-1)  # 224d
-
-        # Update prev_proprio for next step.
-        self._prev_proprio.copy_(cur_proprio)
+        proprio_obs = torch.cat(proprio_parts, dim=-1)  # 112 * proprio_history
 
         # Extero (10d, no history): body_pos(3) + cap_pos(3) + jar_geom(4).
         body_pos_m = feat_t[:, 0:3]
