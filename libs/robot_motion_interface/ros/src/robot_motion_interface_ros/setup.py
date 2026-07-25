@@ -39,6 +39,7 @@ setup(
             'apriltag_policy = robot_motion_interface_ros.apriltag_policy:main',
             'fk_node = robot_motion_interface_ros.fk_node:main',
             'depth_node = robot_motion_interface_ros.depth_node:main',
+            'kinect_node = robot_motion_interface_ros.kinect_node:main',
             'cv_node = robot_motion_interface_ros.cv_node:main',
             'test_pre_grasp = robot_motion_interface_ros.test_node_pre_grasp:main',
             'test_curobo = robot_motion_interface_ros.test_node_for_curobo:main',

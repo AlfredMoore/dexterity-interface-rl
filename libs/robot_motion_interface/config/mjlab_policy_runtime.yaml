@@ -1,14 +1,8 @@
 # Runtime params for depth_feat_policy_node using mjlab-trained policies.
 #
 # Replaces the old runtime_cfg_play.yaml (no longer exported) and HandEnv.yaml.
-# These values must match the training config (params/env.yaml actions section).
-# Update when retraining with different action params.
-
-# Action integration (SmoothedJointPositionAction params)
-dt: 0.05               # physics_timestep(0.005) * decimation(10)
-action_ema: 0.5
-action_scale: 1.0
-target_alpha: 0.5
+# Timing and action-integration scalars are read from the deployed policy's
+# params/env.yaml so they stay tied to the exported policy.
 
 # Per-class velocity scales (arm_vel_scale / finger_vel_scale) are now read directly from
 # the deployed policy's params/env.yaml (auto-synced with training) -- removed here to
@@ -72,11 +66,9 @@ soft_upper:
 jar_geom_lo: [0.03, 0.10, 0.02, 0.02]
 jar_geom_hi: [0.05, 0.20, 0.055, 0.04]
 
-# Policy inference rate (Hz). Formerly in rl_policy_node_config.yaml.
-infer_rate: 20.0
-
 # Obs layout for the mjlab actor.
-# Actor groups: proprio_noised (history=2) + extero_noised (history=1) = 234d.
+# Per-frame group dimensions before applying env.yaml history_length.
 # History order per term: [oldest, newest] (CircularBuffer convention).
-proprio_history: 8
-actor_obs_dim: 906
+actor_group_dims:
+  proprio_noised: 112
+  extero_noised: 10

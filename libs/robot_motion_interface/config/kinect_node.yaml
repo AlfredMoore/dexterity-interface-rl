@@ -1,0 +1,118 @@
+kinect:
+  metadata:
+    device: "Azure Kinect (K4A)"
+    notes: "pyk4a 1.5.0 capture; publishes RGB + depth (+ CameraInfo) as sensor_msgs on ROS2."
+
+  # Device index on the USB bus (0 = first Kinect).
+  device_id: 0
+
+  # =========================================================================
+  # Valid enum values (reference). Each align preset below sets its own camera
+  # modes; values are pyk4a enum MEMBER NAMES, resolved via getattr -- a wrong
+  # name raises AttributeError at startup instead of failing silently.
+  #
+  # fps is a JOINT setting: camera_fps applies to the whole device and must be
+  # valid for BOTH the color resolution AND the depth mode (intersection).
+  # e.g. RES_3072P or WFOV_UNBINNED cap the whole device at 15 fps.
+  #
+  # ColorResolution (720P is the LOWEST):
+  #   RES_720P 1280x720 16:9 30fps | RES_1080P 1920x1080 16:9 30fps
+  #   RES_1440P 2560x1440 16:9 30fps | RES_1536P 2048x1536 4:3 30fps
+  #   RES_2160P 3840x2160 16:9 30fps | RES_3072P 4096x3072 4:3 15fps
+  # ImageFormat: COLOR_BGRA32 (used; all res). MJPG/NV12/YUY2 not handled here.
+  # DepthMode:
+  #   NFOV_2X2BINNED 320x288  FoV 75x65   30fps  ~0.5-5.46 m
+  #   NFOV_UNBINNED  640x576  FoV 75x65   30fps  ~0.5-3.86 m
+  #   WFOV_2X2BINNED 512x512  FoV 120x120 30fps  ~0.25-2.88 m
+  #   WFOV_UNBINNED  1024x1024 FoV 120x120 15fps ~0.25-2.21 m
+  #   PASSIVE_IR     1024x1024 IR only, NO depth
+  # FPS: FPS_5 | FPS_15 | FPS_30
+  # =========================================================================
+
+  # -------------------------------------------------------------------------
+  # Registration mode -- selects which publish path the node runs, and which
+  # preset block (d2c / c2d) supplies the camera modes + frames.
+  #   d2c: depth registered INTO the color frame (capture.transformed_depth).
+  #        color mask applies directly; depth_info carries COLOR intrinsics.
+  #   c2d: native depth kept dense (no FoV corner holes); see c2d.method.
+  # Unknown value raises at startup. Only the block matching `align` is read.
+  # -------------------------------------------------------------------------
+  align: "c2d"
+
+  # Shared publish settings (both align modes).
+  publish:
+    color_topic: "/kinect/color/image_raw"
+    color_info_topic: "/kinect/color/camera_info"
+    depth_topic: "/kinect/depth/image_raw"
+    depth_info_topic: "/kinect/depth/camera_info"
+
+    # Color encoding: bgr8 (OpenCV byte order) | rgb8. Only these two supported.
+    color_encoding: "bgr8"
+    # Depth encoding: only 16UC1 (uint16 millimetres) is emitted.
+    depth_encoding: "16UC1"
+    # QoS: best_effort (high-rate streams; consumers/rviz2 MUST match) | reliable.
+    qos: "best_effort"
+
+  # Optional cv2 preview window (color | depth side by side), so checking the
+  # stream does not require rviz2. Panels are resized to a common height before
+  # stacking, which also covers c2d/native_reproject where color (1280x720) and
+  # depth (640x576) differ in size.
+  debug_vis:
+    enabled: true
+    # Display rate in Hz. The colormap runs here, not at camera fps.
+    rate: 30
+    # Each panel is resized to this height before the two are stacked. This sets
+    # the rendered RESOLUTION, not the window size (see max_width).
+    height: 960
+    # Initial window width cap in pixels. WINDOW_NORMAL does not auto-size to the
+    # image, so the window is explicitly resized to the stacked panel, shrunk to
+    # fit this width (two 16:9 panels at height 960 would be ~3413px wide).
+    # The image keeps its full `height` resolution; only the window is scaled,
+    # and it stays user-resizable.
+    max_width: 1920
+    # FIXED depth range (millimetres) for the colormap. Fixed -- not per-frame
+    # auto-normalised -- so brightness stays comparable between frames instead
+    # of flickering when a stray far pixel moves the max.
+    depth_clip_min_mm: 300
+    depth_clip_max_mm: 2000
+    window_name: "kinect_node (color | depth)"
+
+  # Preset read when align == "d2c".
+  d2c:
+    # WFOV_2X2BINNED (120x120) fully covers the color 16:9 FoV, so depth
+    # registered into the color frame has NO corner holes. Range ~0.25-2.88m.
+    color_resolution: "RES_720P"
+    color_format: "COLOR_BGRA32"
+    depth_mode: "WFOV_2X2BINNED"
+    camera_fps: "FPS_30"
+    synchronized_images_only: true
+    # depth is in the color frame, so both images share this frame.
+    frame_id: "kinect_color_optical_frame"
+
+  # Preset read when align == "c2d".
+  c2d:
+    # NFOV_UNBINNED (640x576) is the highest-res depth at 30fps. In c2d the
+    # color is resampled to depth resolution (transformed_color), so higher
+    # depth res = sharper color for SAM; native depth has no corner holes, so
+    # the wider WFOV is not needed here. Range ~0.5-3.86m.
+    color_resolution: "RES_720P"
+    color_format: "COLOR_BGRA32"
+    depth_mode: "NFOV_UNBINNED"
+    camera_fps: "FPS_30"
+    synchronized_images_only: true
+
+    # How the color+depth pair is produced:
+    #   transformed_color: Azure built-in (capture.transformed_color). Color is
+    #     resampled INTO the depth frame, so color & depth share the depth frame
+    #     and depth intrinsics -- a color mask applies directly. Simple; but the
+    #     color a downstream SAM sees is depth-resolution with holes where depth
+    #     is invalid. (Currently selected: eyeballing SAM3 suitability.)
+    #   native_reproject: keep NATIVE full-res color (best for SAM) + native
+    #     depth in separate frames, bridged by a static depth->color TF so a
+    #     downstream estimator can reproject depth points into the color mask.
+    method: "native_reproject"
+    color_frame_id: "kinect_color_optical_frame"
+    depth_frame_id: "kinect_depth_optical_frame"
+    # Static TF depth_frame -> color_frame from device extrinsics.
+    # Only used by method: native_reproject. Set false if TF comes from elsewhere.
+    publish_extrinsic_tf: true

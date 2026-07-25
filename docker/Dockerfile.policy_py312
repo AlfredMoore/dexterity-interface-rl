@@ -114,7 +114,7 @@ RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh  
     conda activate policy && \
     pip install colcon-common-extensions && \
     pip install numpy==1.26 scipy ninja pyyaml matplotlib && \
-    pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+    pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
 
 WORKDIR /workspace
 COPY ./libs /workspace/libs
@@ -172,7 +172,31 @@ RUN apt update && apt install -y \
     netcat-openbsd \
     ufw
 
-    ########################################################
+########################################################
+# 6.5 Azure Kinect SDK (libk4a 1.4.2) + pyk4a 1.5.0
+########################################################
+COPY ./docker/k4a-install /tmp/k4a-install
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      debconf-utils libusb-1.0-0 libudev1 libgl1 libx11-6 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN echo 'libk4a1.4 libk4a1.4/accepted-eula-hash string 0f5d5c5de396e4fee4c0753a21fee0c1ed726cf0316204edda484f08cb266d76' | debconf-set-selections && \
+    echo 'libk4a1.4 libk4a1.4/accept-eula boolean true' | debconf-set-selections && \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+      /tmp/k4a-install/libk4a1.4_1.4.2_amd64.deb \
+      /tmp/k4a-install/libk4a1.4-dev_1.4.2_amd64.deb \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN echo '/usr/lib/x86_64-linux-gnu/libk4a1.4' > /etc/ld.so.conf.d/azure-kinect.conf && \
+    ldconfig
+
+RUN source $CONDA_DIR/etc/profile.d/conda.sh && conda activate policy && \
+    pip install wheel cython && \
+    pip install "pyk4a==1.5.0"
+
+########################################################
 # 7. Final Configuration
 ########################################################
 RUN echo "export PATH=/opt/openrobots/bin:\$PATH" >> /root/.bashrc && \

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=70.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sam3-trt"
+version = "0.1.0"
+description = "SAM3 TensorRT inference (BGR image + text prompt -> mask)"
+requires-python = ">=3.12"
+dependencies = [
+    "tensorrt>=10.8,<11",      # RTX 5090 / Blackwell (sm_120) needs >= 10.8
+    "transformers==5.0.0rc1",  # SAM3 model + tokenizer (ONNX export step)
+    "accelerate",
+    "onnx",                    # ONNX export step
+    "torchvision",
+]
+# torch (cu128), numpy, opencv come from the policy env and are intentionally
+# NOT listed so pip does not pull a non-cu128 build over the installed torch.
+
+[tool.setuptools]
+# Flat dir also holds export/build/test scripts; install only the runtime module.
+py-modules = ["sam3_trt"]

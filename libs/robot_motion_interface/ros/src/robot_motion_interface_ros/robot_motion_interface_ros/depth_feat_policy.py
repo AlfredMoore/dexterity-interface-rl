@@ -1,8 +1,8 @@
 """Policy node that consumes a pre-computed depth feature vector via CUDA IPC.
 
-Refactored for mjlab-trained policies. The obs layout follows mjlab's per-term
-history convention: proprio_noised (112d x history=2 = 224d) concatenated with
-extero_noised (10d x history=1 = 10d) = 234d total actor obs.
+Refactored for mjlab-trained policies. The actor obs group order comes from
+params/agent.yaml; group history comes from params/env.yaml; per-frame group dims
+come from mjlab_policy_runtime.yaml.
 
 Key differences from the HAND/IsaacLab version:
   - No joint velocity in actor obs (critic-only in mjlab)
@@ -112,7 +112,7 @@ class DepthFeatPolicyNode(Node):
         # instead of fetching the CUDA-IPC handle. Uncomment the call below to restore.
         # self._fetch_depth_feature_handle()
         _hardcoded_jar_feat = torch.tensor(
-            [[0.0, 0.0, 1.0169, 0.0, 0.0, 1.1169, 0.04, 0.16, 0.035, 0.025]],    # green
+            [[0.0, 0.0, 1.0169, 0.0, 0.0, 1.1169, 0.04, 0.16, 0.04, 0.020]],    # green
             # [[0.0, 0.0, 1.0169, 0.0, 0.0, 1.1069, 0.04, 0.16, 0.035, 0.02]],    # printed
             dtype=torch.float32,
             device=self.device,
@@ -162,10 +162,12 @@ class DepthFeatPolicyNode(Node):
         self.driver_cfg = _load_yaml(self.driver_cfg_path)
         self.fk_cfg = _load_yaml(self.fk_cfg_path)
         self.depth_feat_full_cfg = _load_yaml(self.depth_feat_cfg_path)
-        # Deployed policy's training env.yaml -> vel_scale etc. (auto-synced with the
-        # exported policy). See utils/mjlab_yaml: tag-ignoring loader (mjlab not importable).
+        # Deployed policy's training params -> obs layout, timing, and action params.
+        # See utils/mjlab_yaml: tag-ignoring loader (mjlab not importable).
         self._env_cfg_path = self.policy_log_dir / "params" / "env.yaml"
+        self._agent_cfg_path = self.policy_log_dir / "params" / "agent.yaml"
         self.env_cfg = load_mjlab_yaml(self._env_cfg_path)
+        self.agent_cfg = load_mjlab_yaml(self._agent_cfg_path)
 
         self.get_logger().info("#### Depth-feat policy node configs (mjlab): ####")
         self.get_logger().info(f"policy_log_dir:          {self.policy_log_dir}")
@@ -175,6 +177,7 @@ class DepthFeatPolicyNode(Node):
         self.get_logger().info(f"fk_cfg_path:             {self.fk_cfg_path}")
         self.get_logger().info(f"depth_feat_cfg_path:     {self.depth_feat_cfg_path}")
         self.get_logger().info(f"env_cfg_path:            {self._env_cfg_path}")
+        self.get_logger().info(f"agent_cfg_path:          {self._agent_cfg_path}")
 
     def _init_device(self) -> None:
         if not torch.cuda.is_available():
@@ -194,6 +197,43 @@ class DepthFeatPolicyNode(Node):
     # ------------------------------------------------------------------
     def _to_dev_t(self, data: Any, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         return torch.tensor(data, dtype=dtype, device=self.device)
+
+    def _read_env_step_dt(self) -> float:
+        timestep = float(self.env_cfg["sim"]["mujoco"]["timestep"])
+        decimation = int(self.env_cfg["decimation"])
+        return timestep * decimation
+
+    def _obs_group_history_multiplier(self, group_name: str) -> int:
+        history = self.env_cfg["observations"][group_name]["history_length"]
+        return max(1, int(history))
+
+    def _resolve_actor_obs_layout(self) -> tuple[
+        list[str], dict[str, int], dict[str, int], dict[str, int], int
+    ]:
+        actor_groups = list(self.agent_cfg["obs_groups"]["actor"])
+        base_dims = {
+            group: int(self.mjlab_rt["actor_group_dims"][group])
+            for group in actor_groups
+        }
+        histories = {
+            group: self._obs_group_history_multiplier(group)
+            for group in actor_groups
+        }
+        group_dims = {
+            group: base_dims[group] * histories[group]
+            for group in actor_groups
+        }
+        return actor_groups, base_dims, histories, group_dims, sum(group_dims.values())
+
+    @staticmethod
+    def _flatten_history_term_major(history: torch.Tensor, term_sizes: list[int]) -> torch.Tensor:
+        parts = []
+        offset = 0
+        for size in term_sizes:
+            for frame in range(history.shape[0]):
+                parts.append(history[frame, :, offset:offset + size])
+            offset += size
+        return torch.cat(parts, dim=-1)
 
     def _build_joint_mappings(self) -> None:
         # Real driver order: left panda+tesollo, then right panda+tesollo.
@@ -299,14 +339,22 @@ class DepthFeatPolicyNode(Node):
         self.fk_topic = str(self.fk_cfg["fk_topic"])
 
     def _build_policy_and_normalizer(self) -> None:
-        """Load obs dims from mjlab_runtime_cfg, cache scaling tensors, load JIT policy."""
+        """Resolve obs layout, cache scaling tensors, load JIT policy."""
         # Jar geom bounds from runtime config.
         self._geom_lower_t = self._to_dev_t(self.mjlab_rt["jar_geom_lo"]).unsqueeze(0)
         self._geom_upper_t = self._to_dev_t(self.mjlab_rt["jar_geom_hi"]).unsqueeze(0)
 
-        # Obs dims.
-        self.obs_dim = int(self.mjlab_rt["actor_obs_dim"])
-        self.proprio_history = int(self.mjlab_rt["proprio_history"])
+        (
+            self.actor_obs_groups,
+            self.actor_group_base_dims,
+            self.actor_group_histories,
+            self.actor_group_dims,
+            self.obs_dim,
+        ) = self._resolve_actor_obs_layout()
+        self.proprio_history = self.actor_group_histories["proprio_noised"]
+        self.extero_history = self.actor_group_histories["extero_noised"]
+        self._PROPRIO_DIM = self.actor_group_base_dims["proprio_noised"]
+        self._EXTERO_DIM = self.actor_group_base_dims["extero_noised"]
 
         if not self.jit_policy_path.exists():
             raise FileNotFoundError(
@@ -346,15 +394,28 @@ class DepthFeatPolicyNode(Node):
         self.prev_actions_policy: torch.Tensor = torch.zeros((1, A), dtype=torch.float32, device=self.device)
         self._frozen_default_targets: torch.Tensor = torch.zeros((1, A), dtype=torch.float32, device=self.device)
 
-        # Per-term proprio history ring buffer (mjlab CircularBuffer semantics):
-        # holds the last N frames (N = proprio_history), oldest at [0], newest at [-1].
-        # 112d per frame = 19+19+19+19+9+9+3+6+3+6 per side. On the first frame the
-        # whole buffer is back-filled with that frame (NOT zeros), matching mjlab.
-        self._PROPRIO_DIM = 112
+        # Per-term history ring buffers (mjlab CircularBuffer semantics): oldest at [0],
+        # newest at [-1]. On the first frame the whole buffer is back-filled.
+        self._PROPRIO_TERM_SIZES = [19, 19, 19, 19, 9, 9, 3, 6, 3, 6]
+        self._EXTERO_TERM_SIZES = [3, 3, 4]
+        if sum(self._PROPRIO_TERM_SIZES) != self._PROPRIO_DIM:
+            raise ValueError(
+                f"proprio_noised base dim mismatch: term_sizes={sum(self._PROPRIO_TERM_SIZES)} "
+                f"vs actor_group_dims.proprio_noised={self._PROPRIO_DIM}"
+            )
+        if sum(self._EXTERO_TERM_SIZES) != self._EXTERO_DIM:
+            raise ValueError(
+                f"extero_noised base dim mismatch: term_sizes={sum(self._EXTERO_TERM_SIZES)} "
+                f"vs actor_group_dims.extero_noised={self._EXTERO_DIM}"
+            )
         self._proprio_hist: torch.Tensor = torch.zeros(
             (self.proprio_history, 1, self._PROPRIO_DIM), dtype=torch.float32, device=self.device
         )
+        self._extero_hist: torch.Tensor = torch.zeros(
+            (self.extero_history, 1, self._EXTERO_DIM), dtype=torch.float32, device=self.device
+        )
         self._proprio_initialized: bool = False
+        self._extero_initialized: bool = False
 
         # Working buffers.
         self._obs_buf: torch.Tensor = torch.zeros((1, self.obs_dim), dtype=torch.float32, device=self.device)
@@ -377,7 +438,7 @@ class DepthFeatPolicyNode(Node):
         self._rec_actions = torch.zeros((self._rec_max_steps, A), dtype=torch.float32, device=self.device)
         self._rec_targets = torch.zeros((self._rec_max_steps, A), dtype=torch.float32, device=self.device)
         self._rec_joint_pos = torch.zeros((self._rec_max_steps, A), dtype=torch.float32, device=self.device)
-        self._rec_feat = torch.zeros((self._rec_max_steps, 10), dtype=torch.float32, device=self.device)
+        self._rec_feat = torch.zeros((self._rec_max_steps, self._EXTERO_DIM), dtype=torch.float32, device=self.device)
         self._rec_saved = False
 
     def _fetch_depth_feature_handle(self) -> None:
@@ -490,21 +551,15 @@ class DepthFeatPolicyNode(Node):
     # Step 5: timer + summary
     # ------------------------------------------------------------------
     def _init_policy_timer(self) -> None:
-        self.policy_hz = float(self.mjlab_rt["infer_rate"])
-        if self.policy_hz <= 0.0:
-            raise ValueError(f"infer_rate must be > 0, got {self.policy_hz}")
+        self.dt = self._read_env_step_dt()
+        self.policy_hz = 1.0 / self.dt
 
-        self.dt = float(self.mjlab_rt["dt"])
-        self.action_ema = float(self.mjlab_rt["action_ema"])
-        self.action_scale = float(self.mjlab_rt["action_scale"])
-        self.target_alpha = float(self.mjlab_rt["target_alpha"])
+        _act = self.env_cfg["actions"]["left"]
+        self.action_ema = float(_act["ema"])
+        self.action_scale = float(_act["action_scale"])
+        self.target_alpha = float(_act["target_alpha"])
 
         timer_dt = 1.0 / self.policy_hz
-        if abs(timer_dt - self.dt) > 1e-5:
-            self.get_logger().warn(
-                f"Policy timer dt ({timer_dt:.6f}) != runtime dt ({self.dt:.6f}). "
-                "Target integration uses runtime dt."
-            )
 
         self.policy_timer = self.create_timer(
             timer_dt,
@@ -523,19 +578,20 @@ class DepthFeatPolicyNode(Node):
     ) -> torch.Tensor:
         """Build the actor obs in mjlab's per-term history layout.
 
-        proprio_noised (112 * proprio_history) = 10 terms, each emitted as its
-        history_length (=proprio_history) frames oldest->newest, term-major:
+        Actor group order is read from params/agent.yaml. Each group dimension is
+        actor_group_dims[group] from mjlab_policy_runtime.yaml multiplied by that
+        group's history_length from params/env.yaml. Within each group, every term
+        emits its frames oldest->newest before the next term is appended.
+
+        proprio_noised terms per frame:
           left_joint_pos(19) | right_joint_pos(19) |
           left_targets(19)   | right_targets(19)   |
           left_fingertips(9) | right_fingertips(9) |
           left_palm_pos(3)   | left_palm_rot6d(6)  |
           right_palm_pos(3)  | right_palm_rot6d(6)
-          = 112 per frame, x proprio_history frames.
 
-        extero_noised (10d, no history):
+        extero_noised terms per frame:
           bottle_pos(3) | cap_pos(3) | jar_geom(4)
-
-        Total actor obs = 112 * proprio_history + 10, checked against obs_dim.
         """
         left_jp = joint_pos_policy[:, self.left_policy_indices]
         right_jp = joint_pos_policy[:, self.right_policy_indices]
@@ -596,20 +652,9 @@ class DepthFeatPolicyNode(Node):
 
         # Per-term history: for each term emit its N frames oldest->newest, term-major
         # (mjlab flattens each term's history separately, then concatenates terms).
-        # Term boundaries within the 112d proprio vector:
-        #   left_jp(19), right_jp(19), left_tgt(19), right_tgt(19),
-        #   left_ft(9), right_ft(9), left_palm_pos(3), left_palm_rot6d(6),
-        #   right_palm_pos(3), right_palm_rot6d(6)
-        term_sizes = [19, 19, 19, 19, 9, 9, 3, 6, 3, 6]
-        proprio_parts = []
-        offset = 0
-        for sz in term_sizes:
-            for f in range(self.proprio_history):  # oldest -> newest
-                proprio_parts.append(self._proprio_hist[f, :, offset:offset + sz])
-            offset += sz
-        proprio_obs = torch.cat(proprio_parts, dim=-1)  # 112 * proprio_history
+        proprio_obs = self._flatten_history_term_major(self._proprio_hist, self._PROPRIO_TERM_SIZES)
 
-        # Extero (10d, no history): body_pos(3) + cap_pos(3) + jar_geom(4).
+        # Extero: body_pos(3) + cap_pos(3) + jar_geom(4), with group history if env.yaml enables it.
         body_pos_m = feat_t[:, 0:3]
         cap_pos_m = feat_t[:, 3:6]
         geom_raw = feat_t[:, 6:10]
@@ -618,9 +663,24 @@ class DepthFeatPolicyNode(Node):
         # geom_raw   = torch.tensor([[0.04, 0.16, 0.029, 0.02]], device=self.device)  # meter
         jar_geom_scaled = _scale_torch(geom_raw, self._geom_lower_t, self._geom_upper_t)  # (1, 4)
 
-        extero_obs = torch.cat([body_pos_m, cap_pos_m, jar_geom_scaled], dim=-1)  # 10d
+        cur_extero = torch.cat([body_pos_m, cap_pos_m, jar_geom_scaled], dim=-1)
+        if int(cur_extero.shape[-1]) != self._EXTERO_DIM:
+            raise ValueError(
+                f"extero dim={int(cur_extero.shape[-1])} != expected {self._EXTERO_DIM}"
+            )
+        if not self._extero_initialized:
+            self._extero_hist[:] = cur_extero
+            self._extero_initialized = True
+        else:
+            self._extero_hist = torch.roll(self._extero_hist, -1, dims=0)
+            self._extero_hist[-1] = cur_extero
+        extero_obs = self._flatten_history_term_major(self._extero_hist, self._EXTERO_TERM_SIZES)
 
-        actor_obs = torch.cat([proprio_obs, extero_obs], dim=-1)  # 234d
+        group_obs = {
+            "proprio_noised": proprio_obs,
+            "extero_noised": extero_obs,
+        }
+        actor_obs = torch.cat([group_obs[group] for group in self.actor_obs_groups], dim=-1)
 
         if int(actor_obs.shape[-1]) != self.obs_dim:
             raise ValueError(
@@ -732,7 +792,7 @@ class DepthFeatPolicyNode(Node):
         self._prev_actions_snapshot_t.copy_(self.prev_actions_policy)
         t03 = time.perf_counter()
 
-        # 5) Compose 234d obs, run policy.
+        # 5) Compose actor obs, run policy.
         actor_obs = self._compose_actor_obs(
             joint_pos_policy=self._joint_pos_policy_t,
             targets_policy=self._targets_snapshot_t,
@@ -824,9 +884,11 @@ class DepthFeatPolicyNode(Node):
                 "target_alpha": float(self.target_alpha),
             },
             "obs": {
+                "actor_obs_groups": list(self.actor_obs_groups),
                 "actor_obs_dim": int(self.obs_dim),
-                "proprio_history": int(self.proprio_history),
-                "proprio_dim_per_frame": self._PROPRIO_DIM,
+                "actor_group_base_dims": dict(self.actor_group_base_dims),
+                "actor_group_histories": dict(self.actor_group_histories),
+                "actor_group_dims": dict(self.actor_group_dims),
             },
             "policy": {
                 "source": "torch.jit.load",
