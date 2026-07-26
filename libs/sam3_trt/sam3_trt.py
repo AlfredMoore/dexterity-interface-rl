@@ -63,7 +63,8 @@ class Sam3TRT:
         inputs = self.processor(images=rgb, text=prompt, return_tensors="pt", device=self.device)
         for name in ("pixel_values", "input_ids", "attention_mask"):
             self.buf[name].copy_(inputs[name])  # copy_ moves to CUDA + casts dtype
-        self.ctx.execute_v3()
+        stream = torch.cuda.current_stream(self.device)
+        self.ctx.execute_async_v3(stream.cuda_stream)
         prob = torch.sigmoid(self.buf["semantic_seg"].float())      # 1,1,288,288
         prob = F.interpolate(prob, (h, w), mode="bilinear", align_corners=False)[0, 0]
         mask = (prob > threshold).to(torch.uint8) * 255

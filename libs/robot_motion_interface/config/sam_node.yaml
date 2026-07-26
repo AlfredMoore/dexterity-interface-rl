@@ -1,0 +1,18 @@
+sam3:
+  model:
+    engine_path: "libs/sam3_trt/onnx_weights/sam3_fp16.plan"
+    processor_path: "libs/sam3_trt/cache/sam3_processor"
+    device: "cuda"
+
+  inference:
+    prompt: "bottle"
+    mask_threshold: 0.5
+    presence_threshold: 0.5
+
+  ros:
+    input_topic: "/kinect/color/image_raw"
+    mask_topic: "/sam3/mask"
+    depth_mask_topic: "/sam3/depth_mask"
+    masked_depth_topic: "/sam3/masked_depth"
+    presence_topic: "/sam3/presence"
+    qos: "best_effort"

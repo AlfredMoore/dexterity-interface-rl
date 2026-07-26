@@ -24,6 +24,7 @@ Images are hand-built (no cv_bridge dependency), matching depth_feat_node.
 from __future__ import annotations
 
 import importlib.util
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -121,6 +122,9 @@ class KinectNode(Node):
         self.cfg = _load_yaml(self.cfg_path)["kinect"]
 
         self.device_id = int(self.cfg["device_id"])
+        self.capture_timeout_ms = int(self.cfg.get("capture_timeout_ms", 1000))
+        if self.capture_timeout_ms <= 0:
+            raise ValueError("capture_timeout_ms must be > 0")
 
         self.align = str(self.cfg["align"])
         if self.align not in ("d2c", "c2d"):
@@ -372,13 +376,20 @@ class KinectNode(Node):
     def _capture_loop(self) -> None:
         while self._capture_running and rclpy.ok():
             try:
-                capture = self.camera.get_capture()
+                capture = self.camera.get_capture(timeout=self.capture_timeout_ms)
             except Exception as exc:
                 self.get_logger().error(f"Kinect capture error: {exc}")
                 self._device_failed = True
                 self._capture_running = False
-                rclpy.shutdown()
-                return
+                # LIBUSB_TRANSFER_NO_DEVICE invalidates the native SDK handle.
+                # Normal ROS/PyK4A teardown may then block forever while trying
+                # to stop or close that dead handle. This process cannot recover
+                # the device in place, so exit without running native destructors;
+                # the OS will reclaim its USB and DDS resources.
+                self.get_logger().warn(
+                    "Kinect device lost; exiting the node without closing the dead SDK handle"
+                )
+                os._exit(1)
 
             try:
                 if self.align == "d2c":
@@ -501,21 +512,32 @@ class KinectNode(Node):
     # ------------------------------------------------------------------
     def destroy_node(self) -> bool:
         self._capture_running = False
-        if getattr(self, "_capture_thread", None) is not None and self._capture_thread.is_alive():
-            self._capture_thread.join(timeout=1.0)
+        thread = getattr(self, "_capture_thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=self.capture_timeout_ms / 1000.0 + 0.5)
+        thread_alive = thread is not None and thread.is_alive()
+
         if self.vis_enabled:
             cv2.destroyAllWindows()
+
         camera = getattr(self, "camera", None)
-        if camera is not None and not getattr(self, "_device_failed", False):
+        if camera is not None and thread_alive:
+            # Do not race camera.stop() against a native get_capture() that did
+            # not honor its timeout. The daemon thread cannot block process exit.
+            self.get_logger().warn(
+                "Kinect capture thread did not stop; skipping camera.stop()"
+            )
+        elif camera is not None and not getattr(self, "_device_failed", False):
             try:
                 camera.stop()
             except Exception as exc:
                 self.get_logger().error(f"Error stopping Kinect: {exc}")
-        elif getattr(self, "_device_failed", False):
-            # The USB device is gone; stop() would block libk4a/libusb on a dead
-            # handle and wedge shutdown (Ctrl-C included). Skip it -- the OS
-            # reclaims the handle when the process exits.
-            self.get_logger().warn("Kinect device lost; skipping camera.stop() to avoid a hung shutdown")
+        elif camera is not None:
+            # Kept as a defensive fallback. The capture thread normally exits
+            # the process immediately on device loss, before this path is reached.
+            self.get_logger().warn(
+                "Kinect device lost; abandoning the dead SDK handle"
+            )
         return super().destroy_node()
 
 

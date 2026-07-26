@@ -6,6 +6,10 @@ kinect:
   # Device index on the USB bus (0 = first Kinect).
   device_id: 0
 
+  # Never wait forever inside the native SDK. A finite timeout keeps Ctrl-C
+  # responsive and lets the node exit when the USB device disappears.
+  capture_timeout_ms: 1000
+
   # =========================================================================
   # Valid enum values (reference). Each align preset below sets its own camera
   # modes; values are pyk4a enum MEMBER NAMES, resolved via getattr -- a wrong

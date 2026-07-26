@@ -51,6 +51,8 @@ setup(
             'yolo_node_bbox = robot_motion_interface_ros.yolo_node_bbox:main',
             'yolo_node_seg = robot_motion_interface_ros.yolo_node_seg:main',
             'gsam2_node = robot_motion_interface_ros.gsam2_node:main',
+            'sam_node = robot_motion_interface_ros.sam_node:main',
+            "kinect_sam_c2d_node = robot_motion_interface_ros.kinect_sam_c2d_node:main",
         ],
     },
 )
