@@ -30,6 +30,7 @@ setup(
             'aux_policy = robot_motion_interface_ros.aux_policy:main',
             'aux_policy_2 = robot_motion_interface_ros.aux_policy_v2:main',
             'depth_feat_policy = robot_motion_interface_ros.depth_feat_policy:main',
+            'policy_state_estimator = robot_motion_interface_ros.policy_state_estimator:main',
             'depth_feat_node = robot_motion_interface_ros.depth_feat_node:main',
             'depth_sam_feat_node = robot_motion_interface_ros.depth_sam_feat_node:main',
             'depth_feat_node_collect = robot_motion_interface_ros.depth_feat_node_collect:main',

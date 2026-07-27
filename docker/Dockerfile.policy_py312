@@ -1,5 +1,5 @@
-# 1. Base Image: NVIDIA CUDA 12.8 on Ubuntu 24.04
-FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04
+# 1. Base Image: NVIDIA CUDA 13.0 on Ubuntu 24.04
+FROM nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04
 
 # Set environment variables
 ENV LANG=en_US.UTF-8
@@ -114,7 +114,7 @@ RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh  
     conda activate policy && \
     pip install colcon-common-extensions && \
     pip install numpy==1.26 scipy ninja pyyaml matplotlib && \
-    pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
+    pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cu130
 
 WORKDIR /workspace
 COPY ./libs /workspace/libs
@@ -146,6 +146,13 @@ RUN source $CONDA_DIR/etc/profile.d/conda.sh && \
     pip install -e /workspace/libs/sensor_interface/sensor_interface_py && \
     pip install numpy==1.26 pybind11 lark pyrealsense2 opencv-python>=4.8.0
 
+# SAM3 TensorRT (segmentation for the Kinect masked-depth pipeline).
+RUN source $CONDA_DIR/etc/profile.d/conda.sh && \
+    conda activate policy && \
+    pip install "tensorrt>=10.8,<11" "transformers>=5.0" accelerate onnx \
+        --extra-index-url https://download.pytorch.org/whl/cu130 && \
+    pip install -e /workspace/libs/sam3_trt --no-deps && \
+    pip install numpy==1.26
 # Realsense, opengl, opencv dependencies
 RUN apt update && apt install -y \
     libusb-1.0-0 \

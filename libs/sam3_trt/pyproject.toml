@@ -9,7 +9,7 @@ description = "SAM3 TensorRT inference (BGR image + text prompt -> mask)"
 requires-python = ">=3.12"
 dependencies = [
     "tensorrt>=10.8,<11",      # RTX 5090 / Blackwell (sm_120) needs >= 10.8
-    "transformers==5.0.0rc1",  # SAM3 model + tokenizer (ONNX export step)
+    "transformers>=5.0",  # SAM3 model + tokenizer (ONNX export step)
     "accelerate",
     "onnx",                    # ONNX export step
     "torchvision",

@@ -26,7 +26,7 @@ from pyk4a.errors import K4ATimeoutException
 from pyk4a.transformation import color_image_to_depth_camera
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo, Image, JointState
 from std_msgs.msg import Float32
 
 from robot_motion_interface.utils.qos import HIGH_PERF_QOS, HIGH_RELIA_QOS
@@ -37,6 +37,14 @@ spec = importlib.util.find_spec("robot_motion_interface")
 if spec is None or spec.origin is None:
     raise RuntimeError("Cannot locate robot_motion_interface")
 RMI_ROOT = Path(spec.origin).parent.parent.parent
+
+# Feature consumed by policy_state_estimator.py; order and units match the sim extero group.
+STATE_ESTIMATOR_TOPIC = "/state_estimator/extero"
+_EXTERO_NAMES = [
+    "bottle_x", "bottle_y", "bottle_z",
+    "cap_x", "cap_y", "cap_z",
+    "body_r", "body_h", "cap_r", "cap_h",
+]
 WORKSPACE_ROOT = Path("/workspace")
 
 _QOS = {"best_effort": HIGH_PERF_QOS, "reliable": HIGH_RELIA_QOS}
@@ -87,6 +95,10 @@ class KinectSamC2DNode(Node):
 
         self.sam = Sam3TRT(
             str(self.engine_path), str(self.processor_path), self.sam_device
+        )
+        self.estimator = StateEstimator(
+            RMI_ROOT / "runtime" / "state_estimator" / "exported" / "depth_predictor.pt",
+            device=self.sam_device,
         )
         self._setup_camera()
         self._setup_publishers()
@@ -155,6 +167,20 @@ class KinectSamC2DNode(Node):
         self._color_D = np.asarray(self.calib.get_distortion_coefficients(CalibrationType.COLOR), dtype=float)
         self._depth_K = np.asarray(self.calib.get_camera_matrix(CalibrationType.DEPTH), dtype=float)
         self._depth_D = np.asarray(self.calib.get_distortion_coefficients(CalibrationType.DEPTH), dtype=float)
+        depth_size = {
+            DepthMode.NFOV_2X2BINNED: (320, 288),
+            DepthMode.NFOV_UNBINNED: (640, 576),
+            DepthMode.WFOV_2X2BINNED: (512, 512),
+            DepthMode.WFOV_UNBINNED: (1024, 1024),
+        }[getattr(DepthMode, self.depth_mode)]
+        self._depth_map1, self._depth_map2 = cv2.initUndistortRectifyMap(
+            self._depth_K,
+            self._depth_D,
+            None,
+            self._depth_K,
+            depth_size,
+            cv2.CV_32FC1,
+        )
         self._color_info: CameraInfo | None = None
         self._depth_info: CameraInfo | None = None
 
@@ -167,6 +193,9 @@ class KinectSamC2DNode(Node):
         self.depth_mask_pub = self.create_publisher(Image, self.depth_mask_topic, self.sam_qos)
         self.masked_depth_pub = self.create_publisher(Image, self.masked_depth_topic, self.sam_qos)
         self.presence_pub = self.create_publisher(Float32, self.presence_topic, self.sam_qos)
+        self.extero_pub = self.create_publisher(
+            JointState, STATE_ESTIMATOR_TOPIC, self.sam_qos
+        )
 
     def _latest_capture(self):
         capture = self.camera.get_capture(timeout=self.capture_timeout_ms)
@@ -214,12 +243,29 @@ class KinectSamC2DNode(Node):
             mask_bgra, depth, self.calib, self.camera.thread_safe
         )
 
-        depth_mask = ((transformed[:, :, 0] >= 128) & (depth != 0)).astype(np.uint8) * 255
-        masked_depth = np.where(depth_mask != 0, depth, 0).astype(np.uint16)
+        masked_depth_raw = np.where(
+            transformed[:, :, 0] >= 128, depth, 0
+        ).astype(np.uint16)
+        masked_depth = cv2.remap(
+            masked_depth_raw,
+            self._depth_map1,
+            self._depth_map2,
+            cv2.INTER_NEAREST,
+        )
+        depth_mask = (masked_depth != 0).astype(np.uint8) * 255
 
         if self._color_info is None:
             self._color_info = self._camera_info(bgr, self._color_K, self._color_D, self.color_frame_id)
             self._depth_info = self._camera_info(depth, self._depth_K, self._depth_D, self.depth_frame_id)
+
+        # State estimate: masked depth -> [bottle_pos(3), cap_pos(3), jar_geom(4)], metres,
+        pred = self.estimator.infer(masked_depth)[0].tolist()
+        extero = JointState()
+        extero.header.stamp = stamp
+        extero.header.frame_id = self.depth_frame_id
+        extero.name = _EXTERO_NAMES
+        extero.position = pred
+        self.extero_pub.publish(extero)
 
         self.masked_depth_pub.publish(self._image(masked_depth, stamp, "16UC1", self.depth_frame_id))
         self.depth_mask_pub.publish(self._image(depth_mask, stamp, "mono8", self.depth_frame_id))
