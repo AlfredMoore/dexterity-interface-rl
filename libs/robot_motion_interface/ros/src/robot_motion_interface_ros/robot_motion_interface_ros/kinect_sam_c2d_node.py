@@ -45,6 +45,29 @@ _EXTERO_NAMES = [
     "cap_x", "cap_y", "cap_z",
     "body_r", "body_h", "cap_r", "cap_h",
 ]
+# HARDCODING JAR GEOMETRY:
+_TABLETOP_Z = 0.9369  # table top in the calibrated world frame (sim: 0.9144 + 0.045/2)
+_JARS: dict[str, dict[str, float]] = {
+    #                cap_r   cap_h   bot_r   bot_h
+    "green_vita":   {"cap_r": 0.030, "cap_h": 0.020, "bot_r": 0.042, "bot_h": 0.165},
+    "blue_peanut":  {"cap_r": 0.036, "cap_h": 0.020, "bot_r": 0.036, "bot_h": 0.100},
+    "printed":      {"cap_r": 0.040, "cap_h": 0.030, "bot_r": 0.042, "bot_h": 0.120},
+    "brown_peanut": {"cap_r": 0.048, "cap_h": 0.020, "bot_r": 0.050, "bot_h": 0.150},
+    "black_peanut": {"cap_r": 0.033, "cap_h": 0.020, "bot_r": 0.043, "bot_h": 0.180},
+}
+
+def hardcode_pred(pred: list[float], jar_name: str) -> list[float]:
+    """
+    green_vita, blue_peanut, printed, brown_peanut, black_peanut
+    """
+    jar = _JARS[jar_name]
+    bot_h, cap_h = jar["bot_h"], jar["cap_h"]
+    pred[2] = _TABLETOP_Z + bot_h / 2.0          # bottle_z
+    pred[5] = _TABLETOP_Z + bot_h + cap_h / 2.0  # cap_z
+    pred[6:10] = [jar["bot_r"], bot_h, jar["cap_r"], cap_h]
+    return pred
+
+
 WORKSPACE_ROOT = Path("/workspace")
 
 _QOS = {"best_effort": HIGH_PERF_QOS, "reliable": HIGH_RELIA_QOS}
@@ -260,6 +283,9 @@ class KinectSamC2DNode(Node):
 
         # State estimate: masked depth -> [bottle_pos(3), cap_pos(3), jar_geom(4)], metres,
         pred = self.estimator.infer(masked_depth)[0].tolist()
+        # HARDCODE STARTS HERE
+        pred = hardcode_pred(pred, jar_name="green_vita")
+        
         extero = JointState()
         extero.header.stamp = stamp
         extero.header.frame_id = self.depth_frame_id
@@ -279,7 +305,12 @@ class KinectSamC2DNode(Node):
         self.depth_info_pub.publish(self._depth_info)
 
         total_ms = (time.perf_counter() - process_start) * 1000
-        print(f"process latency: total={total_ms:.3f} ms")
+        print(
+            f"latency={total_ms:7.2f}ms  body xy=({pred[0]:+.3f},{pred[1]:+.3f})  "
+            f"cap xy=({pred[3]:+.3f},{pred[4]:+.3f})  "
+            f"cap rh=({pred[8]:.3f},{pred[9]:.3f})\033[K",
+            end="\r", flush=True,
+        )
 
     @staticmethod
     def _image(arr: np.ndarray, stamp, encoding: str, frame_id: str) -> Image:
@@ -308,6 +339,7 @@ class KinectSamC2DNode(Node):
         return msg
 
     def destroy_node(self) -> bool:
+        print()  # keep the last \r-refreshed status line instead of letting ^C overwrite it
         self._running = False
         self._capture_thread.join(timeout=self.capture_timeout_ms / 1000.0 + 1.0)
         self.camera.stop()
