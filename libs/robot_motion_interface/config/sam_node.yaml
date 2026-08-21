@@ -8,7 +8,7 @@ sam3:
     prompt: "bottle"
     mask_threshold: 0.5
     # presence_threshold: 0.5
-    presence_threshold: 0.3
+    presence_threshold: 0.25
 
   ros:
     input_topic: "/kinect/color/image_raw"

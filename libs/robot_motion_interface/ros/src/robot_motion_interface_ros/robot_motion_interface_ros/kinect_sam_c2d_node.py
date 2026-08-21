@@ -57,12 +57,50 @@ _JARS: dict[str, dict[str, float]] = {
 }
 
 def hardcode_pred(pred: list[float], jar_name: str) -> list[float]:
-    """
-    green_vita, blue_peanut, printed, brown_peanut, black_peanut
+    """Overwrite the parts of the state estimate we would rather assert than measure.
+
+    ``pred`` is the estimator output, published as-is to /extero with _EXTERO_NAMES. All
+    lengths are metres; positions are in the AprilTag-calibrated WORLD frame (absolute z --
+    the table top is at _TABLETOP_Z, NOT z=0), matching the sim's extero obs term order.
+
+      idx  name       source after this call   meaning
+      ---  ---------  ---------------------   ------------------------------------------
+       0   bottle_x   ESTIMATOR               jar body axis, world x
+       1   bottle_y   ESTIMATOR               jar body axis, world y
+       2   bottle_z   HARDCODED               body centre  = _TABLETOP_Z + bot_h/2
+       3   cap_x      ESTIMATOR               cap centre, world x
+       4   cap_y      ESTIMATOR               cap centre, world y
+       5   cap_z      HARDCODED               cap centre   = _TABLETOP_Z + bot_h + cap_h/2
+       6   body_r     HARDCODED               jar body radius   (_JARS[...]["bot_r"])
+       7   body_h     HARDCODED               jar body height   (_JARS[...]["bot_h"])
+       8   cap_r      HARDCODED               cap radius        (_JARS[...]["cap_r"])
+       9   cap_h      HARDCODED               cap height        (_JARS[...]["cap_h"])
+
+    So only x/y of the two centres still come from perception; z and all four dimensions are
+    asserted from the _JARS table. Both z values are built from bot_h, so an error in the
+    table's bot_h moves the whole vertical reference the policy grasps against.
+
+    Two traps when hardcoding here:
+
+    * pred[6:10] is ordered (body_r, body_h, cap_r, cap_h). The _JARS literal below is
+      written in the order (cap_r, cap_h, bot_r, bot_h) -- do NOT splice the dict's values
+      in directly, index it by key as the assignment below does.
+    * An x/y offset must be applied to the bottle AND the cap by the same amount. Shifting
+      only one invents a lateral cap-vs-body offset the policy reads as a tilted jar.
+
+    _TABLETOP_Z is copied from the sim table height, not measured on this robot; if the real
+    table sits higher, the policy is told the jar is lower and places the hand low to match.
+
+    Known jar_name keys: green_vita, blue_peanut, printed, brown_peanut, black_peanut.
     """
     jar = _JARS[jar_name]
     bot_h, cap_h = jar["bot_h"], jar["cap_h"]
+    # _Y_OFFSET = 0.020
+    # pred[0] += 0.02
+    # pred[1] += _Y_OFFSET   # bottle_y
     pred[2] = _TABLETOP_Z + bot_h / 2.0          # bottle_z
+    # pred[3] += 0.02
+    # pred[4] += _Y_OFFSET   # cap_y
     pred[5] = _TABLETOP_Z + bot_h + cap_h / 2.0  # cap_z
     pred[6:10] = [jar["bot_r"], bot_h, jar["cap_r"], cap_h]
     return pred
@@ -284,7 +322,7 @@ class KinectSamC2DNode(Node):
         # State estimate: masked depth -> [bottle_pos(3), cap_pos(3), jar_geom(4)], metres,
         pred = self.estimator.infer(masked_depth)[0].tolist()
         # HARDCODE STARTS HERE
-        pred = hardcode_pred(pred, jar_name="green_vita")
+        pred = hardcode_pred(pred, jar_name="printed")
         
         extero = JointState()
         extero.header.stamp = stamp

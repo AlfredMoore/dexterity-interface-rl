@@ -770,6 +770,9 @@ class DepthFeatPolicyNode(Node):
 
         # 3) Wait for FK.
         if not self.has_fk:
+            self.get_logger().warn(
+                f"No FK message received yet on {self.fk_topic}. Skipping policy step."
+                        )
             return
 
         # 4) CPU -> GPU, real -> policy order.
