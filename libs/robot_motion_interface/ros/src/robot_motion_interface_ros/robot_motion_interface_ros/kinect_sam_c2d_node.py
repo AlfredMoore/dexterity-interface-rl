@@ -54,6 +54,7 @@ _JARS: dict[str, dict[str, float]] = {
     "printed":      {"cap_r": 0.040, "cap_h": 0.030, "bot_r": 0.042, "bot_h": 0.120},
     "brown_peanut": {"cap_r": 0.048, "cap_h": 0.020, "bot_r": 0.050, "bot_h": 0.150},
     "black_peanut": {"cap_r": 0.033, "cap_h": 0.020, "bot_r": 0.043, "bot_h": 0.180},
+    "pink_jar":     {"cap_r": 0.040, "cap_h": 0.020, "bot_r": 0.042, "bot_h": 0.100},
 }
 
 def hardcode_pred(pred: list[float], jar_name: str) -> list[float]:
@@ -95,14 +96,20 @@ def hardcode_pred(pred: list[float], jar_name: str) -> list[float]:
     """
     jar = _JARS[jar_name]
     bot_h, cap_h = jar["bot_h"], jar["cap_h"]
+    
+    # pred[2] = _TABLETOP_Z + bot_h / 2.0
+    # pred[5] = _TABLETOP_Z + bot_h + cap_h / 2.0  # cap_z
+    # pred[6:10] = [jar["bot_r"], bot_h, jar["cap_r"], cap_h]
+    
+    # Compensation
     # _Y_OFFSET = 0.020
     # pred[0] += 0.02
     # pred[1] += _Y_OFFSET   # bottle_y
-    pred[2] = _TABLETOP_Z + bot_h / 2.0          # bottle_z
+    # pred[2] += 0.06          # bottle_z
     # pred[3] += 0.02
     # pred[4] += _Y_OFFSET   # cap_y
-    pred[5] = _TABLETOP_Z + bot_h + cap_h / 2.0  # cap_z
-    pred[6:10] = [jar["bot_r"], bot_h, jar["cap_r"], cap_h]
+    # pred[5] += 0.06          # cap_z
+    
     return pred
 
 
@@ -322,7 +329,7 @@ class KinectSamC2DNode(Node):
         # State estimate: masked depth -> [bottle_pos(3), cap_pos(3), jar_geom(4)], metres,
         pred = self.estimator.infer(masked_depth)[0].tolist()
         # HARDCODE STARTS HERE
-        pred = hardcode_pred(pred, jar_name="printed")
+        pred = hardcode_pred(pred, jar_name="blue_peanut")
         
         extero = JointState()
         extero.header.stamp = stamp
